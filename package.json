@@ -1,0 +1,32 @@
+{
+  "name": "agent-hook-token",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A Solana token whose transfer-hook rules an AI agent rewrites inside limits fixed at launch.",
+  "type": "module",
+  "scripts": {
+    "test:programs": "wsl -e bash programs/test.sh",
+    "validator": "wsl -e bash scripts/validator.sh",
+    "e2e": "tsx scripts/e2e.ts",
+    "typecheck": "tsc --noEmit",
+    "e2e:agent": "tsx scripts/e2e-agent.ts",
+    "agent": "tsx scripts/agent.ts",
+    "site": "node scripts/site.mjs",
+    "site:seed": "tsx scripts/seed-site.ts",
+    "site:local": "node scripts/site.mjs --port 4322 --config .local/site/config.js --log .local/site/log.jsonl"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.131.0",
+    "@meteora-ag/dynamic-bonding-curve-sdk": "^1.5.13",
+    "@solana/spl-token": "^0.4.15",
+    "@solana/web3.js": "^1.98.4",
+    "bn.js": "^5.2.5",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.2.0",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  }
+}

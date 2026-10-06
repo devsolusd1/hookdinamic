@@ -1,0 +1,30 @@
+[package]
+name = "agent-hook"
+version = "0.1.0"
+edition = "2021"
+description = "Token-2022 transfer hook whose rules an agent rewrites inside limits fixed at launch."
+license = "MIT"
+publish = false
+
+[lib]
+name = "agent_hook"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+pinocchio = { version = "0.11", default-features = false, features = ["cpi"] }
+pinocchio-system = "0.6"
+
+# On chain a program address is derived by a syscall. Off chain (unit tests, the test crate)
+# the same call needs the curve arithmetic compiled in.
+[target.'cfg(not(target_os = "solana"))'.dependencies]
+solana-address = { version = "2", features = ["curve25519"] }
+
+# Deploy rent is paid per byte, so the release build optimises for size.
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+overflow-checks = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

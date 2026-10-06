@@ -1,0 +1,940 @@
+/* A printed record: paper, ink and one seal colour. Serif for what is said, mono for what
+   the chain says. */
+
+:root {
+  color-scheme: light dark;
+  --paper: #f4f0e6;
+  --paper-deep: #eae5d7;
+  --ink: #17150f;
+  --seal: #b5301c;
+  --ink-soft: color-mix(in oklab, var(--ink) 68%, var(--paper));
+  --hairline: color-mix(in oklab, var(--ink) 24%, var(--paper));
+  --serif: "Newsreader", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  --gutter: clamp(1.25rem, 4vw, 3rem);
+  --label-column: 13rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #13120e;
+    --paper-deep: #1c1b15;
+    --ink: #ebe6d8;
+    --seal: #e4573f;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  scroll-padding-top: 1.5rem;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: 400 1.125rem/1.55 var(--serif);
+  font-optical-sizing: auto;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: var(--seal);
+  color: var(--paper);
+}
+
+p,
+h1,
+h2,
+h3,
+dl,
+dd,
+ol,
+figure,
+blockquote {
+  margin: 0;
+}
+
+a {
+  color: inherit;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
+}
+
+a:hover {
+  color: var(--seal);
+}
+
+:focus-visible {
+  outline: 2px solid var(--seal);
+  outline-offset: 3px;
+}
+
+code,
+.term-note {
+  font-variant-numeric: tabular-nums;
+}
+
+.page {
+  max-width: 78rem;
+  margin-inline: auto;
+  padding-inline: var(--gutter);
+}
+
+/* The small upper-case mono used for everything that names or labels. */
+.label {
+  font: 500 0.72rem/1.5 var(--mono);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.skip {
+  position: absolute;
+  left: var(--gutter);
+  top: -4rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--ink);
+  color: var(--paper);
+  font: 500 0.8rem var(--mono);
+}
+
+.skip:focus {
+  top: 0.5rem;
+}
+
+/* Masthead */
+
+.dateline {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem 2rem;
+  flex-wrap: wrap;
+  padding-block: 0.9rem;
+  border-bottom: 1px solid var(--ink);
+}
+
+.status::before {
+  content: "";
+  display: inline-block;
+  width: 0.55em;
+  height: 0.55em;
+  margin-right: 0.6em;
+  border: 1px solid var(--seal);
+  border-radius: 50%;
+}
+
+.status.is-active::before {
+  background: var(--seal);
+}
+
+.masthead-main {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: end;
+  gap: 1.5rem var(--gutter);
+  padding-block: clamp(1rem, 3vw, 2rem) 1.5rem;
+  border-bottom: 4px double var(--ink);
+}
+
+.nameplate {
+  font-size: clamp(5rem, 21vw, 16.5rem);
+  font-weight: 500;
+  line-height: 0.76;
+  letter-spacing: -0.025em;
+  /* Capitals sit high in their line box; this drops the baseline onto the rule below. */
+  margin-bottom: -0.035em;
+}
+
+.masthead-side {
+  justify-self: end;
+  max-width: 25rem;
+}
+
+.descriptor {
+  font-size: 1.3rem;
+  font-style: italic;
+  line-height: 1.3;
+}
+
+.contents {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 1.25rem;
+  margin-top: 1.1rem;
+}
+
+.contents a {
+  text-decoration: none;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.contents a:hover {
+  border-bottom-color: currentColor;
+}
+
+/* Notices: one line of status above the record. */
+
+.notice {
+  display: flex;
+  gap: 1rem;
+  align-items: baseline;
+  padding: 0.85rem 1rem;
+  margin-top: 1.5rem;
+  background: var(--paper-deep);
+  border-left: 3px solid var(--seal);
+  font-size: 1rem;
+}
+
+.notice .label {
+  flex: none;
+  color: var(--seal);
+}
+
+/* The page ships as a specimen. config.js sets data-mode before anything paints, and app.js
+   sets data-state once it has read the chain. Until then the live page keeps its layout but
+   shows none of the specimen's words. */
+
+[data-mode="specimen"] .live-only,
+[data-mode="live"] .specimen-only,
+.notice-loading,
+.notice-error {
+  display: none;
+}
+
+[data-mode="live"]:not([data-state]) .notice-loading,
+[data-mode="live"][data-state="error"] .notice-error {
+  display: flex;
+}
+
+[data-mode="live"]:not([data-state="ready"]) .needs-data {
+  visibility: hidden;
+}
+
+/* With the chain out of reach there is nothing true to put in these sections. */
+[data-mode="live"][data-state="error"] .from-chain {
+  display: none;
+}
+
+/* Sections: a label in the margin, the matter beside it. */
+
+.section {
+  display: grid;
+  grid-template-columns: var(--label-column) minmax(0, 1fr);
+  gap: 2rem var(--gutter);
+  padding-block: clamp(2.5rem, 6vw, 4.75rem);
+  border-bottom: 1px solid var(--ink);
+}
+
+.section-label {
+  align-self: start;
+  position: sticky;
+  top: 1.5rem;
+}
+
+.section-no {
+  font-size: 2.1rem;
+  font-style: italic;
+  line-height: 1;
+  margin-bottom: 0.6rem;
+}
+
+.section-aside {
+  margin-top: 0.75rem;
+  font-size: 0.95rem;
+  line-height: 1.4;
+  color: var(--ink-soft);
+}
+
+/* The edict in force */
+
+.edict {
+  position: relative;
+}
+
+.edict-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.25rem 1.5rem;
+  flex-wrap: wrap;
+}
+
+.edict-issued {
+  color: var(--ink-soft);
+}
+
+.edict-status {
+  color: var(--seal);
+}
+
+[data-mode="specimen"] .edict-status {
+  visibility: hidden;
+}
+
+.edict-text {
+  max-width: 25em;
+  margin-block: 1.4rem 2.5rem;
+  font-size: clamp(1.75rem, 3.5vw, 3.05rem);
+  line-height: 1.12;
+  letter-spacing: -0.014em;
+  text-wrap: balance;
+  quotes: "\201C" "\201D";
+}
+
+.edict-text::before {
+  content: open-quote;
+  /* The opening mark hangs in the margin so the first line starts flush with the rest. */
+  position: absolute;
+  transform: translateX(-0.48em);
+}
+
+.edict-text::after {
+  content: close-quote;
+}
+
+.edict-text.is-plain {
+  quotes: none;
+  color: var(--ink-soft);
+  font-style: italic;
+}
+
+.edict.is-suspended .terms {
+  color: var(--ink-soft);
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
+.terms {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border-block: 1px solid var(--ink);
+}
+
+.term {
+  padding: 1.1rem 1.25rem 1.3rem;
+  border-left: 1px solid var(--hairline);
+}
+
+.term:first-child {
+  padding-left: 0;
+  border-left: 0;
+}
+
+.term dt {
+  color: var(--ink-soft);
+}
+
+.term dd {
+  margin-top: 0.55rem;
+}
+
+.term-value {
+  display: block;
+  font-size: 1.6rem;
+  line-height: 1.15;
+}
+
+.term-note {
+  display: block;
+  margin-top: 0.4rem;
+  font: 400 0.78rem/1.45 var(--mono);
+  color: var(--ink-soft);
+}
+
+/* The fee split, drawn the way a printed chart would be: solid, hatched, empty. */
+
+.split {
+  display: flex;
+  height: 1.6rem;
+  margin-top: 0.15rem;
+  border: 1px solid var(--ink);
+}
+
+.split > span {
+  min-width: 0;
+}
+
+.split > .to-holders {
+  flex: var(--holders) 0 0;
+}
+
+.split > .to-burn {
+  flex: var(--burn) 0 0;
+}
+
+.split > .to-treasury {
+  flex: var(--treasury) 0 0;
+}
+
+.to-holders {
+  background: var(--ink);
+}
+
+.to-burn {
+  background: repeating-linear-gradient(135deg, var(--ink) 0 1px, transparent 1px 5px);
+}
+
+.split-key {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.15rem 0.9rem;
+  margin-top: 0.55rem;
+}
+
+.split-key b {
+  font-weight: 500;
+  color: var(--ink);
+}
+
+.key {
+  display: inline-block;
+  width: 0.62rem;
+  height: 0.62rem;
+  margin-right: 0.4rem;
+  border: 1px solid var(--ink);
+}
+
+.key.to-burn {
+  background-size: 3px 3px;
+  background-image: linear-gradient(135deg, var(--ink) 25%, transparent 25% 50%, var(--ink) 50% 75%, transparent 75%);
+}
+
+.edict-foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: var(--gutter);
+  margin-top: 2rem;
+}
+
+.reasons {
+  max-width: 36rem;
+}
+
+.reasons .label {
+  color: var(--ink-soft);
+}
+
+.reasons p {
+  margin-top: 0.5rem;
+}
+
+.seal {
+  flex: none;
+  width: 9.25rem;
+  margin: -0.5rem 1rem 0 0;
+  color: var(--seal);
+  transform: rotate(-9deg);
+}
+
+.seal text {
+  fill: currentColor;
+}
+
+.seal-ring {
+  font: 500 9.2px var(--mono);
+}
+
+.seal-label {
+  font: italic 400 15px var(--serif);
+}
+
+.seal-no {
+  font: 500 34px var(--serif);
+  font-variant-numeric: lining-nums;
+}
+
+.proof {
+  margin-top: 1.75rem;
+  padding-top: 0.9rem;
+  border-top: 1px solid var(--hairline);
+  font: 400 0.78rem/1.6 var(--mono);
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.proof .is-verified {
+  color: var(--ink);
+}
+
+.proof .is-mismatch {
+  color: var(--seal);
+}
+
+.stamp {
+  position: absolute;
+  top: -0.7rem;
+  right: 0;
+  padding: 0.3rem 0.55rem 0.25rem 0.95rem;
+  border: 2px solid currentColor;
+  color: var(--seal);
+  font: 500 1.05rem/1 var(--mono);
+  letter-spacing: 0.36em;
+  text-transform: uppercase;
+  transform: rotate(-7deg);
+  opacity: 0.82;
+  pointer-events: none;
+}
+
+/* The Charter */
+
+.lede {
+  max-width: 44rem;
+  font-size: 1.3rem;
+  line-height: 1.4;
+}
+
+.articles {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: var(--gutter);
+  margin-top: 2.25rem;
+  padding: 0;
+  list-style: none;
+  counter-reset: article;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.articles li {
+  display: grid;
+  grid-template-columns: 3.25rem minmax(0, 1fr);
+  align-content: start;
+  padding-block: 1.3rem 1.5rem;
+  border-top: 1px solid var(--hairline);
+  counter-increment: article;
+}
+
+.articles li::before {
+  content: counter(article, upper-roman) ".";
+  grid-row: span 2;
+  font-size: 1.35rem;
+  font-style: italic;
+  line-height: 1.2;
+}
+
+.articles h3 {
+  font: 500 0.72rem/1.5 var(--mono);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  padding-top: 0.42rem;
+}
+
+.articles p {
+  margin-top: 0.4rem;
+}
+
+.articles .value {
+  white-space: nowrap;
+  border-bottom: 1px solid var(--seal);
+}
+
+.caveat {
+  display: flex;
+  gap: 1rem;
+  align-items: baseline;
+  max-width: 44rem;
+  margin-top: 1.75rem;
+}
+
+.caveat .label {
+  flex: none;
+  color: var(--seal);
+}
+
+/* The Record */
+
+.record {
+  padding: 0;
+  list-style: none;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.entry {
+  display: grid;
+  grid-template-columns: 6rem 11.5rem minmax(0, 1fr);
+  gap: 0.25rem 1.5rem;
+  align-items: baseline;
+  padding-block: 1.25rem 1.4rem;
+  border-top: 1px solid var(--hairline);
+}
+
+.entry-no {
+  font-size: 1.35rem;
+  font-style: italic;
+  line-height: 1.2;
+}
+
+.entry-when {
+  color: var(--ink-soft);
+}
+
+.entry-text {
+  max-width: 40rem;
+  font-size: 1.3rem;
+  line-height: 1.32;
+}
+
+.entry-terms,
+.entry-proof {
+  margin-top: 0.55rem;
+  font: 400 0.78rem/1.5 var(--mono);
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.entry-reasons {
+  max-width: 40rem;
+  margin-top: 0.7rem;
+}
+
+.entry-reasons summary {
+  width: fit-content;
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+
+.entry-reasons summary:hover {
+  color: var(--seal);
+}
+
+.entry-reasons p {
+  margin-top: 0.4rem;
+  font-size: 1rem;
+}
+
+.entry.is-hold .entry-no,
+.entry.is-hold .entry-text {
+  font-size: 1.05rem;
+  color: var(--ink-soft);
+}
+
+.entry.is-hold .entry-text,
+.entry.is-unsound .entry-text {
+  font-style: italic;
+}
+
+.entry.is-unsound .entry-text {
+  font-size: 1.05rem;
+  color: var(--seal);
+}
+
+.record-empty,
+.record-more {
+  margin-top: 1.25rem;
+  color: var(--ink-soft);
+}
+
+/* Enforcement */
+
+.flow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 9.5rem minmax(0, 1fr) 11.5rem minmax(0, 1fr);
+  align-items: stretch;
+}
+
+.flow-box {
+  padding: 1rem 1.1rem 1.15rem;
+  border: 1px solid var(--ink);
+}
+
+.flow-box p + p {
+  margin-top: 0.45rem;
+  font-size: 1rem;
+  line-height: 1.4;
+}
+
+.flow-link {
+  position: relative;
+  display: grid;
+  place-items: center;
+  font: 400 0.72rem/1.3 var(--mono);
+  color: var(--ink-soft);
+  text-align: center;
+}
+
+.flow-link span {
+  padding-bottom: 2.1rem;
+}
+
+.flow-link::before {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  top: 50%;
+  border-top: 1px solid var(--ink);
+}
+
+.flow-link::after {
+  content: "";
+  position: absolute;
+  right: 1px;
+  top: 50%;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-top: 1px solid var(--ink);
+  border-right: 1px solid var(--ink);
+  transform: translateY(-50%) rotate(45deg);
+}
+
+.figure figcaption {
+  margin-top: 0.9rem;
+  font-size: 0.95rem;
+  font-style: italic;
+  color: var(--ink-soft);
+}
+
+.prose {
+  columns: 2 22rem;
+  column-gap: var(--gutter);
+  margin-top: 2.75rem;
+}
+
+.prose h3 {
+  font: 500 0.72rem/1.5 var(--mono);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  break-after: avoid;
+}
+
+.prose p {
+  margin-block: 0.4rem 1.6rem;
+  break-inside: avoid;
+}
+
+/* Addresses */
+
+.addresses {
+  border-bottom: 1px solid var(--hairline);
+}
+
+.address {
+  display: grid;
+  grid-template-columns: 11rem minmax(0, 1fr) auto;
+  gap: 0.25rem 1.5rem;
+  align-items: baseline;
+  padding-block: 0.95rem;
+  border-top: 1px solid var(--hairline);
+}
+
+.address dt {
+  color: var(--ink-soft);
+}
+
+.address code {
+  font: 400 0.92rem/1.4 var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.address-actions {
+  display: flex;
+  gap: 1.25rem;
+}
+
+.copy {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
+  cursor: pointer;
+}
+
+.copy:hover {
+  color: var(--seal);
+}
+
+.trade {
+  margin-top: 1.5rem;
+}
+
+.trade .label {
+  margin-right: 1rem;
+  color: var(--ink-soft);
+}
+
+.trade a + a {
+  margin-left: 1.25rem;
+}
+
+/* Colophon */
+
+.colophon {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1rem var(--gutter);
+  flex-wrap: wrap;
+  padding-block: 2rem 3.5rem;
+  font-size: 0.95rem;
+  color: var(--ink-soft);
+}
+
+.colophon p:first-child {
+  max-width: 44rem;
+}
+
+/* Narrower pages */
+
+@media (max-width: 62rem) {
+  .masthead-main {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* Alone on its row, the nameplate runs the width of the page. */
+  .nameplate {
+    font-size: clamp(5rem, 27vw, 16.5rem);
+  }
+
+  .masthead-side {
+    justify-self: start;
+    max-width: 34rem;
+  }
+
+  .section {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .section-label {
+    position: static;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 0 1rem;
+    align-items: baseline;
+  }
+
+  .section-no {
+    margin-bottom: 0;
+  }
+
+  .section-aside {
+    grid-column: 1 / -1;
+    max-width: 34rem;
+  }
+
+  .terms {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .term:nth-child(odd) {
+    padding-left: 0;
+    border-left: 0;
+  }
+
+  .term:nth-child(n + 3) {
+    border-top: 1px solid var(--hairline);
+  }
+
+  .flow {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .flow-link {
+    justify-items: start;
+    min-height: 3.25rem;
+    padding-left: 2.25rem;
+    text-align: left;
+  }
+
+  .flow-link span {
+    padding-bottom: 0;
+  }
+
+  .flow-link::before {
+    inset: 0 auto 0 1rem;
+    border-top: 0;
+    border-left: 1px solid var(--ink);
+  }
+
+  .flow-link::after {
+    top: auto;
+    right: auto;
+    bottom: 1px;
+    left: 1rem;
+    transform: translateX(-50%) rotate(135deg);
+  }
+}
+
+@media (max-width: 44rem) {
+  body {
+    font-size: 1.0625rem;
+  }
+
+  .articles {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .entry {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .entry-body {
+    grid-column: 1 / -1;
+    margin-top: 0.35rem;
+  }
+
+  .address {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .edict-foot {
+    flex-direction: column;
+  }
+
+  .seal {
+    align-self: end;
+    width: 7.5rem;
+    margin: 0;
+  }
+
+  /* No room beside the heading on a phone: the stamp takes a line of its own. */
+  .stamp {
+    position: static;
+    width: fit-content;
+    margin: 1rem 0 -0.4rem auto;
+    font-size: 0.85rem;
+  }
+
+  .notice,
+  .caveat {
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+}
+
+@media (max-width: 30rem) {
+  .terms {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .term {
+    padding-left: 0;
+    border-left: 0;
+  }
+
+  .term + .term {
+    border-top: 1px solid var(--hairline);
+  }
+}
+
+@media print {
+  .contents,
+  .skip,
+  .copy {
+    display: none;
+  }
+
+  .section-label {
+    position: static;
+  }
+}

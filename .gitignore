@@ -1,0 +1,8 @@
+node_modules/
+target/
+test-ledger/
+.env
+# keys never go in the repository
+*-keypair.json
+keys/
+.local/
