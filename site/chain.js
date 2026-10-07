@@ -59,6 +59,7 @@ export function decodeRulebook(bytes) {
       maxRuleSecs: view.getUint32(204, true),
       maxTreasuryBps: u16(208),
       minRenameSecs: view.getUint32(210, true),
+      minTreasuryBps: u16(214),
     },
     // The unix time the edict's term ends: its rule stops applying and the next edict is due.
     ruleUntil: Number(view.getBigInt64(216, true)),
@@ -82,6 +83,8 @@ export function decodeRulebook(bytes) {
     }),
     name: bytes[480],
     renamedAt: Number(view.getBigInt64(488, true)),
+    // The only key that may take the trading fees out of the curve, and only into accounts of its own.
+    keeper: key(864),
   };
 }
 

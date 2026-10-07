@@ -105,6 +105,19 @@ const still = matchMedia("(prefers-reduced-motion: reduce)");
 let turns = 0;
 const seat = slot("seat");
 const stops = [...document.querySelectorAll("[data-stop]")];
+
+// A tap on Veluno and it blinks, there and then (the air pushes it too, as before). The eyes
+// close and open where they are: they follow nothing.
+const face = seat.querySelector(".veluno");
+let blinked = 0;
+seat.addEventListener("pointerdown", () => {
+  face.classList.remove("is-blinking");
+  // Read once, so that a second tap during a blink starts a new one.
+  void face.getBoundingClientRect();
+  face.classList.add("is-blinking");
+  clearTimeout(blinked);
+  blinked = setTimeout(() => face.classList.remove("is-blinking"), 300);
+});
 /** How long it takes from one place to the next. */
 const FLIGHT_MS = 380;
 let shown = null;
@@ -275,7 +288,8 @@ ask.addEventListener("click", () => {
 
 /**
  * The catalogue, with what is on marked. `on` says which: a buying hook and its setting, a
- * fee hook, the name in use. `appAvailable` false marks the hooks this token cannot use.
+ * fee hook, the name in use. What this token cannot use is left out: the hooks about the app
+ * when `appAvailable` is false, the change of name when `on.fixedName` says it has one name.
  */
 function renderCatalogue(on, appAvailable = true) {
   /** One tile of the list. `state` is what its margin says; it is on if that starts with "On" or "Now". */
@@ -333,17 +347,15 @@ function renderCatalogue(on, appAvailable = true) {
     group(
       "Buying hooks",
       "one at a time, or none",
-      BUYING_HOOKS.map((hook) => {
+      // A hook the chain says is on is listed whatever else is true of the token.
+      BUYING_HOOKS.filter((hook) => appAvailable || !hook.needsApp || on.buying?.hook.id === hook.id).map((hook) => {
         const mine = on.buying?.hook.id === hook.id;
-        const unavailable = hook.needsApp && !appAvailable;
-        const state = mine ? `On${on.buying.label ? ` · ${on.buying.label}` : ""}` : unavailable ? "Not for this token" : "";
-        // A hook this token cannot use has no settings to press.
-        if (unavailable) return row(hook, state, `Settings: ${hook.settings.map((setting) => setting.label).join(" · ")}`);
-        return notches(row(hook, state), hook, mine ? on.buying.setting : 0);
+        return notches(row(hook, mine ? `On${on.buying.label ? ` · ${on.buying.label}` : ""}` : ""), hook, mine ? on.buying.setting : 0);
       }),
     ),
     group("Fee hooks", "always one", FEE_HOOKS.map((hook) => row(hook, on.fees?.hook.id === hook.id ? "On" : ""))),
-    group("Name", "a new one now and then", [row(IDENTITY_HOOK, on.fixedName ? "Not for this token" : on.name ? `Now ${on.name}` : "", on.names ? `Names: ${on.names}` : "")]),
+    // A token with one name has no other to take, so nothing is said of changing it.
+    ...(on.fixedName ? [] : [group("Name", "a new one now and then", [row(IDENTITY_HOOK, on.name ? `Now ${on.name}` : "", on.names ? `Names: ${on.names}` : "")])]),
   );
 }
 
@@ -713,7 +725,7 @@ function renderTerm() {
   renderAside();
 
   // The same hook and the same clock, where the other pages say them.
-  const on = [hook, ...ways, book.holdersBps, book.burnBps, book.treasuryBps, book.name].join("\n");
+  const on = [hook, ...ways, book.holdersBps, book.burnBps, book.treasuryBps, book.name, book.hasApp, book.names.length].join("\n");
   if (shownOn !== on) {
     shownOn = on;
     write("buying-name", hook);
@@ -722,7 +734,7 @@ function renderTerm() {
     renderCatalogue(
       {
         buying: known,
-        fees: recogniseSplit(book, book.limits.maxTreasuryBps),
+        fees: recogniseSplit(book, book.limits.maxTreasuryBps, book.limits.minTreasuryBps),
         // A token with one name has nothing to change to.
         ...(book.names.length > 1 ? { name: fullName(book.names[book.name]), names: book.names.map(fullName).join(" · ") } : { fixedName: true }),
       },
@@ -790,7 +802,7 @@ function renderEdict() {
   ask.hidden = !published;
   if (published && slot("edict-reasons").textContent !== published.reasoning) write("edict-reasons", published.reasoning);
 
-  const fees = recogniseSplit(book, book.limits.maxTreasuryBps);
+  const fees = recogniseSplit(book, book.limits.maxTreasuryBps, book.limits.minTreasuryBps);
   write("fees-name", fees ? fees.hook.name : book.epoch ? "Shares that are not on my list" : "Opening split");
   for (const [name, bps] of [["holders", book.holdersBps], ["burn", book.burnBps], ["treasury", book.treasuryBps]]) {
     slot("split").style.setProperty(`--${name}`, bps);
@@ -807,11 +819,17 @@ function renderCharter() {
   const { limits } = book;
   write("limit-interval", span(limits.minIntervalSecs));
   write("limit-rule", span(limits.maxRuleSecs));
+  write("limit-treasury-min", percent(limits.minTreasuryBps));
   write("limit-treasury", percent(limits.maxTreasuryBps));
   write("limit-rename", span(limits.minRenameSecs));
   write("name-count", COUNTS[book.names.length] ?? String(book.names.length));
-  slot("names-many").hidden = book.names.length < 2;
-  slot("names-one").hidden = book.names.length > 1;
+  // What is only true of a token with several names, with one name, or with an app, each said in more than one place.
+  const only = (name, holds) => {
+    for (const node of document.querySelectorAll(`[data-${name}]`)) node.hidden = !holds;
+  };
+  only("names-many", book.names.length > 1);
+  only("names-one", book.names.length < 2);
+  only("with-app", book.hasApp);
   write("fee", percent(site.feeBps));
 }
 
@@ -820,7 +838,7 @@ function termsOf(record) {
   const { change } = record;
   const rule = loggedRule(change);
   const known = recogniseRule(rule);
-  const fees = recogniseSplit(change, book.limits.maxTreasuryBps);
+  const fees = recogniseSplit(change, book.limits.maxTreasuryBps, book.limits.minTreasuryBps);
   const shares = `holders ${percent(change.holdersBps)}, burn ${percent(change.burnBps)}, treasury ${percent(change.treasuryBps)}`;
   return {
     // With no hook on, the answer to "who may buy" is everybody.
@@ -1119,8 +1137,9 @@ function renderStatus() {
 }
 
 if (live) {
-  // The catalogue is the same for every token; what is on follows the first read of the chain.
-  renderCatalogue({});
+  // Until the chain is read the page lists what every token has. What is on, the hooks about
+  // the app and the change of name follow the first read, if this token has them.
+  renderCatalogue({ fixedName: true }, false);
   renderAddresses();
   // The rehearsal's made-up callers have no place on a live page, even before the door is read.
   slot("knocks").replaceChildren();
@@ -1185,11 +1204,14 @@ if (live) {
     renderStatus();
   }, 1_000);
 } else {
-  // The rehearsal: the catalogue as it is, marked the way the made-up edict would leave it.
-  renderCatalogue({
-    buying: { hook: BUYING_HOOKS.find((hook) => hook.id === "newcomers"), setting: 2, label: "up to 0.5%" },
-    fees: { hook: FEE_HOOKS.find((hook) => hook.id === "holders-payday") },
-    name: "Edict (EDICT)",
-    names: "Edict (EDICT) · Decree (DECREE) · By Order (BYORDER) · Same Coin (SAME)",
-  });
+  // The rehearsal: the catalogue of a token that names no app and has one name, marked the
+  // way the made-up edict would leave it.
+  renderCatalogue(
+    {
+      buying: { hook: BUYING_HOOKS.find((hook) => hook.id === "newcomers"), setting: 2, label: "up to 0.5%" },
+      fees: { hook: FEE_HOOKS.find((hook) => hook.id === "holders-payday") },
+      fixedName: true,
+    },
+    false,
+  );
 }

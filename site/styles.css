@@ -570,6 +570,20 @@ main {
   }
 }
 
+/* A tap on me and I blink, there and then. */
+@media (prefers-reduced-motion: no-preference) {
+  .veluno.is-blinking .veluno-eye {
+    animation: wink 0.26s ease-in-out;
+  }
+}
+
+@keyframes wink {
+  45%,
+  55% {
+    transform: scaleY(0.06);
+  }
+}
+
 .says {
   grid-area: says;
 }

@@ -87,17 +87,18 @@ export const BUYING_HOOKS = [
 
 /**
  * A fee hook: where the project's part of the trading fees goes while it is on. Exactly one
- * is on at a time. `split` gives the shares in bps for a token whose treasury is capped at
- * `cap`.
+ * is on at a time. `split` gives the shares in bps for a token whose treasury is owed at
+ * least `floor` and may get at most `cap`. Both are limits fixed at launch, so a hook says
+ * which end the treasury sits at and how the rest is shared, not a number of its own.
  * @typedef {{ holdersBps: number, burnBps: number, treasuryBps: number }} Split
- * @typedef {{ id: string, name: string, about: string, split: (cap: number) => Split }} FeeHook
+ * @typedef {{ id: string, name: string, about: string, split: (cap: number, floor?: number) => Split }} FeeHook
  */
 
-/** The treasury takes `treasury` (never more than its cap), and `toBurn` of the rest is burned. */
-function shares(cap, treasury, toBurn) {
-  const treasuryBps = Math.min(cap, treasury);
-  const burnBps = Math.round(((10_000 - treasuryBps) * toBurn) / 100) * 100;
-  return { holdersBps: 10_000 - treasuryBps - burnBps, burnBps, treasuryBps };
+/** The treasury takes `treasuryBps`, and `toBurn` of the rest, to the nearest whole percent of the fees, is burned. */
+function shares(treasuryBps, toBurn) {
+  const rest = 10_000 - treasuryBps;
+  const burnBps = Math.min(rest, Math.round((rest * toBurn) / 100) * 100);
+  return { holdersBps: rest - burnBps, burnBps, treasuryBps };
 }
 
 /** @type {FeeHook[]} */
@@ -105,26 +106,26 @@ export const FEE_HOOKS = [
   {
     id: "even-split",
     name: "Even Split",
-    about: "The same share for holders and for burning. A fifth for the treasury.",
-    split: (cap) => shares(cap, 2_000, 0.5),
+    about: "The treasury takes the least it is allowed. The rest is marked for holders and for burning, the same share each.",
+    split: (cap, floor = 0) => shares(floor, 0.5),
   },
   {
     id: "buyback-burn",
     name: "Buyback & Burn",
-    about: "Marks most of the fees for buying the token back from the curve and burning it.",
-    split: (cap) => shares(cap, 1_000, 0.7),
+    about: "The treasury takes the least it is allowed. Most of the rest is marked for buying the token back from the curve and burning it.",
+    split: (cap, floor = 0) => shares(floor, 0.7),
   },
   {
     id: "holders-payday",
     name: "Holders’ Payday",
-    about: "Marks most of the fees for holders.",
-    split: (cap) => shares(cap, 1_000, 0.3),
+    about: "The treasury takes the least it is allowed. Most of the rest is marked for holders.",
+    split: (cap, floor = 0) => shares(floor, 0.3),
   },
   {
     id: "project-funding",
     name: "Project Funding",
-    about: "The most the treasury is allowed. The rest shared evenly between holders and burning.",
-    split: (cap) => shares(cap, 10_000, 0.5),
+    about: "The treasury takes the most it is allowed. The rest is marked for holders and for burning, the same share each.",
+    split: (cap) => shares(cap, 0.5),
   },
 ];
 
@@ -167,13 +168,16 @@ export function recogniseRule(conditions) {
 }
 
 /**
- * Which fee hook a split read from the chain is, if it is one from the catalogue.
+ * Which fee hook a split read from the chain is, if it is one from the catalogue. On a token
+ * whose floor is its cap, Even Split and Project Funding come to the same shares, and the
+ * first of the two is the one named.
  * @param {Split} split
  * @param {number} cap the treasury's cap in bps
+ * @param {number} [floor] the treasury's floor in bps
  * @returns {{ hook: FeeHook } | null}
  */
-export function recogniseSplit(split, cap) {
+export function recogniseSplit(split, cap, floor = 0) {
   const same = (other) => other.holdersBps === split.holdersBps && other.burnBps === split.burnBps && other.treasuryBps === split.treasuryBps;
-  const hook = FEE_HOOKS.find((known) => same(known.split(cap)));
+  const hook = FEE_HOOKS.find((known) => same(known.split(cap, floor)));
   return hook ? { hook } : null;
 }
