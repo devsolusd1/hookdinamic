@@ -15,7 +15,10 @@ window.SITE = {
   // The curve's trading fee in basis points. It is fixed with the curve and is not in the rulebook.
   feeBps: 200,
 
-  // The app whose signature an app-only window asks for.
+  // What the agent is called on these pages.
+  agent: "Veluno",
+
+  // The app a hook about "the app" means.
   app: "FOMO",
 
   explorer: "https://solscan.io",

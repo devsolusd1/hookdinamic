@@ -9,14 +9,17 @@
 //! | [`tag::SET_AGENT`]          | set_agent    | guardian             |
 //! | [`tag::SET_COSIGNER`]       | set_cosigner | guardian             |
 //! | [`tag::SET_GUARDIAN`]       | set_guardian | guardian, new one    |
+//! | [`tag::SET_NAME`]           | set_name     | agent                |
 
 use {
     crate::state::{
-        Change, Limits, Refusal, Rulebook, Transfer, NO_KEY, RULEBOOK_LEN, RULEBOOK_SEED, VALIDATION_SEED, VERSION,
+        admits, fact, looks_at, split_adds_up, Change, Facts, Limits, Refusal, Rulebook, MILLIONTHS, NAME_LEN, NO_KEY, RULEBOOK_LEN,
+        RULEBOOK_SEED, SYMBOL_LEN, VALIDATION_SEED, VERSION,
     },
     pinocchio::{
-        cpi::{Seed, Signer},
+        cpi::{invoke_signed, Seed, Signer},
         error::ProgramError,
+        instruction::{InstructionAccount, InstructionView},
         sysvars::{
             clock::Clock,
             instructions::{Instructions, INSTRUCTIONS_ID},
@@ -38,14 +41,26 @@ pub mod tag {
     pub const SET_AGENT: u8 = 3;
     pub const SET_COSIGNER: u8 = 4;
     pub const SET_GUARDIAN: u8 = 5;
+    pub const SET_NAME: u8 = 6;
 }
+
+pub const TOKEN_2022: Address = Address::from_str_const("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+/// `sha256("spl_token_metadata_interface:updating_field")[..8]`: how a token's metadata is edited.
+const UPDATE_FIELD: [u8; 8] = [221, 233, 49, 45, 181, 202, 220, 200];
+/// The metadata fields a name change touches, by their numbers in that interface.
+const FIELD_NAME: u8 = 0;
+const FIELD_SYMBOL: u8 = 1;
 
 /// Meteora DBC's pool authority. It owns the token vault of every curve, so tokens leaving an
 /// account it owns are a buy and tokens arriving in one are a sell.
 pub const POOL_AUTHORITY: Address = Address::from_str_const("FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM");
+const COMPUTE_BUDGET: Address = Address::from_str_const("ComputeBudget111111111111111111111111111111");
+/// The compute-budget instruction that sets a transaction's priority fee.
+const SET_COMPUTE_UNIT_PRICE: u8 = 3;
 
-/// The validation account lists two extra accounts: the rulebook and the Instructions sysvar.
-const EXTRA_ACCOUNTS: usize = 2;
+/// The validation account lists three extra accounts: the rulebook, the Instructions sysvar
+/// and the curve's SOL vault.
+const EXTRA_ACCOUNTS: usize = 3;
 /// One entry of that list: a kind byte, 32 bytes of address, a signer flag, a writable flag.
 const EXTRA_ACCOUNT_LEN: usize = 35;
 pub const VALIDATION_LEN: usize = 16 + EXTRA_ACCOUNTS * EXTRA_ACCOUNT_LEN;
@@ -70,6 +85,7 @@ pub fn process_instruction(program_id: &Address, accounts: &mut [AccountView], d
         tag::SET_AGENT => set_key(program_id, accounts, data, |book| &mut book.agent),
         tag::SET_COSIGNER => set_key(program_id, accounts, data, |book| &mut book.cosigner),
         tag::SET_GUARDIAN => set_guardian(program_id, accounts),
+        tag::SET_NAME => set_name(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -89,6 +105,12 @@ fn log(message: &str) {
 #[cfg(not(target_os = "solana"))]
 fn log(_message: &str) {}
 
+fn u64_in(account: &AccountView, at: usize) -> Result<u64, ProgramError> {
+    let data = account.try_borrow()?;
+    let bytes = data.get(at..at + 8).and_then(|bytes| bytes.try_into().ok()).ok_or(ProgramError::InvalidAccountData)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
 /// Token account layout: mint at 0, owner at 32, amount at 64.
 fn token_owner(account: &AccountView) -> Result<[u8; 32], ProgramError> {
     let data = account.try_borrow()?;
@@ -96,49 +118,59 @@ fn token_owner(account: &AccountView) -> Result<[u8; 32], ProgramError> {
 }
 
 fn token_amount(account: &AccountView) -> Result<u64, ProgramError> {
-    let data = account.try_borrow()?;
-    let bytes = data.get(64..72).and_then(|bytes| bytes.try_into().ok()).ok_or(ProgramError::InvalidAccountData)?;
-    Ok(u64::from_le_bytes(bytes))
+    u64_in(account, 64)
 }
 
 /// Mint layout: supply at 36.
 fn mint_supply(mint: &AccountView) -> Result<u64, ProgramError> {
-    let data = mint.try_borrow()?;
-    let bytes = data.get(36..44).and_then(|bytes| bytes.try_into().ok()).ok_or(ProgramError::InvalidAccountData)?;
-    Ok(u64::from_le_bytes(bytes))
+    u64_in(mint, 36)
 }
 
-/// Whether `cosigner` signed this transaction. The app signs a top-level instruction of its
-/// own next to the swap (it pays for the buyer's token account), not the swap itself, so every
-/// top-level instruction is looked at.
-fn cosigned(ixs: &AccountView, cosigner: &[u8; 32]) -> Result<bool, ProgramError> {
+fn share(amount: u64, supply: u64) -> u64 {
+    if supply == 0 {
+        return 0;
+    }
+    (amount as u128 * MILLIONTHS as u128 / supply as u128) as u64
+}
+
+/// What the transaction itself says: whether `cosigner` signed it, and the priority fee it
+/// set. The app signs a top-level instruction of its own next to the swap (it pays for the
+/// buyer's token account), not the swap itself, so every top-level instruction is looked at.
+fn read_transaction(ixs: &AccountView, cosigner: &[u8; 32]) -> Result<(bool, u64), ProgramError> {
     let ixs = Instructions::try_from(ixs)?;
+    let (mut cosigned, mut priority) = (false, 0);
     for i in 0..ixs.num_instructions() {
         let ix = ixs.load_instruction_at(i)?;
         for j in 0..ix.num_account_metas() {
             let account = ix.get_instruction_account_at(j)?;
-            if account.is_signer() && account.key.as_array() == cosigner {
-                return Ok(true);
+            cosigned |= account.is_signer() && account.key.as_array() == cosigner;
+        }
+        let data = ix.get_instruction_data();
+        if ix.get_program_id() == &COMPUTE_BUDGET && data.first() == Some(&SET_COMPUTE_UNIT_PRICE) {
+            if let Some(price) = data.get(1..9).and_then(|bytes| bytes.try_into().ok()) {
+                priority = u64::from_le_bytes(price);
             }
         }
     }
-    Ok(false)
+    Ok((cosigned, priority))
 }
 
 /// The hook. Token-2022 has already moved the tokens when it calls this; an error undoes the
 /// whole transfer.
 ///
 /// Accounts: source, mint, destination, authority, validation account, rulebook, Instructions
-/// sysvar. It writes nothing, so calling it outside a transfer achieves nothing.
+/// sysvar, the curve's SOL vault. It writes nothing, so calling it outside a transfer
+/// achieves nothing.
 fn execute(program_id: &Address, accounts: &mut [AccountView], data: &[u8]) -> ProgramResult {
-    let [source, mint, dest, _authority, _validation, book, ixs, ..] = accounts else {
+    let [source, mint, dest, _authority, _validation, book, ixs, curve_vault, ..] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
     let amount = u64::from_le_bytes(array(data, 0)?);
 
-    // A holder can always sell: this comes before any rule is even read.
+    // Only a buy is ever judged. Selling into the curve and moving tokens between wallets
+    // need nobody's permission, and this comes before any rule is even read.
     let receiver = token_owner(dest)?;
-    if receiver == *POOL_AUTHORITY.as_array() {
+    if token_owner(source)? != *POOL_AUTHORITY.as_array() || receiver == *POOL_AUTHORITY.as_array() {
         return Ok(());
     }
 
@@ -153,21 +185,46 @@ fn execute(program_id: &Address, accounts: &mut [AccountView], data: &[u8]) -> P
     if book.paused != 0 || (book.exempt != NO_KEY && receiver == book.exempt) {
         return Ok(());
     }
-
-    let rules = book.rules();
-    let buy = token_owner(source)? == *POOL_AUTHORITY.as_array();
-    if buy && rules.gate_open(Clock::get()?.unix_timestamp) && !cosigned(ixs, &book.cosigner)? {
-        log("app-only window: this token can only be bought through the app right now");
-        return Err(Refusal::NotCosigned.into());
+    let clock = Clock::get()?;
+    let now = clock.unix_timestamp;
+    if !book.rule_in_force(now) {
+        return Ok(());
     }
-    let transfer = Transfer { buy, amount, supply: mint_supply(mint)?, held_after: token_amount(dest)? };
-    rules.check_caps(&transfer).map_err(|refusal| {
-        log(match refusal {
-            Refusal::BuyTooLarge => "max buy: this buy is above the current cap",
-            _ => "max wallet: the receiving wallet would hold more than the current cap",
-        });
-        refusal.into()
-    })
+
+    let (conditions, count) = book.rule();
+    let conditions = &conditions[..count];
+    let supply = mint_supply(mint)?;
+    let held = token_amount(dest)?;
+    let mut facts: Facts = [0; fact::COUNT];
+    facts[fact::SIZE as usize] = share(amount, supply);
+    facts[fact::HELD_BEFORE as usize] = share(held.saturating_sub(amount), supply);
+    facts[fact::HELD_AFTER as usize] = share(held, supply);
+    let second_of_day = now.rem_euclid(86_400) as u64;
+    facts[fact::MINUTE as usize] = second_of_day % 3_600 / 60;
+    facts[fact::HOUR as usize] = second_of_day / 3_600;
+    // 1 January 1970 was a Thursday.
+    facts[fact::WEEKDAY as usize] = (now.div_euclid(86_400) + 4).rem_euclid(7) as u64;
+    facts[fact::ELAPSED as usize] = now.saturating_sub(book.updated_at()).max(0) as u64;
+    let account_seed = u64::from_le_bytes(array(dest.address().as_array(), 0)?);
+    facts[fact::LUCK as usize] = clock.slot.wrapping_add(account_seed) % 100;
+    if looks_at(conditions, fact::VIA_APP) || looks_at(conditions, fact::PRIORITY) {
+        let (cosigned, priority) = read_transaction(ixs, &book.cosigner)?;
+        facts[fact::VIA_APP as usize] = cosigned as u64;
+        facts[fact::PRIORITY as usize] = priority;
+    }
+    if looks_at(conditions, fact::CURVE_SOL) {
+        if *curve_vault.address().as_array() != book.curve_vault {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        // The vault is a wrapped-SOL token account, so its amount is in lamports.
+        facts[fact::CURVE_SOL as usize] = token_amount(curve_vault)? / 1_000_000;
+    }
+
+    if admits(conditions, &facts) {
+        return Ok(());
+    }
+    log("edict: this buy does not fit the rule in force");
+    Err(Refusal::NotAllowed.into())
 }
 
 /// Creates the token's rulebook and the validation account Token-2022 reads. The mint signs,
@@ -175,8 +232,9 @@ fn execute(program_id: &Address, accounts: &mut [AccountView], data: &[u8]) -> P
 ///
 /// Accounts: payer (signer, writable), mint (signer), validation account (writable), rulebook
 /// (writable), system program.
-/// Data: guardian, agent, cosigner, exempt (32 bytes each), [`Limits`], then the first rules
-/// as a [`Change`] whose window must be zero.
+/// Data: guardian, agent, cosigner, exempt, curve vault (32 bytes each), [`Limits`], the
+/// opening fee split: holders, burn, treasury (2 bytes each), then the names the token can go
+/// by, 44 bytes each, the one it launches with first. The token opens with no rule.
 fn init(program_id: &Address, accounts: &mut [AccountView], data: &[u8]) -> ProgramResult {
     let [payer, mint, validation, book, _system_program, ..] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -187,12 +245,21 @@ fn init(program_id: &Address, accounts: &mut [AccountView], data: &[u8]) -> Prog
     if !validation.is_data_empty() || !book.is_data_empty() {
         return Err(ProgramError::AccountAlreadyInitialized);
     }
-    let limits = Limits::decode(&array(data, 128)?);
-    let first = Change::decode(&array(data, 128 + Limits::LEN)?);
-    if data.len() != 128 + Limits::LEN + Change::LEN || !limits.sane() || first.gate_secs != 0 {
+    const KEYS: usize = 5 * 32;
+    const NAMES: usize = KEYS + Limits::LEN + 6;
+    let limits = Limits::decode(&array(data, KEYS)?);
+    let split: [u8; 6] = array(data, KEYS + Limits::LEN)?;
+    let (holders_bps, burn_bps, treasury_bps) = (u16::from_le_bytes([split[0], split[1]]), u16::from_le_bytes([split[2], split[3]]), u16::from_le_bytes([split[4], split[5]]));
+    let names = data.get(NAMES..).ok_or(ProgramError::InvalidInstructionData)?;
+    if !limits.sane() {
         return Err(ProgramError::InvalidInstructionData);
     }
-    limits.admit(&first, false)?;
+    if !split_adds_up(holders_bps, burn_bps, treasury_bps) {
+        return Err(Refusal::BadSplit.into());
+    }
+    if treasury_bps > limits.max_treasury_bps {
+        return Err(Refusal::OutsideLimits.into());
+    }
 
     // Both accounts sit at their canonical address, so a token has exactly one rulebook.
     let mint_key = *mint.address().as_array();
@@ -201,6 +268,7 @@ fn init(program_id: &Address, accounts: &mut [AccountView], data: &[u8]) -> Prog
     if validation.address() != &validation_key || book.address() != &book_key {
         return Err(ProgramError::InvalidSeeds);
     }
+    let curve_vault: [u8; 32] = array(data, 128)?;
 
     let bump = [validation_bump];
     let seeds = [Seed::from(VALIDATION_SEED), Seed::from(&mint_key), Seed::from(&bump)];
@@ -208,14 +276,16 @@ fn init(program_id: &Address, accounts: &mut [AccountView], data: &[u8]) -> Prog
     {
         // The list as the transfer-hook interface stores it: the instruction it is for, the
         // byte length of what follows, the number of entries, then the entries. Kind 0 is a
-        // plain address. Both entries depend on the mint alone: routers resolve them without
+        // plain address. Every entry depends on the mint alone: routers resolve them without
         // knowing the buyer.
         let mut list = validation.try_borrow_mut()?;
         list[0..8].copy_from_slice(&EXECUTE);
         list[8..12].copy_from_slice(&((4 + EXTRA_ACCOUNTS * EXTRA_ACCOUNT_LEN) as u32).to_le_bytes());
         list[12..16].copy_from_slice(&(EXTRA_ACCOUNTS as u32).to_le_bytes());
-        list[17..49].copy_from_slice(book_key.as_array());
-        list[52..84].copy_from_slice(INSTRUCTIONS_ID.as_array());
+        for (i, key) in [book_key.as_array(), INSTRUCTIONS_ID.as_array(), &curve_vault].into_iter().enumerate() {
+            let at = 16 + i * EXTRA_ACCOUNT_LEN + 1;
+            list[at..at + 32].copy_from_slice(key);
+        }
     }
 
     let bump = [book_bump];
@@ -230,8 +300,14 @@ fn init(program_id: &Address, accounts: &mut [AccountView], data: &[u8]) -> Prog
     book.agent = array(data, 32)?;
     book.cosigner = array(data, 64)?;
     book.exempt = array(data, 96)?;
+    book.curve_vault = curve_vault;
     book.set_limits(&limits);
-    book.set_rules(&first.rules(0));
+    book.set_split(holders_bps, burn_bps, treasury_bps);
+    if !book.set_names(names) {
+        return Err(Refusal::BadName.into());
+    }
+    // The name it launches with is owed the same stay as any later one.
+    book.set_renamed_at(Clock::get()?.unix_timestamp);
     Ok(())
 }
 
@@ -278,11 +354,11 @@ fn set_rules(program_id: &Address, accounts: &mut [AccountView], data: &[u8]) ->
     let [agent, book, ..] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
-    if data.len() != Change::LEN + 32 {
+    let (change, used) = Change::decode(data).ok_or(ProgramError::from(Refusal::BadRule))?;
+    if data.len() != used + 32 {
         return Err(ProgramError::InvalidInstructionData);
     }
-    let change = Change::decode(&array(data, 0)?);
-    let note = array(data, Change::LEN)?;
+    let note = array(data, used)?;
     let now = Clock::get()?.unix_timestamp;
     as_keyholder(
         program_id,
@@ -343,4 +419,61 @@ fn set_guardian(program_id: &Address, accounts: &mut [AccountView]) -> ProgramRe
         book.guardian = key;
         Ok(())
     })
+}
+
+/// The agent switches the token to another of the names written at launch, as part of an
+/// edict. The rulebook's own address holds the right to edit the token's metadata, so no
+/// key can put any other name on the token.
+///
+/// Accounts: agent (signer), rulebook (writable), mint (writable), Token-2022.
+/// Data: one byte, the number of the name.
+fn set_name(program_id: &Address, accounts: &mut [AccountView], data: &[u8]) -> ProgramResult {
+    let [agent, book, mint, _token_program, ..] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    let [index] = data else {
+        return Err(ProgramError::InvalidInstructionData);
+    };
+    let now = Clock::get()?.unix_timestamp;
+    let mint_key = *mint.address().as_array();
+    let (mut name, mut symbol) = ([0; NAME_LEN], [0; SYMBOL_LEN]);
+    let (mut name_len, mut symbol_len, mut bump) = (0, 0, 0);
+    as_keyholder(
+        program_id,
+        agent,
+        book,
+        |book| (book.agent, Refusal::NotAgent),
+        |book| {
+            if book.mint != mint_key {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            book.rename(*index, now)?;
+            let (new_name, new_symbol) = book.name_at(*index).ok_or(ProgramError::from(Refusal::BadName))?;
+            name[..new_name.len()].copy_from_slice(new_name);
+            symbol[..new_symbol.len()].copy_from_slice(new_symbol);
+            (name_len, symbol_len, bump) = (new_name.len(), new_symbol.len(), book.bump);
+            Ok(())
+        },
+    )?;
+
+    // The rulebook is no longer borrowed here: Token-2022 is about to read it as a signer.
+    let bump = [bump];
+    let seeds = [Seed::from(RULEBOOK_SEED), Seed::from(&mint_key), Seed::from(&bump)];
+    update_field(mint, book, FIELD_NAME, &name[..name_len], &seeds)?;
+    update_field(mint, book, FIELD_SYMBOL, &symbol[..symbol_len], &seeds)
+}
+
+/// Asks Token-2022 to put `value` in one field of the mint's metadata, signed by the rulebook.
+/// Token-2022 resizes the mint itself; the lamports for a longer name are put there at launch.
+fn update_field(mint: &AccountView, book: &AccountView, field: u8, value: &[u8], seeds: &[Seed; 3]) -> ProgramResult {
+    // the instruction's own 8 bytes, the field's number, then the text behind its length
+    let mut data = [0; 8 + 1 + 4 + NAME_LEN];
+    let len = 13 + value.len();
+    data[..8].copy_from_slice(&UPDATE_FIELD);
+    data[8] = field;
+    data[9..13].copy_from_slice(&(value.len() as u32).to_le_bytes());
+    data.get_mut(13..len).ok_or(ProgramError::InvalidInstructionData)?.copy_from_slice(value);
+    let accounts = [InstructionAccount::writable(mint.address()), InstructionAccount::readonly_signer(book.address())];
+    let instruction = InstructionView { program_id: &TOKEN_2022, accounts: &accounts, data: &data[..len] };
+    invoke_signed(&instruction, &[mint, book], &[Signer::from(seeds)])
 }

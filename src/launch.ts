@@ -1,10 +1,13 @@
-// Puts the token on chain in three transactions: the curve's config, the hook's rulebook, the
-// pool. The caller supplies `send`, which signs, sends and waits for each one.
-import { type Keypair, type PublicKey, Transaction } from "@solana/web3.js";
-import { deriveDbcPoolAddress, type DynamicBondingCurveClient } from "@meteora-ag/dynamic-bonding-curve-sdk";
-import { NATIVE_MINT } from "@solana/spl-token";
+// Puts the token on chain in up to four transactions: the curve's config, the hook's
+// rulebook, the pool and, for a token with more than one name, the handing of its name to
+// the rulebook. The caller supplies `send`, which signs, sends and waits for each one. A step
+// already done on chain is skipped, so a launch that stopped halfway can be run again.
+import { deriveDbcPoolAddress, deriveDbcTokenVaultAddress, type DynamicBondingCurveClient } from "@meteora-ag/dynamic-bonding-curve-sdk";
+import { getTokenMetadata, NATIVE_MINT, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
+import { createUpdateAuthorityInstruction } from "@solana/spl-token-metadata";
+import { type Keypair, type PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import { curveConfig, type CurveInput } from "./curve.js";
-import { initIx, type Change, type Limits } from "./hook.js";
+import { initIx, rulebookAddress, type Limits, type Name, type Split } from "./hook.js";
 
 export type Launch = {
   dbc: DynamicBondingCurveClient;
@@ -22,60 +25,103 @@ export type Launch = {
   /** An owner no rule applies to (the buyback vault). */
   exempt?: PublicKey;
   limits: Limits;
-  first: Change;
-  curve: CurveInput;
-  name: string;
-  symbol: string;
+  /** The fee split the token opens with. It opens with no rule. */
+  split: Split;
+  /** Whether the name can change follows from `names`, so it is not asked for here. */
+  curve: Omit<CurveInput, "renamable">;
+  /** The names the token can go by, the one it launches with first. One name: it never changes. */
+  names: Name[];
   uri: string;
 };
 
 export type Send = (what: string, tx: Transaction, signers: Keypair[]) => Promise<unknown>;
 
+const bytes = (name: Name) => Buffer.byteLength(name.name) + Buffer.byteLength(name.symbol);
+
 export async function launch(p: Launch, send: Send): Promise<{ pool: PublicKey; solToGraduate: number }> {
-  const params = curveConfig(p.curve);
-  const config = await p.dbc.partner.createConfigWithTransferHook({
-    ...params,
-    config: p.config.publicKey,
-    feeClaimer: p.feeClaimer,
-    leftoverReceiver: p.feeClaimer,
-    quoteMint: NATIVE_MINT,
-    payer: p.payer.publicKey,
-    transferHookProgram: p.hookProgram,
-  });
-  await send("create the curve's config", config, [p.payer, p.config]);
+  const renamable = p.names.length > 1;
+  const params = curveConfig({ ...p.curve, renamable });
+  const pool = deriveDbcPoolAddress(NATIVE_MINT, p.mint.publicKey, p.config.publicKey);
+  const book = rulebookAddress(p.hookProgram, p.mint.publicKey);
+  const { connection } = p.dbc;
+  const onChain = async (address: PublicKey) => (await connection.getAccountInfo(address)) !== null;
+
+  if (!(await onChain(p.config.publicKey))) {
+    const config = await p.dbc.partner.createConfigWithTransferHook({
+      ...params,
+      config: p.config.publicKey,
+      feeClaimer: p.feeClaimer,
+      leftoverReceiver: p.feeClaimer,
+      quoteMint: NATIVE_MINT,
+      payer: p.payer.publicKey,
+      transferHookProgram: p.hookProgram,
+    });
+    await send("create the curve's config", config, [p.payer, p.config]);
+  }
 
   // The rulebook goes in before the pool: the mint's own key signs it, and without it no
   // transfer of the token can go through.
-  const rulebook = new Transaction().add(
-    initIx({ program: p.hookProgram, payer: p.payer.publicKey, mint: p.mint.publicKey, guardian: p.guardian, agent: p.agent, cosigner: p.cosigner, exempt: p.exempt, limits: p.limits, first: p.first }),
-  );
-  await send("write the rulebook", rulebook, [p.payer, p.mint]);
-
-  // The SDK reads the config back from chain to build this one, and an RPC can lag a moment
-  // behind a transaction it has just confirmed.
-  const createPool = () =>
-    p.dbc.creator.createPoolWithTransferHook({
-      name: p.name,
-      symbol: p.symbol,
-      uri: p.uri,
-      payer: p.payer.publicKey,
-      poolCreator: p.payer.publicKey,
-      config: p.config.publicKey,
-      baseMint: p.mint.publicKey,
-      transferHookProgram: p.hookProgram,
-    });
-  let pool: Transaction | null = null;
-  for (let attempt = 0; !pool; attempt++) {
-    pool = await createPool().catch(async (error) => {
-      if (attempt >= 10) throw error;
-      await new Promise((r) => setTimeout(r, 1_500));
-      return null;
-    });
+  if (!(await onChain(book))) {
+    const rulebook = new Transaction().add(
+      initIx({
+        program: p.hookProgram,
+        payer: p.payer.publicKey,
+        mint: p.mint.publicKey,
+        guardian: p.guardian,
+        agent: p.agent,
+        cosigner: p.cosigner,
+        exempt: p.exempt,
+        // The pool's address follows from the mint and the config, so its SOL vault is known before it exists.
+        curveVault: deriveDbcTokenVaultAddress(pool, NATIVE_MINT),
+        limits: p.limits,
+        split: p.split,
+        names: p.names,
+      }),
+    );
+    await send("write the rulebook", rulebook, [p.payer, p.mint]);
   }
-  await send("create the pool", pool, [p.payer, p.mint]);
 
-  return {
-    pool: deriveDbcPoolAddress(NATIVE_MINT, p.mint.publicKey, p.config.publicKey),
-    solToGraduate: Number(params.migrationQuoteThreshold.toString()) / 1e9,
-  };
+  if (!(await onChain(pool))) {
+    // The SDK reads the config back from chain to build this one, and an RPC can lag a moment
+    // behind a transaction it has just confirmed.
+    const createPool = () =>
+      p.dbc.creator.createPoolWithTransferHook({
+        ...p.names[0],
+        uri: p.uri,
+        payer: p.payer.publicKey,
+        poolCreator: p.payer.publicKey,
+        config: p.config.publicKey,
+        baseMint: p.mint.publicKey,
+        transferHookProgram: p.hookProgram,
+      });
+    let creation: Transaction | null = null;
+    for (let attempt = 0; !creation; attempt++) {
+      creation = await createPool().catch(async (error) => {
+        if (attempt >= 10) throw error;
+        await new Promise((r) => setTimeout(r, 1_500));
+        return null;
+      });
+    }
+    await send("create the pool", creation, [p.payer, p.mint]);
+  }
+
+  // Meteora leaves the right to edit the token's metadata with the pool's creator. It goes to
+  // the rulebook's address at once, so that from here on a name changes only the way the
+  // program allows. The mint is given the lamports to hold the longest of its names.
+  if (renamable) {
+    const metadata = await getTokenMetadata(connection, p.mint.publicKey, "confirmed", TOKEN_2022_PROGRAM_ID);
+    if (metadata?.updateAuthority?.equals(p.payer.publicKey)) {
+      const mint = (await connection.getAccountInfo(p.mint.publicKey))!;
+      const room = Math.max(...p.names.map(bytes)) - bytes(metadata);
+      const missing = (await connection.getMinimumBalanceForRentExemption(mint.data.length + Math.max(room, 0))) - mint.lamports;
+      const handover = new Transaction();
+      if (missing > 0) handover.add(SystemProgram.transfer({ fromPubkey: p.payer.publicKey, toPubkey: p.mint.publicKey, lamports: missing }));
+      handover.add(createUpdateAuthorityInstruction({ programId: TOKEN_2022_PROGRAM_ID, metadata: p.mint.publicKey, oldAuthority: p.payer.publicKey, newAuthority: book }));
+      await send("hand the token's name to the rulebook", handover, [p.payer]);
+    } else if (!metadata?.updateAuthority?.equals(book)) {
+      throw new Error(`the token's name can be edited by ${metadata?.updateAuthority?.toBase58() ?? "nobody"}, not by its rulebook`);
+    }
+  }
+
+  return { pool, solToGraduate: Number(params.migrationQuoteThreshold.toString()) / 1e9 };
 }

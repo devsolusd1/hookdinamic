@@ -28,9 +28,11 @@ export type CurveInput = {
   graduationCapSol: number;
   /** Fee on every buy and sell, in bps. Meteora fixes it per config: it cannot change later. */
   feeBps: number;
+  /** Whether the token's name and ticker can change after launch. Also fixed with the config. */
+  renamable?: boolean;
 };
 
-export function curveConfig({ startCapSol, graduationCapSol, feeBps }: CurveInput) {
+export function curveConfig({ startCapSol, graduationCapSol, feeBps, renamable }: CurveInput) {
   // Sixteen segments of equal liquidity are one constant-product curve, like pump.fun's.
   // The SDK's single-segment builder (buildCurveWithMarketCap) refuses a range this wide:
   // past about 30,000 times the start cap its own rounding leaves it a few lamports short.
@@ -40,8 +42,9 @@ export function curveConfig({ startCapSol, graduationCapSol, feeBps }: CurveInpu
       tokenType: TokenType.Token2022,
       tokenBaseDecimal: TokenDecimal.SIX,
       tokenQuoteDecimal: 9,
-      // nobody can mint more or edit the metadata
-      tokenAuthorityOption: TokenAuthorityOption.Immutable,
+      // Nobody can mint more. The metadata is sealed, or left with the pool's creator, who
+      // hands it to the rulebook as soon as the pool exists.
+      tokenAuthorityOption: renamable ? TokenAuthorityOption.CreatorUpdateAuthority : TokenAuthorityOption.Immutable,
       totalTokenSupply: TOTAL_SUPPLY,
       leftover: 0,
     },

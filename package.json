@@ -13,7 +13,10 @@
     "agent": "tsx scripts/agent.ts",
     "site": "node scripts/site.mjs",
     "site:seed": "tsx scripts/seed-site.ts",
-    "site:local": "node scripts/site.mjs --port 4322 --config .local/site/config.js --log .local/site/log.jsonl"
+    "site:local": "node scripts/site.mjs --port 4322 --config .local/site/config.js --log .local/site/log.jsonl",
+    "launch": "tsx scripts/launch.ts",
+    "smoke": "tsx scripts/smoke.ts",
+    "site:devnet": "node scripts/site.mjs --port 4323 --config .local/devnet/site-config.js --log .local/devnet/agent-log.jsonl"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.131.0",

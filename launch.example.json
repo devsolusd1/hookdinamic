@@ -1,0 +1,29 @@
+{
+  "rpc": "https://api.devnet.solana.com",
+  "hookProgram": "<endereço do programa do hook já publicado>",
+  "payerKeypair": "payer.json",
+  "guardian": "<carteira do guardião>",
+  "agent": "<carteira do agente>",
+  "cosigner": "<carteira assinante do app>",
+  "feeBps": 200,
+  "startCapSol": 30,
+  "graduationCapUsd": 1000000000,
+  "limits": {
+    "minIntervalSecs": 600,
+    "maxRuleSecs": 7200,
+    "maxTreasuryBps": 3000,
+    "minRenameSecs": 86400
+  },
+  "split": {
+    "holdersBps": 4000,
+    "burnBps": 4000,
+    "treasuryBps": 2000
+  },
+  "names": [
+    { "name": "Edict", "symbol": "EDICT" },
+    { "name": "Decree", "symbol": "DECREE" },
+    { "name": "By Order", "symbol": "BYORDER" },
+    { "name": "Same Coin", "symbol": "SAME" }
+  ],
+  "uri": "https://<seu domínio>/metadata.json"
+}
