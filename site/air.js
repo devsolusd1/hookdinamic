@@ -24,8 +24,6 @@ const NUDGES = {
   edict: [[0, -420, 60]],
   // an edict running out lets it sink a little
   over: [[0, 160, -40]],
-  // something it cannot tell from here: it leans, and stays leaning a moment
-  unsure: [[0, 0, 110]],
 };
 
 /**

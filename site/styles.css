@@ -1,33 +1,38 @@
-/* Veluno's page. White paper and two colours taken from the character: the orange of its body
-   and the brown of its eyes. A soft serif for what it says, a plain sans for the rest, mono
-   for what the chain says. It is the same white page whatever the device prefers. */
+/* Veluno's page. White, a light grey for whatever holds something, near-black for words, and
+   one colour: the orange of its body. A sans with some character for what it says and for
+   headings, a plain sans for the rest, mono only for addresses and the clock. */
 
 :root {
   color-scheme: light;
   --paper: #ffffff;
-  --paper-deep: #f6f2ea;
-  --ink: #442319;
+  --paper-deep: #f4f4f6;
+  --ink: #1e1d22;
   --veluno: #f84d25;
   /* The same orange, deep enough to read as small text on white. */
   --veluno-text: #c2370f;
   --eye: #fefbf0;
   --ink-soft: color-mix(in oklab, var(--ink) 68%, var(--paper));
   --hairline: color-mix(in oklab, var(--ink) 18%, var(--paper));
+  /* A wash of my orange, for whatever is on right now, and the roundness of everything that holds something. */
+  --tint: color-mix(in oklab, var(--veluno) 11%, var(--paper));
+  --radius: 1.5rem;
+  /* What is written on my orange. */
+  --on-veluno: #1e1d22;
   /* The edge of something that can be pressed: it has to be seen. */
-  --edge: color-mix(in oklab, var(--ink) 50%, var(--paper));
-  --display: "Fraunces", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  --edge: color-mix(in oklab, var(--ink) 54%, var(--paper));
+  --display: "Bricolage Grotesque", "Instrument Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
   --sans: "Instrument Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   --gutter: clamp(1.25rem, 4vw, 3.5rem);
 }
 
-/* Night, for whoever asks for it with the moon at the top right: the same page on charcoal,
-   with my cream for ink. Everything else follows from these. */
+/* Night, for whoever asks for it with the moon at the top right: the same page on charcoal.
+   Everything else follows from these. */
 :root[data-theme="night"] {
   color-scheme: dark;
   --paper: #2a292e;
-  --paper-deep: #36353b;
-  --ink: #f6efe6;
+  --paper-deep: #35343a;
+  --ink: #f3f2f5;
   --veluno: #ff5a30;
   --veluno-text: #ff8d6b;
 }
@@ -38,9 +43,8 @@
   box-sizing: border-box;
 }
 
-/* At night the dot for "this one is on" sits on my cream where a pill is filled: a deeper orange keeps it in sight. */
-[data-theme="night"] .notch[aria-pressed="true"][data-on]::before,
-[data-theme="night"] .hook.is-on .hook-state::before {
+/* At night a pressed pill is filled with light: a deeper orange keeps the dot for "this one is on" in sight on it. */
+[data-theme="night"] .notch[aria-pressed="true"][data-on]::before {
   background: #c2370f;
 }
 
@@ -71,7 +75,13 @@ body {
 
 ::selection {
   background: var(--veluno);
-  color: var(--paper);
+  color: var(--on-veluno);
+}
+
+/* The heaviest weight this page loads for its text. */
+strong,
+b {
+  font-weight: 600;
 }
 
 p,
@@ -107,11 +117,10 @@ button {
   outline-offset: 3px;
 }
 
-/* The small mono used for everything that names or labels. */
+/* The small print that names things: plain words, said and not stamped. */
 .label {
-  font: 500 0.72rem/1.5 var(--mono);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font: 600 0.82rem/1.4 var(--sans);
+  letter-spacing: 0.005em;
 }
 
 .skip {
@@ -119,14 +128,19 @@ button {
   left: var(--gutter);
   top: -4rem;
   z-index: 5;
-  padding: 0.5rem 0.75rem;
+  padding: 0.5rem 0.9rem;
+  border-radius: 999px;
   background: var(--ink);
   color: var(--paper);
-  font: 500 0.8rem var(--mono);
+  font: 600 0.85rem var(--sans);
 }
 
 .skip:focus {
   top: 0.5rem;
+}
+
+.skip:hover {
+  color: var(--paper);
 }
 
 /* The top: my name, and the rail. Five places, each with one line under it that the chain
@@ -146,7 +160,7 @@ button {
 }
 
 :root:not([data-view="home"]) .top {
-  border-bottom-color: var(--hairline);
+  border-bottom-color: var(--paper-deep);
 }
 
 .brand {
@@ -157,8 +171,8 @@ button {
 }
 
 .brand a {
-  font: 600 1.5rem/1 var(--display);
-  font-variation-settings: "SOFT" 100, "WONK" 1;
+  font: 700 1.45rem/1 var(--display);
+  letter-spacing: -0.02em;
   text-decoration: none;
 }
 
@@ -241,8 +255,8 @@ button {
 
 .stop-word {
   display: block;
-  font: 500 1.12rem/1.2 var(--display);
-  font-variation-settings: "SOFT" 100, "WONK" 1;
+  font: 600 1.12rem/1.2 var(--display);
+  white-space: nowrap;
 }
 
 .rail a:hover,
@@ -258,7 +272,7 @@ button {
   display: block;
   min-height: 1.5em;
   overflow: hidden;
-  font: 400 0.68rem/1.5 var(--mono);
+  font: 500 0.74rem/1.5 var(--sans);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -269,7 +283,7 @@ button {
 }
 
 .stop-live b {
-  font-weight: 500;
+  font-weight: 600;
 }
 
 /* Where I am, I am the report. */
@@ -375,7 +389,7 @@ main {
   width: 100%;
   max-width: 84rem;
   margin-inline: auto;
-  padding: clamp(1rem, 2.4vw, 2.25rem) var(--gutter) clamp(2.5rem, 5vw, 4rem);
+  padding: clamp(1.5rem, 3.5vw, 3rem) var(--gutter) clamp(3rem, 6vw, 5rem);
   /* Opened straight at #hooks, the browser scrolls to that page. A page starts at its top, with
      my name and the rail above it, so the margin is taller than anything that could be above.
      A fixed length: a window that reports no height yet, as some in-app browsers do, would
@@ -409,20 +423,63 @@ main {
 }
 
 .view-title {
-  font: 500 clamp(2.6rem, 6vw, 4.6rem)/0.98 var(--display);
-  font-variation-settings: "SOFT" 100, "WONK" 1;
-  letter-spacing: -0.02em;
+  font: 700 clamp(2rem, 4.2vw, 3.1rem)/1.02 var(--display);
+  letter-spacing: -0.03em;
 }
 
 .view-lede {
-  max-width: 44rem;
-  margin-top: 1.1rem;
-  font-size: 1.2rem;
+  max-width: 38rem;
+  margin-top: 0.75rem;
+  font-size: 1.1rem;
   line-height: 1.45;
+  color: var(--ink-soft);
 }
 
 .view-head {
-  margin-bottom: clamp(1.75rem, 4vw, 2.75rem);
+  margin-bottom: clamp(2rem, 4vw, 3rem);
+}
+
+/* The small things to press all over these pages: round, soft, and they fill in under the pointer. */
+.ask,
+.dare,
+.copy,
+.record-earlier button {
+  padding: 0.38rem 0.9rem;
+  border: 0;
+  border-radius: 999px;
+  background: var(--paper-deep);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.ask:hover,
+.dare:hover,
+.copy:hover,
+.record-earlier button:hover {
+  background: var(--ink);
+  color: var(--paper);
+}
+
+/* A pale pill on a pale tile: each one gets a fine edge, so it reads as something to press
+   without a pointer over it. A filled one needs none. */
+.ask,
+.dare,
+.copy,
+.record-earlier button,
+.notch,
+.door-filter button,
+.entry-more summary {
+  box-shadow: inset 0 0 0 1px var(--edge);
+}
+
+.ask:hover,
+.dare:hover,
+.copy:hover,
+.record-earlier button:hover,
+.notch[aria-pressed="true"],
+.door-filter button[aria-pressed="true"]:not(.is-sell),
+.dare.is-no {
+  box-shadow: none;
 }
 
 /* Home: Veluno, and what it is saying. */
@@ -518,9 +575,8 @@ main {
 }
 
 .says h1 {
-  font: 500 clamp(2.8rem, 5.6vw, 4.9rem)/0.96 var(--display);
-  font-variation-settings: "SOFT" 100, "WONK" 1;
-  letter-spacing: -0.025em;
+  font: 700 clamp(2.7rem, 5.4vw, 4.6rem)/0.98 var(--display);
+  letter-spacing: -0.035em;
 }
 
 .says h1 em {
@@ -542,10 +598,9 @@ main {
   min-height: 5.5rem;
   padding: clamp(1.2rem, 2.2vw, 1.9rem) clamp(1.3rem, 2.5vw, 2.1rem);
   border-radius: 1.9rem;
-  background-color: var(--ink);
-  color: var(--paper);
-  font: 400 clamp(1.3rem, 2.15vw, 1.85rem)/1.26 var(--display);
-  font-variation-settings: "SOFT" 100;
+  background-color: var(--tint);
+  color: var(--ink);
+  font: 500 clamp(1.25rem, 1.95vw, 1.7rem)/1.3 var(--display);
   text-wrap: pretty;
   transition: background-color 0.4s, color 0.4s;
 }
@@ -567,8 +622,10 @@ main {
   color: var(--ink);
 }
 
+/* Words of the page's own, where mine could not be shown: quieter, not slanted. */
 .bubble.is-plain > [data-edict-text] {
-  font-style: italic;
+  font-weight: 400;
+  color: var(--ink-soft);
 }
 
 .bubble-why {
@@ -603,21 +660,6 @@ main {
 .term-clock b {
   font: 500 0.95em var(--mono);
   font-variant-numeric: tabular-nums;
-}
-
-.ask {
-  padding: 0.3rem 0;
-  border: 0;
-  background: none;
-  color: var(--ink-soft);
-  text-decoration: underline;
-  text-decoration-thickness: 1px;
-  text-underline-offset: 0.2em;
-  cursor: pointer;
-}
-
-.ask:hover {
-  color: var(--veluno-text);
 }
 
 /* The edict's term as a line: what has passed in ink, what is to come in pencil, and a mark
@@ -756,64 +798,53 @@ main {
   text-decoration-color: var(--edge);
 }
 
-/* What is on: three switches, at the head of the list of hooks. */
+/* What is on right now: three things, on a wash of my orange at the head of the page. */
 
 .board {
   display: grid;
   grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 0.9fr);
-  column-gap: var(--gutter);
-  margin-bottom: clamp(2rem, 4vw, 3rem);
-  padding-bottom: 1.1rem;
-  border-top: 2px solid var(--ink);
-  border-bottom: 1px solid var(--hairline);
+  gap: 0.5rem clamp(1.25rem, 3vw, 2.5rem);
+  margin-bottom: clamp(1.75rem, 3.5vw, 2.5rem);
+  padding: 1.2rem 1.5rem 1.4rem;
+  border-radius: var(--radius);
+  background: var(--tint);
 }
 
 .board-head {
   grid-column: 1 / -1;
-  padding-block: 0.65rem 0.35rem;
+  color: var(--veluno-text);
 }
 
 .switch {
   display: grid;
   align-content: start;
-  gap: 0.15rem;
+  gap: 0.1rem;
 }
 
-.switch-kind::before {
-  content: "";
-  display: inline-block;
-  width: 0.55em;
-  height: 0.55em;
-  margin-right: 0.55em;
-  border-radius: 50%;
-  background: var(--veluno);
-}
-
-.switch.is-off .switch-kind::before {
-  background: none;
-  box-shadow: inset 0 0 0 1px var(--ink-soft);
+.switch-kind {
+  color: var(--ink-soft);
 }
 
 .switch-name {
-  font: 500 1.5rem/1.2 var(--display);
-  font-variation-settings: "SOFT" 100;
+  font: 600 1.6rem/1.15 var(--display);
   overflow-wrap: anywhere;
 }
 
 .switch-more {
-  font-size: 0.95rem;
+  font-size: 0.9rem;
+  line-height: 1.35;
   color: var(--ink-soft);
 }
 
 .switch-note {
-  margin-top: 0.2rem;
-  font: 400 0.78rem/1.45 var(--mono);
+  margin-top: 0.25rem;
+  font-size: 0.85rem;
   font-variant-numeric: tabular-nums;
   color: var(--ink-soft);
 }
 
 .switch-note b {
-  font-weight: 500;
+  font-weight: 600;
   color: var(--ink);
 }
 
@@ -828,9 +859,10 @@ main {
   display: flex;
   height: 0.7rem;
   max-width: 20rem;
-  margin-top: 0.35rem;
-  border: 1px solid var(--ink);
+  margin-top: 0.45rem;
   border-radius: 999px;
+  background: var(--paper);
+  box-shadow: inset 0 0 0 1px var(--edge);
   overflow: hidden;
 }
 
@@ -852,63 +884,115 @@ main {
   flex: var(--treasury) 0 0;
 }
 
-/* The hooks: the catalogue as a numbered list. */
-
-.hook-group + .hook-group {
-  margin-top: 2.5rem;
+/* What is on the door right now, in one line. */
+.door-now {
+  width: fit-content;
+  max-width: 100%;
+  margin-bottom: clamp(1.5rem, 3vw, 2.25rem);
+  padding: 0.75rem 1.2rem;
+  border-radius: var(--radius);
+  background: var(--tint);
+  font-size: 0.98rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }
 
-.hook-group > .label {
+.door-now::before {
+  content: "";
+  display: inline-block;
+  width: 0.55em;
+  height: 0.55em;
+  margin-right: 0.6em;
+  border-radius: 50%;
+  background: var(--veluno);
+}
+
+/* With nothing on the door the line is plain: my orange is for what is on. */
+.door-now.is-open {
+  background: var(--paper-deep);
+}
+
+.door-now.is-open::before {
+  background: none;
+  box-shadow: inset 0 0 0 1.5px var(--edge);
+}
+
+/* The hooks: everything I can switch on, each on a tile of its own. */
+
+.hook-group + .hook-group {
+  margin-top: 3rem;
+}
+
+.hook-group-title {
   display: flex;
   flex-wrap: wrap;
-  justify-content: space-between;
-  gap: 0 1rem;
-  padding-bottom: 0.6rem;
-  border-bottom: 2px solid var(--ink);
+  align-items: baseline;
+  gap: 0.2rem 0.8rem;
+  margin-bottom: 1rem;
+  font: 700 1.55rem/1.15 var(--display);
+  letter-spacing: -0.02em;
 }
 
 .hook-group-aside {
+  font: 400 0.95rem/1.4 var(--sans);
   color: var(--ink-soft);
 }
 
 .hooks {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  column-gap: var(--gutter);
+  gap: 1rem;
   padding: 0;
   list-style: none;
 }
 
 .hook {
   display: grid;
-  grid-template-columns: 2.3rem minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 0.2rem 0.9rem;
-  align-items: baseline;
+  align-items: start;
   align-content: start;
-  padding-block: 1rem 1.15rem;
-  border-bottom: 1px solid var(--hairline);
+  padding: 1.3rem 1.5rem 1.4rem;
+  border-radius: var(--radius);
+  background: var(--paper-deep);
 }
 
-.hook-no {
-  font: 400 0.78rem/1.5 var(--mono);
-  font-variant-numeric: tabular-nums;
-  color: var(--ink-soft);
+/* The one that is on sits on my orange. */
+.hook.is-on {
+  background: var(--tint);
+}
+
+/* Only the name shares its row with what the margin says; everything under it has the tile's full width. */
+.hook-body {
+  display: contents;
+}
+
+.hook-about,
+.hook-settings,
+.hook-rule {
+  grid-column: 1 / -1;
 }
 
 .hook-name {
-  font: 500 1.4rem/1.2 var(--display);
-  font-variation-settings: "SOFT" 100;
+  grid-column: 1;
+  font: 600 1.15rem/1.25 var(--display);
 }
 
 .hook-about {
-  max-width: 34rem;
+  max-width: 30rem;
   margin-top: 0.15rem;
+  font-size: 0.95rem;
+  line-height: 1.4;
   color: var(--ink-soft);
 }
 
+.hook.is-on .hook-about {
+  color: var(--ink);
+}
+
 .hook-settings {
-  margin-top: 0.4rem;
-  font: 400 0.78rem/1.45 var(--mono);
+  margin-top: 0.65rem;
+  font-size: 0.85rem;
   color: var(--ink-soft);
   overflow-wrap: anywhere;
 }
@@ -917,27 +1001,25 @@ main {
 .notches {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.35rem;
+  gap: 0.4rem;
 }
 
 .notch {
-  padding: 0.2rem 0.6rem;
-  border: 1px solid var(--edge);
+  padding: 0.32rem 0.8rem;
+  border: 0;
   border-radius: 999px;
-  background: none;
-  color: var(--ink-soft);
-  font: inherit;
+  background: var(--paper);
+  color: var(--ink);
+  font: 500 0.88rem/1.3 var(--sans);
   cursor: pointer;
 }
 
 .notch:hover {
-  border-color: var(--ink);
-  color: var(--ink);
+  box-shadow: inset 0 0 0 1.5px var(--ink);
 }
 
 .notch[data-on] {
-  border-color: var(--ink);
-  color: var(--ink);
+  font-weight: 600;
 }
 
 .notch[data-on]::before {
@@ -951,62 +1033,26 @@ main {
 }
 
 .notch[aria-pressed="true"] {
-  border-color: var(--ink);
   background: var(--ink);
   color: var(--paper);
 }
 
+/* What I answer when a setting is pressed: said in a little bubble of its own. */
 .hook-rule {
   max-width: 34rem;
-  margin-top: 0.55rem;
-  padding-left: 0.8rem;
-  border-left: 2px solid var(--veluno);
-  font: 400 1.08rem/1.35 var(--display);
-  font-variation-settings: "SOFT" 100;
-}
-
-.hook-rule .fails,
-.hook-rule .holds,
-.hook-rule .unknown {
-  font-family: var(--sans);
-  font-size: 0.92em;
-}
-
-.hook-rule .fails {
-  text-decoration: line-through;
-  text-decoration-color: var(--veluno);
-  text-decoration-thickness: 2px;
-}
-
-.hook-rule .unknown {
-  border-bottom: 1px dashed var(--ink-soft);
-  color: var(--ink-soft);
-}
-
-.hook-answer {
-  font-weight: 600;
-  white-space: nowrap;
-}
-
-.hook-answer[data-admits="false"] {
-  color: var(--veluno-text);
-}
-
-.hook-answer[data-admits="null"] {
-  white-space: normal;
-}
-
-/* The buy to try them with, above the list. */
-.try-any {
-  margin-bottom: clamp(1.5rem, 3vw, 2.25rem);
-}
-
-.try-any .try-range:first-child {
-  margin-top: 0.2rem;
+  margin-top: 0.7rem;
+  padding: 0.7rem 0.95rem 0.75rem;
+  border-radius: 1rem;
+  background: var(--paper);
+  font-size: 0.98rem;
+  line-height: 1.4;
 }
 
 .hook-state {
+  grid-column: 2;
+  grid-row: 1;
   max-width: 13rem;
+  font: 600 0.82rem/1.4 var(--sans);
   color: var(--ink-soft);
   text-align: right;
 }
@@ -1016,33 +1062,14 @@ main {
 }
 
 .hook.is-on .hook-state {
-  padding: 0.22rem 0.65rem 0.2rem;
+  padding: 0.25rem 0.7rem;
   border-radius: 999px;
-  background: var(--ink);
-  color: var(--paper);
-}
-
-.hook.is-on .hook-state::before {
-  content: "";
-  display: inline-block;
-  width: 0.55em;
-  height: 0.55em;
-  margin-right: 0.55em;
-  border-radius: 50%;
   background: var(--veluno);
-}
-
-.hook.is-on .hook-about {
-  color: var(--ink);
+  color: var(--on-veluno);
 }
 
 .catalogue-note {
-  max-width: 44rem;
-  margin-top: 1.75rem;
-  padding: 0.9rem 1.1rem;
-  border-radius: 1.1rem;
-  background: var(--paper-deep);
-  font-size: 0.98rem;
+  margin-top: 2rem;
 }
 
 /* The door: who came, and what the curve holds. */
@@ -1050,111 +1077,8 @@ main {
 .door {
   display: grid;
   grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr);
-  gap: 2.5rem var(--gutter);
+  gap: 2rem clamp(1.25rem, 3vw, 2.5rem);
   align-items: start;
-}
-
-/* What is on the door, and a buy to try it with. I answer on the right. */
-.knocking {
-  display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
-  gap: 0.9rem var(--gutter);
-  align-items: start;
-  margin-bottom: clamp(2rem, 4vw, 3rem);
-  padding-block: 1rem 1.4rem;
-  border-top: 2px solid var(--ink);
-  border-bottom: 1px solid var(--hairline);
-}
-
-.knocking .door-now {
-  grid-column: 1 / -1;
-  margin: 0;
-  font: 500 0.78rem/1.5 var(--mono);
-  font-variant-numeric: tabular-nums;
-  color: var(--ink);
-}
-
-.knocking .door-now::before {
-  content: "";
-  display: inline-block;
-  width: 0.55em;
-  height: 0.55em;
-  margin-right: 0.6em;
-  border-radius: 50%;
-  background: var(--veluno);
-}
-
-.try-ask {
-  font: 400 clamp(1.25rem, 2vw, 1.6rem)/1.3 var(--display);
-  font-variation-settings: "SOFT" 100;
-  text-wrap: pretty;
-}
-
-.try-ask output {
-  font-weight: 600;
-  white-space: nowrap;
-  box-shadow: inset 0 -0.14em 0 color-mix(in oklab, var(--veluno) 55%, transparent);
-}
-
-.try-range {
-  display: grid;
-  grid-template-columns: 8.5rem minmax(0, 1fr);
-  align-items: center;
-  gap: 0.9rem;
-  margin-top: 0.8rem;
-  color: var(--ink-soft);
-}
-
-.try-range input {
-  width: 100%;
-  margin: 0;
-  accent-color: var(--veluno);
-}
-
-.try-app {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  margin-top: 0.8rem;
-}
-
-.try-app input {
-  accent-color: var(--veluno);
-}
-
-.try-answer {
-  font: 500 clamp(1.7rem, 3.2vw, 2.5rem)/1.05 var(--display);
-  font-variation-settings: "SOFT" 100, "WONK" 1;
-  letter-spacing: -0.01em;
-}
-
-.try-answer[data-admits="false"] {
-  color: var(--veluno-text);
-}
-
-.try-clauses {
-  margin: 0.6rem 0 0;
-  padding: 0;
-  list-style: none;
-  font-size: 0.98rem;
-}
-
-.try-clauses .fails {
-  text-decoration: line-through;
-  text-decoration-color: var(--veluno);
-  text-decoration-thickness: 2px;
-}
-
-.try-clauses .unknown {
-  border-bottom: 1px dashed var(--ink-soft);
-  color: var(--ink-soft);
-}
-
-.try-small {
-  max-width: 30rem;
-  margin-top: 0.7rem;
-  font-size: 0.86rem;
-  color: var(--ink-soft);
 }
 
 .door-filter {
@@ -1166,26 +1090,23 @@ main {
 
 /* Each is drawn as the rows of its kind are, so the filter is also the legend. */
 .door-filter button {
-  padding: 0.2rem 0.65rem 0.18rem;
+  padding: 0.35rem 0.85rem;
   border: 0;
   border-radius: 999px;
-  background: none;
-  box-shadow: inset 0 0 0 1px var(--edge);
-  color: var(--ink-soft);
-  letter-spacing: inherit;
-  text-transform: inherit;
+  background: var(--paper-deep);
+  color: var(--ink);
+  font: inherit;
   cursor: pointer;
 }
 
 .door-filter button b {
   margin-left: 0.3em;
-  font-weight: 500;
   font-variant-numeric: tabular-nums;
+  opacity: 0.7;
 }
 
 .door-filter button:hover {
-  box-shadow: inset 0 0 0 1px var(--ink);
-  color: var(--ink);
+  box-shadow: inset 0 0 0 1.5px var(--ink);
 }
 
 .door-filter button[aria-pressed="true"] {
@@ -1196,7 +1117,11 @@ main {
 
 .door-filter button.is-refused[aria-pressed="true"] {
   background: var(--veluno);
-  color: #2a140d;
+  color: var(--on-veluno);
+}
+
+.door-filter button.is-refused[aria-pressed="true"] b {
+  opacity: 1;
 }
 
 .door-filter button.is-sell[aria-pressed="true"] {
@@ -1205,19 +1130,26 @@ main {
   color: var(--ink);
 }
 
+/* Everyone who came, each on a row of their own. The ones I turned away sit on my orange. */
 .knocks {
+  display: grid;
+  gap: 0.45rem;
   padding: 0;
   list-style: none;
-  border-top: 2px solid var(--ink);
 }
 
 .knock {
   display: grid;
-  grid-template-columns: 8.5rem minmax(0, 1fr) auto;
+  grid-template-columns: 7.5rem minmax(0, 1fr) auto;
   gap: 0.2rem 1rem;
-  align-items: baseline;
-  padding-block: 0.8rem 0.9rem;
-  border-bottom: 1px solid var(--hairline);
+  align-items: center;
+  padding: 0.7rem 1rem 0.75rem;
+  border-radius: 1rem;
+  background: var(--paper-deep);
+}
+
+.knock.is-refused {
+  background: var(--tint);
 }
 
 .knocks[data-show="refused"] .knock:not(.is-refused),
@@ -1228,8 +1160,9 @@ main {
 
 .knock-kind {
   width: fit-content;
-  padding: 0.18rem 0.6rem 0.16rem;
+  padding: 0.2rem 0.65rem;
   border-radius: 999px;
+  font-size: 0.78rem;
 }
 
 .knock.is-buy .knock-kind {
@@ -1238,18 +1171,17 @@ main {
 }
 
 .knock.is-sell .knock-kind {
-  box-shadow: inset 0 0 0 1px var(--ink);
+  box-shadow: inset 0 0 0 1.5px var(--ink);
 }
 
-/* Orange is for the ones turned away, and the brown of the eyes reads on it in both schemes. */
+/* Orange is for the ones turned away, and the brown of my eyes reads on it by day and by night. */
 .knock.is-refused .knock-kind {
   background: var(--veluno);
-  color: #2a140d;
+  color: var(--on-veluno);
 }
 
 .knock-what {
-  font: 400 1.3rem/1.25 var(--display);
-  font-variation-settings: "SOFT" 100;
+  font: 600 1.15rem/1.25 var(--display);
 }
 
 .knock.is-refused .knock-what {
@@ -1259,7 +1191,7 @@ main {
 }
 
 .knock-when {
-  font: 400 0.78rem/1.5 var(--mono);
+  font-size: 0.85rem;
   font-variant-numeric: tabular-nums;
   color: var(--ink-soft);
   white-space: nowrap;
@@ -1306,36 +1238,56 @@ main {
   }
 }
 
-.knocks-empty,
-.door-note {
+.knocks-empty {
   max-width: 38rem;
   margin-top: 1.1rem;
   font-size: 0.95rem;
   color: var(--ink-soft);
 }
 
+.door-note {
+  max-width: 30rem;
+  margin-top: 1.1rem;
+}
+
+/* The curve: four figures in one soft panel, each number with what it is under it. */
+.door-curve > .label {
+  color: var(--ink-soft);
+}
+
 .curve {
-  margin-top: 0.6rem;
-  border-top: 2px solid var(--ink);
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.2rem 1rem;
+  margin-top: 0.7rem;
+  padding: 1.3rem 1.4rem 1.35rem;
+  border-radius: var(--radius);
+  background: var(--paper-deep);
 }
 
 .curve > div {
   display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 1rem;
-  padding-block: 0.7rem;
-  border-bottom: 1px solid var(--hairline);
+  flex-direction: column-reverse;
+  gap: 0.15rem;
 }
 
 .curve dt {
+  font-size: 0.86rem;
   color: var(--ink-soft);
 }
 
 .curve dd {
-  font: 500 1.2rem/1.2 var(--mono);
+  font: 600 1.5rem/1.1 var(--display);
   font-variant-numeric: tabular-nums;
-  white-space: nowrap;
+  letter-spacing: -0.02em;
+  overflow-wrap: anywhere;
+}
+
+.curve-note {
+  margin-top: 0.65rem;
+  padding-inline: 0.4rem;
+  font-size: 0.85rem;
+  color: var(--ink-soft);
 }
 
 /* A figure that has just changed says so for a moment. */
@@ -1344,29 +1296,24 @@ main {
 }
 
 .curve dd span.is-fresh {
-  color: var(--veluno);
+  color: var(--veluno-text);
   transition: none;
 }
 
-/* The journal: a diary page. My numbers hang in the margin, a line runs down beside them,
-   and each entry says what it set before it says anything else. */
+/* The journal: each entry has its number over it and says what it set before it says
+   anything else. The one that is on sits on my orange. */
 
 .record {
-  max-width: 60rem;
+  display: grid;
+  gap: 0.5rem;
+  max-width: 46rem;
   padding: 0;
   list-style: none;
 }
 
-.entry {
-  display: grid;
-  grid-template-columns: 7.5rem minmax(0, 1fr);
-}
-
 .entry-no {
-  padding-top: 1.35rem;
-  white-space: nowrap;
-  font: 500 1.9rem/1 var(--display);
-  font-variation-settings: "SOFT" 100, "WONK" 1;
+  padding: 0.6rem 0 0.4rem 0.5rem;
+  font: 600 1.25rem/1 var(--display);
   color: var(--ink-soft);
 }
 
@@ -1375,12 +1322,13 @@ main {
 }
 
 .entry-body {
-  padding: 1.3rem 0 1.7rem 1.75rem;
-  border-left: 2px solid var(--veluno);
+  padding: 1.15rem 1.4rem 1.3rem;
+  border-radius: var(--radius);
+  background: var(--paper-deep);
 }
 
-.entry + .entry .entry-body {
-  box-shadow: inset 0 1px 0 var(--hairline);
+.entry.is-in-force .entry-body {
+  background: var(--tint);
 }
 
 .entry-head {
@@ -1388,15 +1336,20 @@ main {
   flex-wrap: wrap;
   align-items: center;
   gap: 0.35rem 0.9rem;
+  font-variant-numeric: tabular-nums;
   color: var(--ink-soft);
 }
 
 .entry-tag {
-  padding: 0.18rem 0.6rem 0.16rem;
+  padding: 0.2rem 0.7rem;
   border-radius: 999px;
-  background: var(--ink);
-  color: var(--paper);
-  font-variant-numeric: tabular-nums;
+  background: var(--paper);
+}
+
+/* Orange only while it is on. */
+.entry.is-in-force .entry-tag {
+  background: var(--veluno);
+  color: var(--on-veluno);
 }
 
 .entry-tag:empty {
@@ -1408,7 +1361,7 @@ main {
   display: flex;
   flex-wrap: wrap;
   gap: 0.7rem clamp(1.5rem, 4vw, 3rem);
-  margin-top: 0.75rem;
+  margin-top: 0.7rem;
 }
 
 .entry-set dt {
@@ -1416,53 +1369,46 @@ main {
 }
 
 .entry-set dd {
-  font: 500 1.4rem/1.2 var(--display);
-  font-variation-settings: "SOFT" 100;
+  font: 600 1.35rem/1.2 var(--display);
 }
 
 .entry-text {
   max-width: 40rem;
-  margin-top: 0.85rem;
-  color: var(--ink-soft);
-}
-
-.entry.is-in-force .entry-text {
-  color: var(--ink);
+  margin-top: 0.8rem;
 }
 
 .entry-more {
   max-width: 40rem;
-  margin-top: 0.7rem;
+  margin-top: 0.8rem;
 }
 
 .entry-more summary {
   width: fit-content;
-  color: var(--ink-soft);
+  padding: 0.3rem 0.85rem;
+  border-radius: 999px;
+  background: var(--paper);
   cursor: pointer;
 }
 
 .entry-more summary:hover {
-  color: var(--veluno-text);
+  box-shadow: inset 0 0 0 1.5px var(--ink);
 }
 
 .entry-more p {
-  margin-top: 0.5rem;
+  margin-top: 0.6rem;
   font-size: 0.98rem;
-}
-
-/* What I said, where it is behind the press. */
-.entry-more .entry-text {
-  color: var(--ink);
 }
 
 .entry-more .entry-fine,
 .entry-more .entry-proof {
-  font: 400 0.78rem/1.5 var(--mono);
+  font-size: 0.84rem;
+  font-variant-numeric: tabular-nums;
   color: var(--ink-soft);
   overflow-wrap: anywhere;
 }
 
 .entry-proof .is-verified {
+  font-weight: 600;
   color: var(--ink);
 }
 
@@ -1482,93 +1428,61 @@ main {
   color: var(--ink-soft);
 }
 
-.record-earlier button {
-  padding: 0.3rem 0.8rem 0.28rem;
-  border: 1px solid var(--edge);
-  border-radius: 999px;
-  background: none;
-  cursor: pointer;
-}
-
-.record-earlier button:hover {
-  border-color: var(--ink);
-  color: var(--ink);
-}
-
-/* The charter */
+/* The charter: the things I cannot do, each on a tile, and each one you can ask me for. */
 
 .articles {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  column-gap: var(--gutter);
+  gap: 1rem;
   padding: 0;
   list-style: none;
-  counter-reset: article;
-  border-top: 2px solid var(--ink);
 }
 
 .articles li {
   display: grid;
-  grid-template-columns: 2.6rem minmax(0, 1fr);
   align-content: start;
-  padding-block: 1.1rem 1.3rem;
-  border-bottom: 1px solid var(--hairline);
-  counter-increment: article;
-}
-
-.articles li::before {
-  content: counter(article, decimal-leading-zero);
-  grid-row: span 2;
-  padding-top: 0.5rem;
-  font: 400 0.78rem/1.5 var(--mono);
-  color: var(--ink-soft);
+  justify-items: start;
+  padding: 1.3rem 1.5rem 1.4rem;
+  border-radius: var(--radius);
+  background: var(--paper-deep);
 }
 
 .articles h3 {
-  font: 500 1.4rem/1.2 var(--display);
-  font-variation-settings: "SOFT" 100;
+  font: 600 1.2rem/1.25 var(--display);
 }
 
 .articles p {
   margin-top: 0.3rem;
+  font-size: 0.98rem;
+  line-height: 1.45;
+  color: var(--ink-soft);
 }
 
 /* "Ask me to": I say no, and shake. */
 .dare {
-  grid-column: 2;
-  justify-self: start;
-  margin-top: 0.5rem;
-  padding: 0.25rem 0;
-  border: 0;
-  background: none;
-  color: var(--ink-soft);
-  text-decoration: underline;
-  text-decoration-thickness: 1px;
-  text-underline-offset: 0.2em;
-  cursor: pointer;
+  margin-top: 0.75rem;
+  background: var(--paper);
 }
 
-.dare:hover {
-  color: var(--veluno-text);
-}
-
-.dare.is-no {
-  color: var(--veluno-text);
-  text-decoration: none;
+.dare.is-no,
+.dare.is-no:hover {
+  background: var(--veluno);
+  color: var(--on-veluno);
 }
 
 .articles .value {
   font-weight: 600;
+  color: var(--ink);
   white-space: nowrap;
   box-shadow: inset 0 -0.14em 0 color-mix(in oklab, var(--veluno) 55%, transparent);
 }
 
 .caveat {
   max-width: 44rem;
-  margin-top: 1.75rem;
-  padding: 0.9rem 1.1rem;
-  border-radius: 1.1rem;
-  background: var(--paper-deep);
+  margin-top: 1rem;
+  padding: 1rem 1.25rem;
+  border-radius: var(--radius);
+  background: var(--tint);
 }
 
 .caveat strong {
@@ -1576,45 +1490,71 @@ main {
 }
 
 .sub {
-  margin-top: clamp(2.5rem, 6vw, 4rem);
-  font: 500 clamp(1.7rem, 3.2vw, 2.4rem)/1.05 var(--display);
-  font-variation-settings: "SOFT" 100, "WONK" 1;
+  margin-top: clamp(2.25rem, 5vw, 3.5rem);
+  font: 600 clamp(1.6rem, 3vw, 2.2rem)/1.05 var(--display);
   scroll-margin-top: 5rem;
 }
 
+/* How it works: a short list, and each line opens to say more. */
 .how {
-  columns: 2 22rem;
-  column-gap: var(--gutter);
-  margin-top: 1.5rem;
+  display: grid;
+  gap: 0.45rem;
+  max-width: 46rem;
+  margin-top: 1.1rem;
 }
 
-.how h4 {
-  font: 500 0.72rem/1.5 var(--mono);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  break-after: avoid;
+.how details {
+  border-radius: 1.1rem;
+  background: var(--paper-deep);
+}
+
+.how summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.85rem 1.2rem;
+  font-weight: 600;
+  list-style: none;
+  cursor: pointer;
+}
+
+.how summary::-webkit-details-marker {
+  display: none;
+}
+
+.how summary::after {
+  content: "+";
+  font: 400 1.3rem/1 var(--sans);
+  color: var(--ink-soft);
+}
+
+.how details[open] summary::after {
+  content: "–";
 }
 
 .how p {
-  margin-block: 0.35rem 1.4rem;
-  break-inside: avoid;
+  padding: 0 1.2rem 1.05rem;
+  color: var(--ink-soft);
 }
 
-/* Addresses */
+/* Addresses: each on a row of its own, with something to press at the end. */
 
 .addresses {
+  display: grid;
+  gap: 0.45rem;
   max-width: 62rem;
-  margin-top: 1.5rem;
-  border-top: 2px solid var(--ink);
+  margin-top: 1.2rem;
 }
 
 .address {
   display: grid;
-  grid-template-columns: 9rem minmax(0, 1fr) auto;
-  gap: 0.25rem 1.25rem;
-  align-items: baseline;
-  padding-block: 0.85rem;
-  border-bottom: 1px solid var(--hairline);
+  grid-template-columns: 6.5rem minmax(0, 1fr) auto;
+  gap: 0.25rem 0.9rem;
+  align-items: center;
+  padding: 0.65rem 0.75rem 0.65rem 1.1rem;
+  border-radius: 1rem;
+  background: var(--paper-deep);
 }
 
 .address dt {
@@ -1622,29 +1562,19 @@ main {
 }
 
 .address code {
-  font: 400 0.9rem/1.4 var(--mono);
+  font: 400 0.88rem/1.4 var(--mono);
   overflow-wrap: anywhere;
 }
 
 .address-actions {
   display: flex;
-  gap: 1.1rem;
+  align-items: center;
+  gap: 0.9rem;
 }
 
 .copy {
-  padding: 0;
-  border: 0;
-  background: none;
-  letter-spacing: inherit;
-  text-transform: inherit;
-  text-decoration: underline;
-  text-decoration-thickness: 1px;
-  text-underline-offset: 0.2em;
-  cursor: pointer;
-}
-
-.copy:hover {
-  color: var(--veluno-text);
+  background: var(--paper);
+  font: inherit;
 }
 
 .trade {
@@ -1669,8 +1599,7 @@ main {
   align-items: baseline;
   gap: 0.5rem 2.5rem;
   margin-inline: var(--gutter);
-  padding-block: 1rem 1.5rem;
-  border-top: 1px solid var(--hairline);
+  padding-block: 0.5rem 1.5rem;
   font-size: 0.92rem;
   color: var(--ink-soft);
 }
@@ -1703,9 +1632,10 @@ main {
   display: none;
 }
 
-/* The chain has gone quiet: what is on the page is old, and looks it. */
-[data-stale="true"] .from-chain {
-  opacity: 0.55;
+/* The chain has gone quiet: what I am saying is old, and the bubble goes quiet with it. The
+   foot says since when. Nothing is faded, because it still has to be read. */
+[data-stale="true"] .bubble {
+  background-color: var(--paper-deep);
 }
 
 /* Going from one page to another. I fly to the word; the page I leave is blown off downwind
@@ -1897,7 +1827,7 @@ main {
 
 @media (max-width: 52rem) {
   .stop-live {
-    font-size: 0.62rem;
+    font-size: 0.68rem;
   }
 
   /* Only the figure: there is no room for the words round it. They stay in the link's name. */
@@ -1916,11 +1846,7 @@ main {
     margin-block: 0;
   }
 
-  .knocking {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  /* The catalogue is one column until there is room for a name beside what is on. */
+  /* The tiles go one under the other. */
   .hooks {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -1984,20 +1910,20 @@ main {
     font-size: 1rem;
   }
 
-  .hooks,
   .articles {
     grid-template-columns: minmax(0, 1fr);
   }
 
   .hook {
-    grid-template-columns: 2.1rem minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .hook-state {
-    grid-column: 2;
+    grid-column: 1;
+    grid-row: auto;
     width: fit-content;
     max-width: none;
-    margin-top: 0.3rem;
+    margin-top: 0.5rem;
     text-align: left;
   }
 
@@ -2014,65 +1940,88 @@ main {
     justify-self: end;
   }
 
-  .entry {
-    grid-template-columns: 4.5rem minmax(0, 1fr);
-  }
-
-  .entry-no {
-    padding-top: 1.45rem;
-    font-size: 1.15rem;
-  }
-
   .entry-body {
-    padding-left: 1rem;
+    padding: 1rem 1.1rem 1.15rem;
   }
 
   .entry-set dd {
     font-size: 1.2rem;
   }
 
+  .board,
+  .hook,
+  .articles li,
+  .curve {
+    padding-inline: 1.1rem;
+  }
+
+  .curve dd {
+    font-size: 1.25rem;
+  }
+
   .address {
     grid-template-columns: minmax(0, 1fr);
+    padding: 0.8rem 1rem;
   }
+}
 
-  .try-range {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 0.2rem;
-  }
-
-  /* Big enough for a thumb. */
+/* Big enough for a thumb, on a narrow page and wherever a finger does the pointing. */
+@media (max-width: 44rem), (pointer: coarse) {
   .notch,
-  .door-filter button {
+  .door-filter button,
+  .ask,
+  .dare,
+  .copy,
+  .record-earlier button {
     min-height: 2.5rem;
     padding-inline: 0.85rem;
+  }
+
+  .entry-more summary {
+    padding-block: 0.7rem;
   }
 
   .notches,
   .door-filter {
     gap: 0.5rem;
   }
-
-  .ask {
-    padding-block: 0.5rem;
-  }
 }
 
 @media print {
+  /* What is on is said by a fill, so fills are printed. */
+  :root {
+    print-color-adjust: exact;
+    -webkit-print-color-adjust: exact;
+  }
+
+  :root[data-theme="night"] .notch[aria-pressed="true"][data-on]::before {
+    background: var(--veluno);
+  }
+
   /* Paper is white whatever the screen was. */
   :root[data-theme="night"] {
     color-scheme: light;
     --paper: #ffffff;
-    --paper-deep: #f6f2ea;
-    --ink: #442319;
+    --paper-deep: #f4f4f6;
+    --ink: #1e1d22;
     --veluno: #f84d25;
     --veluno-text: #c2370f;
+  }
+
+  /* On paper everything in How it works is open. */
+  .how details::details-content {
+    display: block;
+    content-visibility: visible;
+  }
+
+  .how summary::after {
+    display: none;
   }
 
   .rail,
   .theme,
   .record-earlier,
   .dare,
-  .try,
   .skip,
   .copy,
   .ask,

@@ -153,31 +153,3 @@ export function describe(conditions, app = "FOMO") {
   }
   return ways;
 }
-
-/**
- * What the hook would say to a buy, as far as it can be told from `facts`: the numbers the
- * hook compares, by the names in FACTS, scaled as the chain holds them (BigInt). A fact that
- * is left out is one nobody outside the transaction can know, and a rule that turns on it gets
- * the third answer. It mirrors Condition::holds and admits in programs/hook/src/state.rs; the
- * hook has the last word.
- * @param {Condition[]} conditions
- * @param {Record<string, bigint>} facts
- * @param {string} [app]
- * @returns {{ admits: boolean | null, ways: { admits: boolean | null, clauses: { words: string, holds: boolean | null, fact: string | undefined }[] }[] }}
- */
-export function judge(conditions, facts, app = "FOMO") {
-  const holds = ({ fact, op, value }) => {
-    const seen = facts[FACTS[fact]?.name];
-    if (seen === undefined) return null;
-    const modulus = value >> 32n;
-    const answers = { "<": seen < value, "<=": seen <= value, ">": seen > value, ">=": seen >= value, "==": seen === value, "!=": seen !== value, mod: modulus !== 0n && seen % modulus === (value & 0xffff_ffffn) };
-    return answers[OPS[op]] ?? false;
-  };
-  const ways = [];
-  for (let group = 0; group < MAX_GROUPS; group++) {
-    const clauses = conditions.filter((condition) => condition.group === group).map((condition) => ({ words: say(condition, app), holds: holds(condition), fact: FACTS[condition.fact]?.name }));
-    // One clause that fails closes this way, whatever is unknown beside it.
-    if (clauses.length) ways.push({ clauses, admits: clauses.some((clause) => clause.holds === false) ? false : clauses.every((clause) => clause.holds) ? true : null });
-  }
-  return { admits: ways.length === 0 || ways.some((way) => way.admits) ? true : ways.every((way) => way.admits === false) ? false : null, ways };
-}

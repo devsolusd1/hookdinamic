@@ -8,7 +8,7 @@ import { recentTrades } from "./feed.js";
 import { BUYING_HOOKS, FEE_HOOKS, IDENTITY_HOOK, recogniseRule, recogniseSplit, ruleOf, worded } from "./hooks.js";
 import { watchAccounts } from "./live.js";
 import { decodePool } from "./pool.js";
-import { FACTS, describe, judge, span } from "./rules.js";
+import { describe, span } from "./rules.js";
 
 const site = window.SITE;
 const root = document.documentElement;
@@ -278,12 +278,10 @@ ask.addEventListener("click", () => {
  * fee hook, the name in use. `appAvailable` false marks the hooks this token cannot use.
  */
 function renderCatalogue(on, appAvailable = true) {
-  let number = 0;
-  /** One line of the list. `state` is what its margin says; it is on if that starts with "On" or "Now". */
+  /** One tile of the list. `state` is what its margin says; it is on if that starts with "On" or "Now". */
   const row = (hook, state, settings = "") => {
     const node = document.getElementById("hook-template").content.firstElementChild.cloneNode(true);
     node.classList.toggle("is-on", /^(On|Now)\b/.test(state));
-    node.querySelector(".hook-no").textContent = String(++number).padStart(2, "0");
     node.querySelector(".hook-name").textContent = worded(hook.name, site.app);
     node.querySelector(".hook-about").textContent = worded(hook.about, site.app);
     if (settings) node.querySelector(".hook-settings").textContent = settings;
@@ -291,7 +289,7 @@ function renderCatalogue(on, appAvailable = true) {
     node.querySelector(".hook-state").textContent = state || "";
     return node;
   };
-  /** A buying hook's settings as things to press. The one pressed says, in the program's own terms, what a buy would be held to, and what I would say to the buy being tried. */
+  /** A buying hook's settings as things to press. The one pressed says, in the program's own terms, what a buy would be held to. */
   const notches = (node, hook, inForce) => {
     const line = node.querySelector(".hook-settings") ?? node.querySelector(".hook-body").appendChild(document.createElement("p"));
     line.className = "hook-settings notches";
@@ -310,9 +308,8 @@ function renderCatalogue(on, appAvailable = true) {
         const open = button.getAttribute("aria-pressed") !== "true";
         for (const other of buttons) other.setAttribute("aria-pressed", String(open && other === button));
         says.hidden = !open;
-        if (open) pressed.set(hook.id, { says, rule: ruleOf(hook.id, i + 1), inForce: inForce === i + 1 });
-        else pressed.delete(hook.id);
-        renderPressed(open ? hook.id : null);
+        if (open) says.textContent = `A buy goes through if ${describe(ruleOf(hook.id, i + 1), site.app).join("; or if ")}.`;
+        breeze.push(0, open ? -110 : 60, 0);
       });
       return button;
     });
@@ -320,13 +317,11 @@ function renderCatalogue(on, appAvailable = true) {
     line.after(says);
     return node;
   };
-  pressed.clear();
-  slot("try-app-any").hidden = !appAvailable;
   const group = (title, aside, rows) => {
     const section = document.createElement("section");
     section.className = "hook-group";
     const heading = document.createElement("h3");
-    heading.className = "label";
+    heading.className = "hook-group-title";
     heading.append(title, mark(aside, "hook-group-aside"));
     const list = document.createElement("ol");
     list.className = "hooks";
@@ -342,13 +337,13 @@ function renderCatalogue(on, appAvailable = true) {
         const mine = on.buying?.hook.id === hook.id;
         const unavailable = hook.needsApp && !appAvailable;
         const state = mine ? `On${on.buying.label ? ` · ${on.buying.label}` : ""}` : unavailable ? "Not for this token" : "";
-        // A hook this token cannot use is not something to try.
+        // A hook this token cannot use has no settings to press.
         if (unavailable) return row(hook, state, `Settings: ${hook.settings.map((setting) => setting.label).join(" · ")}`);
         return notches(row(hook, state), hook, mine ? on.buying.setting : 0);
       }),
     ),
     group("Fee hooks", "always one", FEE_HOOKS.map((hook) => row(hook, on.fees?.hook.id === hook.id ? "On" : ""))),
-    group("Identity", "a new name now and then", [row(IDENTITY_HOOK, on.fixedName ? "Not for this token" : on.name ? `Now ${on.name}` : "", on.names ? `Names: ${on.names}` : "")]),
+    group("Name", "a new one now and then", [row(IDENTITY_HOOK, on.fixedName ? "Not for this token" : on.name ? `Now ${on.name}` : "", on.names ? `Names: ${on.names}` : "")]),
   );
 }
 
@@ -633,7 +628,8 @@ function renderTerm() {
   const { now, left, standing, from, to } = term();
   const known = standing && book.rule.length ? recogniseRule(book.rule) : null;
   const ways = standing ? describe(book.rule, site.app) : [];
-  const hook = ways.length === 0 ? "None" : known ? hookLabel(known) : "A rule outside the catalogue";
+  // With nothing on, who may buy is everybody: said that way, not as "none".
+  const hook = ways.length === 0 ? "Anyone" : known ? hookLabel(known) : "A rule that is not on my list";
 
   // The sentence under the bubble.
   const over = Math.max(0, Math.floor(now - book.ruleUntil));
@@ -657,7 +653,7 @@ function renderTerm() {
   // The line: how much of the term has passed, and who came during it.
   const width = Math.max(1, to - from);
   slot("spent").style.setProperty("--n", standing ? Math.min(1, Math.max(0, (now - from) / width)).toFixed(4) : "1");
-  write("rule-from", `${standing ? "issued" : book.epoch ? "ran out" : "opened"} ${timeOnly.format(from * 1000)}`);
+  write("rule-from", `${standing ? "said at" : book.epoch ? "ran out" : "opened"} ${timeOnly.format(from * 1000)}`);
   write("rule-to", standing ? `ends ${timeOnly.format(to * 1000)} UTC` : "now");
   const within = knocks.filter((trade) => trade.at >= from && trade.at <= to);
   // While an edict stands a mark stays where it is. Afterwards the line stretches, so they are redrawn now and then.
@@ -721,7 +717,6 @@ function renderTerm() {
   if (shownOn !== on) {
     shownOn = on;
     write("buying-name", hook);
-    slot("switch-buying").classList.toggle("is-off", ways.length === 0);
     write("rule-title", ways.length ? "A buy goes through if" : "");
     slot("ways").replaceChildren(...(ways.length ? ways : ["Every buy goes through."]).map((way) => mark(way, "")));
     renderCatalogue(
@@ -748,9 +743,8 @@ function renderTerm() {
     "door-now",
     book.paused ? "The guardian has suspended me. Nothing is on the door." : ways.length ? `On the door now: ${hook}, for ${clock(left)} more.` : "Nothing on the door now. Every buy goes through.",
   );
+  slot("door-now").classList.toggle("is-open", book.paused || ways.length === 0);
   renderRail();
-  renderTry();
-  renderPressed();
   const tag = document.querySelector(".entry-tag[data-in-force]");
   if (tag) {
     tag.textContent = book.paused ? "Suspended" : standing ? `On now · ${clock(left)} left` : "Ran out";
@@ -777,126 +771,6 @@ function renderRail() {
   under("journal", "", book.epoch ? `No. ${book.epoch}` : "nothing yet");
 }
 
-// A buy the visitor describes, held up to a rule by this page: on the door to the rule in force,
-// in the catalogue to whichever setting is pressed.
-const tried = { size: 0.5, held: 0, viaApp: false };
-/** The rehearsal's edict, for a page that is not live: Newcomers up to 0.5%, eighteen minutes in. */
-const REHEARSED = { rule: ruleOf("newcomers", 2), now: Date.UTC(2026, 9, 5, 14, 20, 48) / 1000, since: Date.UTC(2026, 9, 5, 14, 2, 0) / 1000 };
-/** Why I cannot tell, by the fact nobody outside the transaction can know. */
-const UNKNOWN = {
-  luck: "It depends on the wallet’s turn, which changes with every slot.",
-  priority_fee: "It depends on the fee the buyer sets.",
-  curve_sol: "It depends on the SOL in the curve at that instant.",
-  elapsed: "It depends on how long the edict has been standing.",
-};
-
-/** What I would say to the buy being tried under `rule`. `since` is when the rule was written, or null where it is not in force. */
-function wouldSay(rule, since) {
-  const scaled = (pct) => BigInt(Math.round(pct * 10_000));
-  const now = live ? chainNow() : REHEARSED.now;
-  const day = ((now % 86_400) + 86_400) % 86_400;
-  const verdict = judge(
-    rule,
-    {
-      size: scaled(tried.size),
-      held_before: scaled(tried.held),
-      held_after: scaled(tried.held + tried.size),
-      minute: BigInt(Math.floor((day % 3_600) / 60)),
-      hour: BigInt(Math.floor(day / 3_600)),
-      weekday: BigInt((Math.floor(now / 86_400) + 4) % 7),
-      via_app: tried.viaApp ? 1n : 0n,
-      ...(since === null ? {} : { elapsed: BigInt(Math.max(0, Math.floor(now - since))) }),
-    },
-    site.app,
-  );
-  // The reason given is one that still matters: not a clause in a way that something else has already closed.
-  const open = verdict.ways.filter((way) => way.admits === null);
-  const missing = open.flatMap((way) => way.clauses).find((clause) => clause.holds === null)?.fact;
-  const answer = verdict.admits === true ? "I would let it in." : verdict.admits === false ? "I would turn it away." : `I can’t tell from here. ${UNKNOWN[missing] ?? ""}`;
-  return { ...verdict, answer, key: JSON.stringify([answer, verdict.ways.map((way) => way.clauses.map((clause) => [clause.words, clause.holds]))]) };
-}
-
-/** Each way a buy can go through, clause by clause: what holds, what fails, what cannot be told. */
-const clauses = (ways, or) => ways.flatMap((way, i) => [...(i ? [or] : []), ...way.clauses.flatMap((clause, j) => [...(j ? [", and "] : []), mark(clause.words, clause.holds === null ? "unknown" : clause.holds ? "holds" : "fails")])]);
-
-const gesture = (admits) => (admits === true ? "in" : admits === false ? "away" : "unsure");
-
-let triedSaid = "";
-let triedAnswer;
-
-/** The door's answer, worked out again. `asked` is true when the visitor has just changed the buy. */
-function renderTry(asked = false) {
-  write("try-app-says", `It comes through the ${site.app} app`);
-  write("try-size-says", `${tried.size}%`);
-  write("try-held-says", tried.held ? `${tried.held}%` : "none");
-  // A live page that has not read the chain yet has no rule to hold the buy up to.
-  if (live && !book) return;
-  const { rule, since } = live ? { rule: term().standing ? book.rule : [], since: book.updatedAt } : REHEARSED;
-  const verdict = wouldSay(rule, since);
-  const key = JSON.stringify([rule.length, tried, verdict.key]);
-  if (key !== triedSaid) {
-    triedSaid = key;
-    // With nothing on the door there is nothing to try: the line above already says so.
-    slot("try-form").hidden = rule.length === 0;
-    slot("try-answer").parentElement.hidden = rule.length === 0;
-    slot("try-app-row").hidden = !rule.some((condition) => FACTS[condition.fact]?.name === "via_app");
-    const said = slot("try-answer");
-    said.textContent = verdict.answer;
-    said.dataset.admits = String(verdict.admits);
-    slot("try-clauses").replaceChildren(
-      ...verdict.ways.map((way, i) => {
-        const item = document.createElement("li");
-        item.append(...(i ? ["or: "] : []), ...clauses([way]));
-        return item;
-      }),
-    );
-  }
-  // My body answers too, when the answer is to something the visitor did on this page.
-  if (asked && shown === "door" && rule.length && verdict.admits !== triedAnswer) breeze.nudge(gesture(verdict.admits), 400);
-  triedAnswer = verdict.admits;
-}
-
-/** The settings pressed in the catalogue, by hook: where each says its rule, and whether it is the one in force. */
-const pressed = new Map();
-
-/** What each pressed setting says: its rule, and my answer to the buy being tried. `asked` is the hook the visitor has just pressed or changed the buy for. */
-function renderPressed(asked = null) {
-  for (const [id, open] of pressed) {
-    const verdict = wouldSay(open.rule, open.inForce && live && book ? book.updatedAt : open.inForce ? REHEARSED.since : null);
-    if (asked === id || asked === true) {
-      if (open.admits !== verdict.admits || asked === id) breeze.nudge(gesture(verdict.admits), 400);
-    }
-    open.admits = verdict.admits;
-    if (open.key === verdict.key) continue;
-    open.key = verdict.key;
-    const answer = mark(verdict.answer, "hook-answer");
-    answer.dataset.admits = String(verdict.admits);
-    open.says.replaceChildren("A buy goes through if ", ...clauses(verdict.ways, "; or if "), ". ", answer);
-  }
-  if (asked !== null && asked !== true && !pressed.has(asked)) breeze.push(0, 60, 0);
-}
-
-for (const [name, key] of [["try-size", "size"], ["try-held", "held"]]) {
-  const inputs = document.querySelectorAll(`[data-${name}]`);
-  for (const input of inputs) {
-    input.addEventListener("input", () => {
-      tried[key] = Number(input.value);
-      // The same buy on the door and in the catalogue.
-      for (const other of inputs) other.value = input.value;
-      renderTry(true);
-      renderPressed(true);
-    });
-  }
-}
-for (const box of document.querySelectorAll("[data-try-app]")) {
-  box.addEventListener("change", () => {
-    tried.viaApp = box.checked;
-    for (const other of document.querySelectorAll("[data-try-app]")) other.checked = box.checked;
-    renderTry(true);
-    renderPressed(true);
-  });
-}
-
 function renderEdict() {
   const published = inForce.verified ? inForce.entry.record : null;
   const text = slot("edict-text");
@@ -917,7 +791,7 @@ function renderEdict() {
   if (published && slot("edict-reasons").textContent !== published.reasoning) write("edict-reasons", published.reasoning);
 
   const fees = recogniseSplit(book, book.limits.maxTreasuryBps);
-  write("fees-name", fees ? fees.hook.name : book.epoch ? "Shares outside the catalogue" : "Opening split");
+  write("fees-name", fees ? fees.hook.name : book.epoch ? "Shares that are not on my list" : "Opening split");
   for (const [name, bps] of [["holders", book.holdersBps], ["burn", book.burnBps], ["treasury", book.treasuryBps]]) {
     slot("split").style.setProperty(`--${name}`, bps);
     write(`split-${name}`, percent(bps));
@@ -950,10 +824,10 @@ function termsOf(record) {
   const shares = `holders ${percent(change.holdersBps)}, burn ${percent(change.burnBps)}, treasury ${percent(change.treasuryBps)}`;
   return {
     // With no hook on, the answer to "who may buy" is everybody.
-    buying: rule.length === 0 ? "Anyone" : known ? hookLabel(known) : "A rule outside the catalogue",
+    buying: rule.length === 0 ? "Anyone" : known ? hookLabel(known) : "A rule that is not on my list",
     // The rule itself, for one this page has no name for.
     rule: rule.length && !known ? describe(rule, site.app).join("; or if ") : "",
-    fees: fees ? fees.hook.name : "Shares outside the catalogue",
+    fees: fees ? fees.hook.name : "Shares that are not on my list",
     shares,
     term: span(change.ruleSecs),
     name: record.hooks.name === null ? "" : (book.names[record.hooks.name]?.name ?? "a name this page does not know"),
@@ -1045,7 +919,7 @@ function renderRecord() {
       }),
   );
   slot("record-empty").hidden = edicts.length > 0;
-  slot("record-empty").textContent = logMissing ? "I could not load my journal just now." : "I have not published anything yet.";
+  slot("record-empty").textContent = logMissing ? "I could not load my journal just now." : "I have not written anything here yet.";
   slot("record-earlier").hidden = edicts.length <= journalShows || journalShows >= MAX_ENTRIES;
   slot("record-more").hidden = edicts.length <= MAX_ENTRIES || journalShows < MAX_ENTRIES;
   slot("record-file").href = site.log;
@@ -1133,6 +1007,7 @@ for (const button of document.querySelectorAll("[data-filter]")) {
 function renderCurve() {
   slot("curve").hidden = !market;
   slot("curve-head").hidden = !market;
+  slot("curve-note").hidden = !market;
   if (!market) return;
   const figures = {
     "market-cap": market.marketCapSol.toFixed(2),
@@ -1240,7 +1115,7 @@ function renderStatus() {
     : line === "live"
       ? "Hearing from the chain as it happens"
       : "Asking the chain every twenty seconds";
-  write("status", `${hearing} · ${book.epoch} ${book.epoch === 1 ? "edict" : "edicts"} issued${book.paused ? " · suspended by the guardian" : ""}`);
+  write("status", `${hearing} · ${book.epoch} ${book.epoch === 1 ? "edict" : "edicts"} so far${book.paused ? " · suspended by the guardian" : ""}`);
 }
 
 if (live) {
@@ -1317,5 +1192,4 @@ if (live) {
     name: "Edict (EDICT)",
     names: "Edict (EDICT) · Decree (DECREE) · By Order (BYORDER) · Same Coin (SAME)",
   });
-  renderTry();
 }
