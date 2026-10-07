@@ -377,8 +377,10 @@ main {
   margin-inline: auto;
   padding: clamp(1rem, 2.4vw, 2.25rem) var(--gutter) clamp(2.5rem, 5vw, 4rem);
   /* Opened straight at #hooks, the browser scrolls to that page. A page starts at its top, with
-     my name and the rail above it, so the margin is taller than anything that could be above. */
-  scroll-margin-top: 100vh;
+     my name and the rail above it, so the margin is taller than anything that could be above.
+     A fixed length: a window that reports no height yet, as some in-app browsers do, would
+     make a margin counted in viewport heights come to nothing. */
+  scroll-margin-top: 200rem;
 }
 
 /* A heading takes the focus when its page arrives, so that a screen reader says where it is. Nothing to draw. */
