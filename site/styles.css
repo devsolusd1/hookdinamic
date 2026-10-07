@@ -191,6 +191,23 @@ button {
   color: var(--veluno-text);
 }
 
+/* Where else I am: one round link beside the moon. */
+.social {
+  display: grid;
+  place-items: center;
+  width: 2.3rem;
+  height: 2.3rem;
+  border: 1px solid var(--edge);
+  border-radius: 50%;
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.social:hover {
+  border-color: var(--ink);
+  color: var(--ink);
+}
+
 /* A moon by day, a sun by night: what pressing it brings. */
 .theme {
   display: grid;
@@ -1620,6 +1637,18 @@ main {
 
 .foot p:last-child {
   max-width: 44rem;
+}
+
+/* The status of the line and where else I am, side by side. */
+.foot-start {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35rem 1.4rem;
+}
+
+.foot-start a {
+  color: var(--ink);
 }
 
 .foot .status {
