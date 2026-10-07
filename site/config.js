@@ -15,6 +15,25 @@ window.SITE = {
   // The agent's published decisions, one JSON object per line.
   log: "data/log.jsonl",
 
+  // What the keeper has done with the fees: its running totals and the last lines of its
+  // ledger, in one small file it replaces after every line.
+  ledger: "data/ledger-head.json",
+
+  // The whole ledger, every line from the first. The page links to it and does not read it.
+  ledgerFile: "data/ledger.jsonl",
+
+  // The wallet the treasury's share is sent to. The project holds it. The rulebook does not
+  // name it: it is an address the keeper is given (TREASURY), so the page shows it from here,
+  // and it has to be the same one. The ledger says where each payment went, and the page says
+  // so when one went to any other address.
+  treasury: "6Zudkofv2WFz2XdAR43cozs7rJavhyn5UmQw7E9QSDph",
+
+  // What the keeper holds itself to when it pays holders, as the charter states it: the least
+  // it sends a wallet, how much has to be ready for a round, the longest it waits between
+  // rounds, and how long a sum too small to send is kept for a wallet that sold everything.
+  // They are the keeper's own settings and are in neither the rulebook nor the ledger.
+  payout: { leastSol: 0.001, readySol: 1, waitHours: 24, lapseDays: 30 },
+
   // The curve's trading fee in basis points. It is fixed with the curve and is not in the rulebook.
   feeBps: 300,
 

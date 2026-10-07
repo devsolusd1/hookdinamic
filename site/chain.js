@@ -151,11 +151,20 @@ const isEntry = (entry) =>
   typeof entry.record.reasoning === "string" &&
   (entry.record.action === "hold" || (entry.record.action === "rewrite" && isEdict(entry.record)));
 
-/** The agent's log, oldest first. An empty list if nothing is published; null if the file could not be fetched. */
-export async function readLog(url) {
+/**
+ * The agent's log, oldest first. An empty list if nothing is published; null if the file could
+ * not be fetched.
+ *
+ * `mint` is the token the reader wants the log of, and the page always gives it: lines about
+ * any other token are left out. The agent names its token in every line, and a service's disk
+ * that served another token before (a rehearsal on devnet, for one) may still hold that one's
+ * lines. They are not this token's history. Without `mint`, every line of the file is returned.
+ */
+export async function readLog(url, mint) {
   let response;
   try {
-    response = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(10_000) });
+    // Kept, but asked about every time: a log that has not changed is not downloaded again.
+    response = await fetch(url, { cache: "no-cache", signal: AbortSignal.timeout(10_000) });
   } catch {
     return null;
   }
@@ -166,7 +175,7 @@ export async function readLog(url) {
     if (!line.trim()) continue;
     try {
       const entry = JSON.parse(line);
-      if (isEntry(entry)) entries.push(entry);
+      if (isEntry(entry) && (mint === undefined || entry.record.mint === mint)) entries.push(entry);
     } catch {
       // A line cut short by a write in progress: the next read will have it whole.
     }

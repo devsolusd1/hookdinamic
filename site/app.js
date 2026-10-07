@@ -1,11 +1,12 @@
 // Fills the pages from the chain, and keeps them filled as things happen. The markup already
 // holds a complete rehearsal; on a live page every slot is overwritten with what the rulebook,
-// the curve and the agent's log say. Text that came from the agent is only ever set as text,
-// never as markup.
+// the curve, the agent's log and the keeper's ledger say. Text that came from the agent or the
+// keeper is only ever set as text, never as markup.
 import { air } from "./air.js";
 import { decodeRulebook, hashOf, isAddress, isSignature, loggedRule, readChain, readLog } from "./chain.js";
 import { recentTrades } from "./feed.js";
 import { BUYING_HOOKS, FEE_HOOKS, IDENTITY_HOOK, recogniseRule, recogniseSplit, ruleOf, worded } from "./hooks.js";
+import { inSol, inTokens, readLedger, told } from "./ledger.js";
 import { watchAccounts } from "./live.js";
 import { decodePool } from "./pool.js";
 import { describe, span } from "./rules.js";
@@ -22,6 +23,12 @@ const NEWS_MS = 8_000;
 const NEWS_AGE_SECS = 90;
 /** After this long without an answer, what is on the page is said to be old. */
 const STALE_MS = 70_000;
+/** My keeper writes in its ledger a few times an hour, so the page asks for it once a minute. */
+const LEDGER_MS = 60_000;
+/** How many of the ledger's last lines the hooks page shows. */
+const MAX_MOVES = 6;
+/** The address a rulebook holds where it names no keeper: thirty-two zero bytes. */
+const NOBODY = "1".repeat(32);
 const VIEWS = ["home", "hooks", "door", "journal", "charter"];
 
 const slot = (name) => document.querySelector(`[data-${name}]`);
@@ -92,6 +99,14 @@ const fullName = (name) => (name ? `${name.name} (${name.symbol})` : "a name thi
 
 // Whoever the agent is called this month.
 if (site.agent) write("agent", site.agent);
+
+// What my keeper holds itself to when it pays holders. The charter states it in numbers.
+if (site.payout) {
+  write("pay-least", `${site.payout.leastSol} SOL`);
+  write("pay-ready", `${site.payout.readySol} SOL`);
+  write("pay-wait", span(site.payout.waitHours * 3_600));
+  write("pay-lapse", span(site.payout.lapseDays * 86_400));
+}
 
 // The air moves Veluno: the pointer going past, a tap, the page scrolling, and the chain.
 const breeze = air(slot("air"), () => !document.hidden);
@@ -440,6 +455,8 @@ async function take(nextBook, nextEntries, slot = bookSlot) {
   renderEdict();
   renderCharter();
   renderAddresses();
+  // Now the page knows which token it is, it can tell whose ledger it was given.
+  renderGone();
   root.dataset.state = "ready";
   renderStatus();
 }
@@ -449,7 +466,7 @@ function chaseLog(epoch) {
   for (const wait of [2_000, 5_000, 10_000]) {
     setTimeout(async () => {
       if (!book || book.epoch !== epoch || inForce.entry) return;
-      const log = await readLog(site.log);
+      const log = await readLog(site.log, book.mint);
       if (log) take(book, log).catch(() => {});
     }, wait);
   }
@@ -465,6 +482,8 @@ function takePool(bytes, slot = poolSlot) {
     market = null;
   }
   renderCurve();
+  // How much of the fees my keeper has taken out is said next to how much there has been.
+  renderGoneSum();
 }
 
 /** When the chain was last asked, so that two reasons to ask at the same moment make one request. */
@@ -477,7 +496,10 @@ async function refresh() {
   askedAt = Date.now();
   try {
     // The device's time is noted the moment the chain answers, not when the log has arrived too.
-    const [{ chain, at }, log] = await Promise.all([readChain(site.rpc, site.rulebook, site.pool).then((read) => ({ chain: read, at: Date.now() })), readLog(site.log)]);
+    const reading = readChain(site.rpc, site.rulebook, site.pool).then((read) => ({ chain: read, at: Date.now() }));
+    // The log is read for one token, and only the rulebook says which. A rulebook's token never
+    // changes, so the two are asked for together on every read but the first.
+    const [{ chain, at }, log] = await Promise.all([reading, book ? readLog(site.log, book.mint) : reading.then((read) => readLog(site.log, read.chain.book.mint))]);
     if (chain.now !== null) {
       const measured = chain.now - at / 1000;
       // The chain's clock moves in steps; a new reading is only taken when it really differs.
@@ -1045,6 +1067,115 @@ function renderCurve() {
   }
 }
 
+/** My keeper's ledger as last read, or null while none has been. */
+let ledger = null;
+/** How the last attempt to fetch it went: "reading", "none" for no keeper yet, "unreachable", or "read". */
+let ledgerState = "reading";
+let ledgerAskedAt = 0;
+let ledgerBusy = false;
+/** What of it was last put on the page, so that nothing is written again, and no link rebuilt, while it stays the same. */
+let goneShown = "";
+
+async function readFees() {
+  if (ledgerBusy) return;
+  ledgerBusy = true;
+  ledgerAskedAt = Date.now();
+  // A page that names no ledger has no keeper to read.
+  const head = site.ledger ? await readLedger(site.ledger) : false;
+  ledgerBusy = false;
+  if (head) {
+    // A copy older than the one already shown is a cache behind the times, not a ledger that lost lines.
+    if (!ledger || head.seq >= ledger.seq) {
+      if (ledger && head.seq > ledger.seq && shown !== "hooks") document.querySelector('[data-nav="hooks"]').classList.add("has-news");
+      ledger = head;
+    }
+    ledgerState = "read";
+  } else {
+    // Once a ledger has been read, a file that is not there is a file that could not be fetched.
+    ledgerState = head === false && !ledger ? "none" : "unreachable";
+  }
+  renderGone();
+}
+
+/** The ledger this page shows: the one last read, unless it was kept for another token. */
+const ledgerShown = () => (ledger && !(book && ledger.mint !== book.mint) ? ledger : null);
+
+/** Where the fees went: the three shares, what is still owed in each, and the last things my keeper did. */
+function renderGone() {
+  const head = ledgerShown();
+  const key = [ledgerState, ledger?.seq, Boolean(head)].join(" ");
+  if (key === goneShown) return;
+  goneShown = key;
+  const say = slot("gone-say");
+  // What was last read stays up when the ledger cannot be reached, and says so.
+  say.textContent =
+    ledger && !head
+      ? "The ledger this page was given is for another token, so I do not show it."
+      : ledgerState === "unreachable"
+        ? `I cannot reach my keeper’s ledger just now. ${head ? "This is what I last read." : "I keep trying."}`
+        : ledgerState === "none"
+          ? "My keeper is not running yet. Until it runs, a fee hook of mine only records the shares."
+          : head
+            ? ""
+            : "One moment. I am reading my keeper’s ledger.";
+  say.hidden = !say.textContent;
+  slot("gone-body").hidden = !head;
+  // From here on the rehearsal's figures are gone from a live page.
+  slot("gone").dataset.ledger = head ? "read" : ledgerState;
+  if (!head) return;
+
+  const { totals } = head;
+  const owed = (lamports) => (Number(lamports) ? `${inSol(lamports)} SOL still owed` : "nothing owed");
+  write("gone-holders", inSol(totals.holders.paid));
+  write("owed-holders", owed(totals.holders.owed));
+  write("gone-burn", inSol(totals.burn.spent));
+  write("gone-tokens", inTokens(totals.burn.tokens));
+  write("owed-burn", owed(totals.burn.owed));
+  write("gone-treasury", inSol(totals.treasury.paid));
+  write("owed-treasury", owed(totals.treasury.owed));
+  renderGoneSum();
+
+  const lines = head.recent.slice(-MAX_MOVES).reverse();
+  slot("moves-head").hidden = lines.length === 0;
+  slot("moves").hidden = lines.length === 0;
+  slot("moves").replaceChildren(...lines.map(renderMove));
+  // These are the last few lines. The whole ledger is one press away, once it has a line in it.
+  slot("moves-all").hidden = !site.ledgerFile || head.seq === 0;
+  if (site.ledgerFile) slot("ledger-file").href = site.ledgerFile;
+}
+
+/** One sentence under the three shares: how much of the fees collected has left the pool. */
+function renderGoneSum() {
+  const head = ledgerShown();
+  if (!head) return;
+  const taken = Number(head.totals.claimed) / 1e9;
+  const text = !taken
+    ? "My keeper has not taken any fees out of the pool yet."
+    : // The pool counts every fee there has been. Read a moment apart, the two may not line up: then only one is said.
+      market && market.feesSol >= taken
+      ? `Of the ${inSol(String(Math.round(market.feesSol * 1e9)))} SOL in fees so far, my keeper has taken ${inSol(head.totals.claimed)} SOL out of the pool.`
+      : `My keeper has taken ${inSol(head.totals.claimed)} SOL in fees out of the pool so far.`;
+  if (slot("gone-sum").textContent !== text) write("gone-sum", text);
+}
+
+/** One line of the ledger: what happened, when, and the transactions that show it. */
+function renderMove(line) {
+  const said = told(line, site.treasury);
+  const node = document.getElementById("move-template").content.firstElementChild.cloneNode(true);
+  if (said.share) node.classList.add(`is-${said.share}`);
+  node.querySelector(".move-kind").textContent = said.kind;
+  node.querySelector(".move-what").textContent = said.what;
+  if (said.more) node.querySelector(".move-more").textContent = said.more;
+  else node.querySelector(".move-more").remove();
+  const time = node.querySelector(".move-when");
+  time.textContent = whenShort(Date.parse(line.at));
+  time.dateTime = line.at;
+  const proofs = node.querySelector(".move-proofs");
+  if (said.proofs.length) proofs.replaceChildren(...separated([...said.proofs.map(([words, signature]) => link(words, `${site.explorer}/tx/${signature}`)), ...(said.rest ? [said.rest] : [])]));
+  else proofs.remove();
+  return node;
+}
+
 // The charter is a list of things I cannot do. Ask for one and I shake my whole body, as I do for a buy I turn away.
 for (const article of document.querySelectorAll(".articles li")) {
   const dare = document.createElement("button");
@@ -1078,7 +1209,11 @@ slot("record").addEventListener(
   true,
 );
 
-/** The addresses in config.js are shown at once; the ones only the rulebook knows follow its first read. */
+/**
+ * The addresses in config.js are shown at once; the ones only the rulebook knows follow its
+ * first read. The treasury's is the one address here that is on no account of the token's: my
+ * keeper is told it, and this page is told the same one.
+ */
 function renderAddresses() {
   const rows = [
     ["Token", book?.mint, "token"],
@@ -1086,8 +1221,10 @@ function renderAddresses() {
     ["Hook program", site.program, "account"],
     ["Curve", site.pool, "account"],
     ["Agent", book?.agent, "account"],
+    ["Keeper", book?.keeper, "account"],
+    ["Treasury", site.treasury, "account"],
     ["Guardian", book?.guardian, "account"],
-  ].filter(([, address]) => isAddress(address));
+  ].filter(([, address]) => isAddress(address) && address !== NOBODY);
   if (rows.join() === addressesShown) return;
   addressesShown = rows.join();
   slot("addresses").replaceChildren(
@@ -1148,6 +1285,14 @@ if (live) {
   renderStatus();
   refresh();
 
+  // What my keeper did with the fees comes from its own file, apart from the chain: read now,
+  // and then once a minute while somebody is looking.
+  renderGone();
+  readFees();
+  setInterval(() => {
+    if (!document.hidden) readFees();
+  }, LEDGER_MS);
+
   // The chain is asked every twenty seconds while that is the only way to know, and once a
   // minute as a safety net while it is also pushing. A door the node would not show is asked
   // for again on every beat.
@@ -1194,6 +1339,7 @@ if (live) {
     } else {
       listen();
       refresh();
+      if (Date.now() - ledgerAskedAt >= LEDGER_MS) readFees();
     }
   });
 

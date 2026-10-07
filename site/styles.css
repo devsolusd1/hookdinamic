@@ -1099,8 +1099,181 @@ main {
   color: var(--on-veluno);
 }
 
-.catalogue-note {
-  margin-top: 2rem;
+/* Where the fees went: a tile for each share, with what my keeper has paid out of it and what
+   it still owes, and under them the last things it did. Each share wears the mark it has on
+   the split at the head of the page: solid for holders, hatched for the burn, empty for the
+   treasury. */
+
+.gone {
+  margin-top: 3rem;
+}
+
+/* A live page shows none of the rehearsal's payments while my keeper's ledger is on its way. */
+[data-mode="live"] .gone:not([data-ledger]) > :not(.hook-group-title) {
+  visibility: hidden;
+}
+
+/* What stands here when there is nothing to show, or when what is shown is old. */
+.gone-say {
+  width: fit-content;
+  max-width: min(100%, 44rem);
+  padding: 0.75rem 1.2rem;
+  border-radius: var(--radius);
+  background: var(--paper-deep);
+  font-size: 0.98rem;
+}
+
+.gone-say:not([hidden]) + div {
+  margin-top: 1rem;
+}
+
+.shares {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.share {
+  display: grid;
+  align-content: start;
+  gap: 0.15rem;
+  padding: 1.3rem 1.5rem 1.4rem;
+  border-radius: var(--radius);
+  background: var(--paper-deep);
+}
+
+.share dt {
+  font-size: 0.95rem;
+  color: var(--ink-soft);
+}
+
+/* The figure first, and what it is under it. */
+.share-figure {
+  order: -1;
+  font: 600 1.6rem/1.15 var(--display);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+  overflow-wrap: anywhere;
+}
+
+.share-more {
+  margin-top: 0.45rem;
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-soft);
+}
+
+.share dt::before,
+.move-kind::before {
+  content: "";
+  display: inline-block;
+  width: 0.62rem;
+  height: 0.62rem;
+  margin-right: 0.5em;
+  border-radius: 50%;
+}
+
+/* A line about no one share keeps the room for a mark, so the words down the list start together. */
+.share dt::before,
+.move:is(.is-holders, .is-burn, .is-treasury) .move-kind::before {
+  box-shadow: inset 0 0 0 1px var(--ink);
+}
+
+.share.is-holders dt::before,
+.move.is-holders .move-kind::before {
+  background: var(--ink);
+}
+
+.share.is-burn dt::before,
+.move.is-burn .move-kind::before {
+  background: repeating-linear-gradient(135deg, var(--ink) 0 1px, transparent 1px 3px);
+}
+
+.gone-sum {
+  max-width: 44rem;
+  margin-top: 0.9rem;
+  padding-inline: 0.4rem;
+  font-size: 0.95rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-soft);
+}
+
+.moves-head {
+  margin: 1.75rem 0 0.6rem;
+  padding-inline: 0.4rem;
+  color: var(--ink-soft);
+}
+
+/* Each thing my keeper did, on a row of its own: what, when, and the transactions that show it. */
+.moves {
+  display: grid;
+  gap: 0.45rem;
+  padding: 0;
+  list-style: none;
+}
+
+.move {
+  display: grid;
+  /* A round of payments has several transactions: on a narrow row they wrap, and leave the sentence its room. */
+  grid-template-columns: 7.5rem minmax(0, 1fr) fit-content(40%);
+  grid-template-areas:
+    "kind what when"
+    ". more proofs";
+  gap: 0.1rem 1rem;
+  align-items: baseline;
+  padding: 0.7rem 1rem 0.75rem;
+  border-radius: 1rem;
+  background: var(--paper-deep);
+}
+
+.move-kind {
+  grid-area: kind;
+}
+
+.move-what {
+  grid-area: what;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.move-more {
+  grid-area: more;
+}
+
+.move-when {
+  grid-area: when;
+  white-space: nowrap;
+}
+
+.move-proofs {
+  grid-area: proofs;
+}
+
+.move-more,
+.move-when,
+.move-proofs {
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-soft);
+}
+
+.move-when,
+.move-proofs {
+  text-align: right;
+}
+
+.move-proofs a {
+  text-decoration-color: var(--edge);
+  white-space: nowrap;
+}
+
+/* Under the last lines: where all of them are. */
+.moves-all {
+  max-width: 44rem;
+  margin-top: 0.9rem;
+  padding-inline: 0.4rem;
+  font-size: 0.95rem;
+  color: var(--ink-soft);
 }
 
 /* The door: who came, and what the curve holds. */
@@ -1983,6 +2156,30 @@ main {
     justify-self: end;
   }
 
+  .shares {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* What it was and when on one row; the sentence and its transactions under it, at full width. */
+  .move {
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-areas:
+      "kind when"
+      "what what"
+      "more more"
+      "proofs proofs";
+  }
+
+  .move-proofs {
+    margin-top: 0.2rem;
+    text-align: left;
+  }
+
+  /* Stacked, a line with no mark starts where its sentence does. */
+  .move:not(.is-holders, .is-burn, .is-treasury) .move-kind::before {
+    display: none;
+  }
+
   .entry-body {
     padding: 1rem 1.1rem 1.15rem;
   }
@@ -1993,6 +2190,7 @@ main {
 
   .board,
   .hook,
+  .share,
   .articles li,
   .curve {
     padding-inline: 1.1rem;
@@ -2022,6 +2220,11 @@ main {
 
   .entry-more summary {
     padding-block: 0.7rem;
+  }
+
+  .move-proofs a {
+    display: inline-block;
+    padding-block: 0.35rem;
   }
 
   .notches,
