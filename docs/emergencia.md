@@ -212,15 +212,23 @@ mais nada. **Aqui cada minuto conta: troque primeiro, entenda depois.**
 
    Confira `old keeper`, `new keeper` e `The chain would accept it.`
 3. De verdade: o mesmo comando com `--send --mainnet` no fim.
-4. **Chame quem programa antes de religar o keeper no servidor.** Motivos:
+4. **Deixe o serviço ligado como está, e chame quem programa antes de mexer no keeper do
+   servidor.** O que acontece depois da troca:
    - As taxas que ainda estavam na pool estão seguras: só o keeper novo consegue retirar.
-   - O que o keeper antigo já tinha retirado e ainda não tinha pago ficou na **carteira antiga**.
-     Nada move esse dinheiro sozinho. Se a chave antiga foi roubada, conte como perdido. Se
-     ela só foi trocada e continua com você, o dinheiro está lá e sai com ela.
+   - O keeper antigo, **se continuar ligado**, não retira mais nada e paga sozinho o que já
+     tinha retirado e ainda não tinha pago: manda a parte da tesouraria, recompra e queima, e
+     paga os holders. Depois escreve na última linha do livro público o que sobrou com ele, e
+     para. Não desligue o serviço nem troque `KEEPER_KEYPAIR_JSON` antes disso. Se a chave
+     antiga foi roubada, o ladrão pode esvaziar a carteira primeiro: conte como perdido o que
+     não tiver sido pago.
+   - O que sobrar com ele (quantias pequenas demais para enviar) fica na **carteira antiga**.
+     Com o serviço desligado, fica lá tudo o que ele ainda não tinha pago: nada move esse
+     dinheiro sozinho.
    - As contas do keeper antigo (quanto cada holder tem a receber) não passam sozinhas para o
      novo. Elas só existem no disco do servidor. Hoje não existe um comando para isso.
-   Enquanto isso, o `/health` mostra `the keeper keeps failing: the rulebook names ... as the
-   keeper, not my key`. É o esperado: o keeper antigo parou.
+   Quando ele termina, o `/health` mostra `the keeper keeps failing: the rulebook names ... as
+   the keeper, not my key ...: I have paid out what my books owed and stopped for good`. É o
+   esperado: o keeper antigo pagou o que devia e parou.
 
 **Não troque o keeper por rotina.** Só em emergência, ou combinado com quem programa.
 

@@ -246,9 +246,9 @@ A lista `"problems"` diz o motivo, em inglês. Os mais comuns:
 | `the agent is not running: ... is not set` | Faltou uma variável. | Volte ao passo 4 e confira o nome que aparece. |
 | `... is not a keypair ...` | A chave foi colada pela metade. | Cole de novo, do `[` ao `]`. |
 | `the agent keeps failing: ... is not this token's agent` | A chave no servidor não é a do agente deste token. | Confira `AGENT_KEYPAIR_JSON` e `MINT`. |
-| `the keeper keeps failing: the rulebook names ... as the keeper, not my key` | A chave no servidor não é a do keeper deste token. | Confira `KEEPER_KEYPAIR_JSON` e `MINT`. |
+| `the keeper keeps failing: the rulebook names ... as the keeper, not my key` | A chave no servidor não é a do keeper deste token. | Confira `KEEPER_KEYPAIR_JSON` e `MINT`. Se o guardião acabou de trocar o keeper, é o esperado: veja `docs/emergencia.md`, parte 5. |
 | `... has not worked since it started: ...` | O agente ou o keeper ainda não conseguiu dar um passo desde que ligou. Quase sempre é uma variável errada. | Leia o resto da frase e confira o passo 4. |
-| `... there is nothing at the treasury's address ...` | Nunca houve nada no endereço que está em `TREASURY`. | Compare `TREASURY` com a carteira, letra por letra. Se estiver certo, mande 0,01 SOL para ela: o keeper liga sozinho quando o SOL chegar. |
+| `... there is nothing at the treasury's address ...` | Não há nada no endereço que está em `TREASURY`: ou nunca houve, ou a carteira foi esvaziada até zero (o keeper confere isso cada vez que o serviço liga). | Compare `TREASURY` com a carteira, letra por letra. Se estiver certo, mande 0,01 SOL para ela: o keeper liga sozinho quando o SOL chegar. Ao tirar SOL da tesouraria, deixe sempre um pouco nela. |
 | `... the treasury's address ... is not a wallet ...` | O endereço em `TREASURY` não é de uma carteira (é de um programa ou de uma conta de token). SOL mandado para lá nunca sairia. | Corrija `TREASURY`. O keeper não faz nada enquanto isso. |
 | `... the books ... are those of keeper ... for token ..., not mine` | O disco é de outro token (o do ensaio, por exemplo). | Não use esse disco. Veja "O ensaio na devnet". |
 | `the keeper's wallet needs topping up` | O keeper ficou sem SOL para as taxas de rede. | Mande 0,05 SOL para o endereço do keeper (0,2 SOL se o movimento estiver grande). |
@@ -335,8 +335,10 @@ Os preços são os que as páginas dos provedores mostravam em 7 de outubro de 2
   disser que pode.
 - **Trocar uma chave do servidor** (depois de usar o comando do guardião): Variables → cole o
   conteúdo da chave nova em `AGENT_KEYPAIR_JSON` ou `KEEPER_KEYPAIR_JSON` → Seal → Deploy.
-  Para a chave do keeper, fale antes com quem programa: as contas do keeper antigo não passam
-  sozinhas para o novo.
+  Para a chave do keeper, fale antes com quem programa, e não troque a variável enquanto o
+  `/health` não disser `stopped for good`: até lá o keeper antigo está pagando o que já tinha
+  retirado (`docs/emergencia.md`, parte 5). As contas do keeper antigo não passam sozinhas
+  para o novo.
 - **Trocar o RPC do servidor** (a chave da Helius): Variables → `RPC_URL` → Seal → Deploy. E
   troque também a linha `rpc` do `token.json` no seu computador: é por ela que o comando do
   guardião fala com a rede (`docs/emergencia.md`).

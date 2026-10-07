@@ -902,7 +902,10 @@ async function onValidator() {
   }
 
   console.log("a token on the validator");
-  for (const [wallet, sol] of [[payer, 10], [guardian, 1], [agent, 1], [keeper, 1], [alice, 50], [bob, 50], [carol, 50]] as const) await airdrop(wallet.publicKey, sol);
+  // The treasury is a wallet somebody has used: the keeper does nothing for one that has never held anything.
+  for (const [wallet, sol] of [[payer, 10], [guardian, 1], [agent, 1], [keeper, 1], [treasury, 1], [alice, 50], [bob, 50], [carol, 50]] as const) await airdrop(wallet.publicKey, sol);
+  // What the treasury holds before the keeper has sent it anything.
+  const treasuryHad = BigInt(await connection.getBalance(treasury.publicKey, "confirmed"));
   const { pool } = await launch({
     dbc, hookProgram: HOOK, payer, mint, config,
     guardian: guardian.publicKey, agent: agent.publicKey, keeper: keeper.publicKey,
@@ -942,6 +945,8 @@ async function onValidator() {
   const lastOf = (lines: string[]) => lines.slice(-25).join("\n");
 
   console.log("the service, with both loops");
+  // The keeper looks at the treasury's address in finalized blocks: what it was sent above is final before the service starts.
+  while ((await connection.getBalance(treasury.publicKey, "finalized")) === 0) await sleep(500);
   await clearOfTheNextDrop(330);
   let service = startService(env, dir);
   await until("it starts, and the agent issues its first edict by itself", async () => (await readBook()).epoch >= 1n && readLog(logPath).length >= 1, 60);
@@ -967,7 +972,7 @@ async function onValidator() {
   check(pageHead && pageHead.mint === mint.publicKey.toBase58() && pageHead.seq >= 2 && BigInt(pageHead.totals.claimed) >= 288_000_000n && pageHead.recent.some((line: { kind: string }) => line.kind === "claim"), `the page reads the keeper's head from the service: ${pageHead ? `${pageHead.seq} lines, ${Number(pageHead.totals.claimed) / 1e9} SOL claimed` : "nothing"}`);
   const ledger = await ledgerNow();
   check(ledger.length === (await headNow())?.seq && ledger.every((line, i) => line.seq === i + 1), `the whole ledger is served too, line for line with the head (${ledger.map((line) => line.kind).join(", ")})`);
-  check(BigInt(await connection.getBalance(treasury.publicKey, "confirmed")) === BigInt((await headNow())!.totals.treasury.paid) && BigInt((await headNow())!.totals.treasury.paid) > 0n, "and the treasury's wallet holds exactly what the ledger says it was sent");
+  check(BigInt(await connection.getBalance(treasury.publicKey, "confirmed")) - treasuryHad === BigInt((await headNow())?.totals.treasury.paid ?? -1) && BigInt((await headNow())?.totals.treasury.paid ?? 0) > 0n, "and the treasury's wallet holds exactly what the ledger says it was sent, on top of what it held before");
 
   for (const path of ["/log.jsonl", "/ledger.jsonl", "/ledger-head.json"]) {
     const allowed = await fetch(at(path), { headers: { origin: SITE } });
@@ -1028,7 +1033,7 @@ async function onValidator() {
   const finalLedger = await ledgerNow();
   const signatures = finalLedger.flatMap((line) => (line.signature ? [line.signature] : []));
   check(finalLedger.every((line, i) => line.seq === i + 1) && new Set(signatures).size === signatures.length && finalLedger.filter((line) => line.kind === "claim").length >= 1, `the ledger still has every line once (${finalLedger.map((line) => line.kind).join(", ")})`);
-  check(BigInt(await connection.getBalance(treasury.publicKey, "confirmed")) === BigInt((await headNow())!.totals.treasury.paid), "and the treasury's wallet still holds exactly what it says");
+  check(BigInt(await connection.getBalance(treasury.publicKey, "confirmed")) - treasuryHad === BigInt((await headNow())!.totals.treasury.paid), "and the treasury's wallet still holds exactly what it says, on top of what it held before");
   health = await healthOf(port);
   if (!health.body.ok) console.log(lastOf(service.lines));
 
@@ -1072,7 +1077,9 @@ async function onValidator() {
   check(told.code === 0 && told.out.includes(`old keeper  ${keeper.publicKey.toBase58()}`) && told.out.includes(`new keeper  ${newKeeper.toBase58()}`) && told.out.includes("Nothing was sent") && (await readBook()).keeper.equals(keeper.publicKey), "replacing the keeper, as a dry run, names the old key and the new and changes nothing");
   told = await guardianSays("keeper", newKeeper.toBase58(), ...withKey, "--send");
   check(told.code === 0 && (await readBook()).keeper.equals(newKeeper), "with --send the rulebook names the new keeper");
-  await until("the old keeper stops at its next round, and /health says why", async () => (await healthOf(port)).body.problems.some((problem) => problem.includes("the keeper keeps failing") && problem.includes("as the keeper, not my key")), 60);
+  // The old keeper claims nothing more, pays out what it holds round by round, each payment waiting for a finalized block, and only then stops.
+  await until("the old keeper pays out what it held and stops for good, and /health says why", async () => (await healthOf(port)).body.problems.some((problem) => problem.includes("the keeper keeps failing") && problem.includes("as the keeper, not my key") && problem.includes("stopped for good")), 300);
+  check((await ledgerNow()).at(-1)?.kind === "note", "the last line of its ledger is its note of what was left with it");
   const records = await fetch(at("/ledger-head.json"));
   check(records.status === 200 && (await records.text()).length > 0, "the records are still served while both loops are refused");
 

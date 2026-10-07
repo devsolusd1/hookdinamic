@@ -220,7 +220,7 @@ async function run() {
       `old keeper  ${book.keeper.toBase58()}   can take no fees out of the pool from then on`,
       `new keeper  ${keeper.toBase58()}   becomes the only key the fees can be claimed for`,
       "Fees still in the pool are safe: only the new keeper can claim them.",
-      "What the old keeper had already claimed and not yet paid out stays in the old keeper's wallet. Nothing moves it for you.",
+      "What the old keeper had already claimed and not yet paid out is in the old keeper's wallet. Left running, the old keeper pays it out by itself and then stops for good; stopped, nothing moves it for you.",
       "The service has to be given the new keeper's key, and the old keeper's books do not carry over by themselves.",
       ...(keeper.equals(guardian.publicKey) ? ["WARNING: that is the guardian's own key. Whoever gets one then has both."] : []),
       ...(keeper.equals(book.agent) ? ["WARNING: that is the agent's key. One stolen key would then be both."] : []),
