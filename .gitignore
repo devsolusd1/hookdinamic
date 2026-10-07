@@ -6,3 +6,20 @@ test-ledger/
 *-keypair.json
 keys/
 .local/
+# what the service, the keeper and the agent write when they are run from this folder
+/data/
+/keeper/
+/agent-log.jsonl*
+# a launch belongs in a folder outside this one. If one is run from here all the same, its
+# keys and files stay out: the names are those of launch.example.json and of docs/lancamento.md
+/launch.json
+/token.json
+/mint.json
+/curve-config.json
+/payer.json
+/pagador.json
+/guardiao*.json
+/agente*.json
+/keeper*.json
+/programa.json
+/buffer.json

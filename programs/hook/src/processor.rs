@@ -10,6 +10,8 @@
 //! | [`tag::SET_COSIGNER`]       | set_cosigner | guardian             |
 //! | [`tag::SET_GUARDIAN`]       | set_guardian | guardian, new one    |
 //! | [`tag::SET_NAME`]           | set_name     | agent                |
+//! | [`tag::SET_KEEPER`]         | set_keeper   | guardian             |
+//! | [`tag::CLAIM_FEES`]         | claim_fees   | keeper               |
 
 use {
     crate::state::{
@@ -17,7 +19,7 @@ use {
         RULEBOOK_SEED, SYMBOL_LEN, VALIDATION_SEED, VERSION,
     },
     pinocchio::{
-        cpi::{invoke_signed, Seed, Signer},
+        cpi::{invoke_signed, invoke_signed_with_bounds, Seed, Signer},
         error::ProgramError,
         instruction::{InstructionAccount, InstructionView},
         sysvars::{
@@ -42,9 +44,13 @@ pub mod tag {
     pub const SET_COSIGNER: u8 = 4;
     pub const SET_GUARDIAN: u8 = 5;
     pub const SET_NAME: u8 = 6;
+    pub const SET_KEEPER: u8 = 7;
+    pub const CLAIM_FEES: u8 = 8;
 }
 
 pub const TOKEN_2022: Address = Address::from_str_const("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+/// The older token program. Wrapped SOL, which the fees are paid in, is a token of this one.
+pub const TOKEN: Address = Address::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 /// `sha256("spl_token_metadata_interface:updating_field")[..8]`: how a token's metadata is edited.
 const UPDATE_FIELD: [u8; 8] = [221, 233, 49, 45, 181, 202, 220, 200];
 /// The metadata fields a name change touches, by their numbers in that interface.
@@ -54,6 +60,25 @@ const FIELD_SYMBOL: u8 = 1;
 /// Meteora DBC's pool authority. It owns the token vault of every curve, so tokens leaving an
 /// account it owns are a buy and tokens arriving in one are a sell.
 pub const POOL_AUTHORITY: Address = Address::from_str_const("FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM");
+/// Meteora's bonding curve program, the only one `claim_fees` ever calls.
+pub const METEORA_DBC: Address = Address::from_str_const("dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN");
+/// `sha256("global:claim_trading_fee2")[..8]`: Meteora's claim for a pool whose token has a hook.
+const CLAIM_TRADING_FEE2: [u8; 8] = [84, 191, 71, 50, 9, 162, 55, 193];
+/// The accounts Meteora's claim names, in its order: pool authority, config, pool, where the
+/// fees in the token go, where the fees in SOL go, the pool's two vaults, the two mints, the
+/// fee claimer, the two token programs, Meteora's event authority, Meteora's program.
+pub const CLAIM_ACCOUNTS: usize = 14;
+/// Where, among those, the two destinations, the token's mint, the fee claimer and Meteora's
+/// program sit.
+const CLAIM_TOKEN_DESTINATION: usize = 3;
+const CLAIM_SOL_DESTINATION: usize = 4;
+const CLAIM_MINT: usize = 7;
+const CLAIM_FEE_CLAIMER: usize = 9;
+const CLAIM_PROGRAM: usize = 13;
+/// After them come the accounts the token's hook wants in a transfer. This program's own
+/// list has five (the three extra accounts, the program, the validation account).
+const MAX_CLAIM_HOOK_ACCOUNTS: usize = 8;
+const MAX_CLAIM_ACCOUNTS: usize = CLAIM_ACCOUNTS + MAX_CLAIM_HOOK_ACCOUNTS;
 const COMPUTE_BUDGET: Address = Address::from_str_const("ComputeBudget111111111111111111111111111111");
 /// The compute-budget instruction that sets a transaction's priority fee.
 const SET_COMPUTE_UNIT_PRICE: u8 = 3;
@@ -86,6 +111,8 @@ pub fn process_instruction(program_id: &Address, accounts: &mut [AccountView], d
         tag::SET_COSIGNER => set_key(program_id, accounts, data, |book| &mut book.cosigner),
         tag::SET_GUARDIAN => set_guardian(program_id, accounts),
         tag::SET_NAME => set_name(program_id, accounts, data),
+        tag::SET_KEEPER => set_key(program_id, accounts, data, |book| &mut book.keeper),
+        tag::CLAIM_FEES => claim_fees(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -232,9 +259,9 @@ fn execute(program_id: &Address, accounts: &mut [AccountView], data: &[u8]) -> P
 ///
 /// Accounts: payer (signer, writable), mint (signer), validation account (writable), rulebook
 /// (writable), system program.
-/// Data: guardian, agent, cosigner, exempt, curve vault (32 bytes each), [`Limits`], the
-/// opening fee split: holders, burn, treasury (2 bytes each), then the names the token can go
-/// by, 44 bytes each, the one it launches with first. The token opens with no rule.
+/// Data: guardian, agent, cosigner, exempt, curve vault, keeper (32 bytes each), [`Limits`],
+/// the opening fee split: holders, burn, treasury (2 bytes each), then the names the token can
+/// go by, 44 bytes each, the one it launches with first. The token opens with no rule.
 fn init(program_id: &Address, accounts: &mut [AccountView], data: &[u8]) -> ProgramResult {
     let [payer, mint, validation, book, _system_program, ..] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -245,7 +272,7 @@ fn init(program_id: &Address, accounts: &mut [AccountView], data: &[u8]) -> Prog
     if !validation.is_data_empty() || !book.is_data_empty() {
         return Err(ProgramError::AccountAlreadyInitialized);
     }
-    const KEYS: usize = 5 * 32;
+    const KEYS: usize = 6 * 32;
     const NAMES: usize = KEYS + Limits::LEN + 6;
     let limits = Limits::decode(&array(data, KEYS)?);
     let split: [u8; 6] = array(data, KEYS + Limits::LEN)?;
@@ -257,7 +284,7 @@ fn init(program_id: &Address, accounts: &mut [AccountView], data: &[u8]) -> Prog
     if !split_adds_up(holders_bps, burn_bps, treasury_bps) {
         return Err(Refusal::BadSplit.into());
     }
-    if treasury_bps > limits.max_treasury_bps {
+    if !limits.treasury_fits(treasury_bps) {
         return Err(Refusal::OutsideLimits.into());
     }
 
@@ -301,6 +328,7 @@ fn init(program_id: &Address, accounts: &mut [AccountView], data: &[u8]) -> Prog
     book.cosigner = array(data, 64)?;
     book.exempt = array(data, 96)?;
     book.curve_vault = curve_vault;
+    book.keeper = array(data, 160)?;
     book.set_limits(&limits);
     book.set_split(holders_bps, burn_bps, treasury_bps);
     if !book.set_names(names) {
@@ -384,7 +412,7 @@ fn pause(program_id: &Address, accounts: &mut [AccountView], data: &[u8]) -> Pro
     })
 }
 
-/// The guardian replaces the agent or the co-signer.
+/// The guardian replaces the agent, the co-signer or the keeper.
 ///
 /// Accounts: guardian (signer), rulebook (writable). Data: the new key.
 fn set_key(
@@ -419,6 +447,98 @@ fn set_guardian(program_id: &Address, accounts: &mut [AccountView]) -> ProgramRe
         book.guardian = key;
         Ok(())
     })
+}
+
+/// The keeper takes the trading fees out of the curve. Meteora hands them only to the address
+/// its config names as fee claimer, and for this token that is the rulebook's own, so this
+/// asks Meteora for them with the rulebook signing. They can only land in token accounts the
+/// keeper owns: a claim is of no use to anybody else, even one the keeper was tricked into
+/// signing. And the rulebook signs only for the curve of its own token: the mint the claim
+/// names has to be the one the rulebook was written for.
+///
+/// Accounts: keeper (signer), then every account of Meteora's claim in Meteora's order (see
+/// [`CLAIM_ACCOUNTS`]; the fee claimer among them is the rulebook), then the accounts the
+/// token's hook wants in a transfer.
+/// Data: the most to claim in the token, then the most to claim in SOL (8 bytes each). Both
+/// are passed on as they are.
+///
+/// Only fees in SOL can come out this way, and the curve is set to take no others. Moving
+/// fees in the token would have Token-2022 call this program's hook from inside this
+/// program's own call, which Solana does not allow.
+fn claim_fees(program_id: &Address, accounts: &mut [AccountView], data: &[u8]) -> ProgramResult {
+    let [keeper, claim @ ..] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    let count = claim.len();
+    if count < CLAIM_ACCOUNTS {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    }
+    if count > MAX_CLAIM_ACCOUNTS {
+        return Err(ProgramError::InvalidArgument);
+    }
+    let amounts: &[u8; 16] = data.try_into().map_err(|_| ProgramError::InvalidInstructionData)?;
+
+    if !keeper.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let keeper_key = *keeper.address().as_array();
+    let book = &claim[CLAIM_FEE_CLAIMER];
+    if !book.owned_by(program_id) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+    let (mint_key, bump) = {
+        let book_data = book.try_borrow()?;
+        let book = Rulebook::cast(&book_data).ok_or(ProgramError::InvalidAccountData)?;
+        if book.version != VERSION {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if book.keeper != keeper_key {
+            return Err(Refusal::NotKeeper.into());
+        }
+        (book.mint, book.bump)
+    };
+    // The rulebook signs for a claim on its own token's curve and on no other. Anybody can
+    // make a curve for a token of theirs whose config names this rulebook as fee claimer, and
+    // that token's hook program would then be called with the rulebook signing and accounts
+    // of the caller's choosing. Meteora, for its part, refuses a pool that is not this mint's.
+    if *claim[CLAIM_MINT].address().as_array() != mint_key {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    // The call below goes to Meteora whatever is passed here: its address is written in this
+    // program. A caller who put another program in its place is told so.
+    if claim[CLAIM_PROGRAM].address() != &METEORA_DBC {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    for destination in [&claim[CLAIM_TOKEN_DESTINATION], &claim[CLAIM_SOL_DESTINATION]] {
+        let is_token_account = destination.owned_by(&TOKEN_2022) || destination.owned_by(&TOKEN);
+        if !is_token_account || token_owner(destination)? != keeper_key {
+            return Err(Refusal::NotKeepersAccount.into());
+        }
+    }
+
+    // Meteora's instruction: its 8 bytes, the two amounts, then which of the accounts after
+    // its own are for the token's hook, as a list of (kind, how many). Kind 0 is "for a
+    // transfer of the token"; with no such accounts the list is empty.
+    let hook_accounts = count - CLAIM_ACCOUNTS;
+    let mut call = [0; 8 + 16 + 4 + 2];
+    call[..8].copy_from_slice(&CLAIM_TRADING_FEE2);
+    call[8..24].copy_from_slice(amounts);
+    let len = if hook_accounts == 0 {
+        28
+    } else {
+        call[24] = 1;
+        call[29] = hook_accounts as u8;
+        30
+    };
+    // The pool, the two destinations and the two vaults are written to; the fee claimer signs.
+    // Past the last account given the array repeats it, and that part is never used.
+    let metas: [InstructionAccount; MAX_CLAIM_ACCOUNTS] = core::array::from_fn(|i| {
+        InstructionAccount::new(claim[i.min(count - 1)].address(), (2..=6).contains(&i), i == CLAIM_FEE_CLAIMER)
+    });
+    let instruction = InstructionView { program_id: &METEORA_DBC, accounts: &metas[..count], data: &call[..len] };
+    let bump = [bump];
+    let seeds = [Seed::from(RULEBOOK_SEED), Seed::from(&mint_key), Seed::from(&bump)];
+    invoke_signed_with_bounds::<MAX_CLAIM_ACCOUNTS, _>(&instruction, claim, &[Signer::from(&seeds)])
 }
 
 /// The agent switches the token to another of the names written at launch, as part of an

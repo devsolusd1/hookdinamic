@@ -1,0 +1,31 @@
+# The Dockerfile copies only what it names, so none of this can end up in the image. This
+# keeps it from being handed to the builder at all when the image is built from a working
+# folder, where .env and .local hold keys.
+.env
+.env.*
+!.env.example
+.local
+keys
+*-keypair.json
+*.pending
+.git
+node_modules
+target
+test-ledger
+programs
+docs
+data
+keeper
+agent-log.jsonl
+# the files of a launch run from this folder, keys among them (see .gitignore)
+launch.json
+token.json
+mint.json
+curve-config.json
+payer.json
+pagador.json
+guardiao*.json
+agente*.json
+keeper*.json
+programa.json
+buffer.json

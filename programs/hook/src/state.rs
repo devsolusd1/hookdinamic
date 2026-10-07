@@ -12,7 +12,7 @@ pub const RULEBOOK_SEED: &[u8] = b"rules";
 /// `["extra-account-metas", mint]`. The transfer-hook interface fixes that name.
 pub const VALIDATION_SEED: &[u8] = b"extra-account-metas";
 
-pub const VERSION: u8 = 3;
+pub const VERSION: u8 = 4;
 pub const BPS: u16 = 10_000;
 pub const RULEBOOK_LEN: usize = 896;
 pub const NO_KEY: [u8; 32] = [0; 32];
@@ -56,6 +56,10 @@ pub enum Refusal {
     BadName = 17,
     /// A name changes only together with an edict, and none was written just now.
     NoEdict = 18,
+    /// The signer is not the keeper.
+    NotKeeper = 19,
+    /// Fees were asked to be sent to an account that is not a token account of the keeper.
+    NotKeepersAccount = 20,
 }
 
 /// The text in a field padded with zeros: not empty, readable, with no control characters.
@@ -206,6 +210,8 @@ pub struct Limits {
     /// Longest an edict may stand, in seconds. After that every buy goes through until the
     /// agent writes again, so a rule nobody can satisfy cannot outlive this.
     pub max_rule_secs: u32,
+    /// The smallest share of the fees the agent may leave the treasury, in bps.
+    pub min_treasury_bps: u16,
     /// The largest share of the fees the agent may send to the treasury, in bps.
     pub max_treasury_bps: u16,
     /// Shortest time between two changes of the token's name, in seconds.
@@ -213,14 +219,17 @@ pub struct Limits {
 }
 
 impl Limits {
-    pub const LEN: usize = 14;
+    pub const LEN: usize = 16;
 
+    /// The floor for the treasury comes last: it was added after the other four, in bytes
+    /// that had been spare, so nothing before it moved.
     pub fn decode(bytes: &[u8; Self::LEN]) -> Self {
         Limits {
             min_interval_secs: u32_at(bytes, 0),
             max_rule_secs: u32_at(bytes, 4),
             max_treasury_bps: u16_at(bytes, 8),
             min_rename_secs: u32_at(bytes, 10),
+            min_treasury_bps: u16_at(bytes, 14),
         }
     }
 
@@ -230,12 +239,19 @@ impl Limits {
         out[4..8].copy_from_slice(&self.max_rule_secs.to_le_bytes());
         out[8..10].copy_from_slice(&self.max_treasury_bps.to_le_bytes());
         out[10..14].copy_from_slice(&self.min_rename_secs.to_le_bytes());
+        out[14..16].copy_from_slice(&self.min_treasury_bps.to_le_bytes());
         out
     }
 
     /// Whether these limits make sense at all. Checked once, at launch.
     pub fn sane(&self) -> bool {
-        self.max_treasury_bps <= BPS
+        self.min_treasury_bps <= self.max_treasury_bps && self.max_treasury_bps <= BPS
+    }
+
+    /// Whether the treasury may be given this share of the fees: no less than its floor, no
+    /// more than its cap. Asked of the opening split and of every edict's.
+    pub fn treasury_fits(&self, treasury_bps: u16) -> bool {
+        (self.min_treasury_bps..=self.max_treasury_bps).contains(&treasury_bps)
     }
 
     /// Whether the agent may make this change. `has_cosigner`: the rulebook names an app key,
@@ -252,7 +268,7 @@ impl Limits {
         if !split_adds_up(change.holders_bps, change.burn_bps, change.treasury_bps) {
             return Err(Refusal::BadSplit);
         }
-        if change.treasury_bps > self.max_treasury_bps {
+        if !self.treasury_fits(change.treasury_bps) {
             return Err(Refusal::OutsideLimits);
         }
         Ok(())
@@ -351,7 +367,7 @@ impl Change {
 /// | 104 |  32 | cosigner     |
 /// | 136 |  32 | exempt       |
 /// | 168 |  32 | curve_vault  |
-/// | 200 |  14 | limits       |
+/// | 200 |  16 | limits: shortest interval (4), longest term (4), treasury cap (2), shortest stay of a name (4), treasury floor (2) |
 /// | 216 |   8 | rule_until   |
 /// | 224 |   6 | fee split: holders, burn, treasury |
 /// | 232 |   8 | epoch        |
@@ -363,6 +379,7 @@ impl Change {
 /// | 481 |   1 | name_count   |
 /// | 488 |   8 | renamed_at   |
 /// | 512 | 352 | names, 44 bytes each: name (32), ticker (10), two spare bytes |
+/// | 864 |  32 | keeper       |
 #[repr(C)]
 pub struct Rulebook {
     pub version: u8,
@@ -371,7 +388,7 @@ pub struct Rulebook {
     pub paused: u8,
     _pad: [u8; 5],
     pub mint: [u8; 32],
-    /// Can pause, and replace the agent and the co-signer. Cannot write rules.
+    /// Can pause, and replace the agent, the co-signer and the keeper. Cannot write rules.
     pub guardian: [u8; 32],
     /// The only key that can write rules.
     pub agent: [u8; 32],
@@ -382,7 +399,7 @@ pub struct Rulebook {
     pub exempt: [u8; 32],
     /// The token account holding the curve's SOL, read for the "SOL in the curve" fact.
     pub curve_vault: [u8; 32],
-    limits: [u8; 16],
+    limits: [u8; Limits::LEN],
     rule_until: [u8; 8],
     split: [u8; 8],
     epoch: [u8; 8],
@@ -400,7 +417,11 @@ pub struct Rulebook {
     renamed_at: [u8; 8],
     _reserved: [u8; 16],
     names: [u8; MAX_NAMES * NAME_ENTRY_LEN],
-    _reserved2: [u8; 32],
+    /// The only key that may ask for the trading fees. The curve names this rulebook's own
+    /// address as the one that claims them, so no key holds that right for good: the keeper
+    /// asks through the program, and the guardian can replace it. It sits in what were the
+    /// last 32 spare bytes, so nothing before it moved.
+    pub keeper: [u8; 32],
 }
 
 const _: () = assert!(core::mem::size_of::<Rulebook>() == RULEBOOK_LEN);
@@ -424,13 +445,11 @@ impl Rulebook {
     }
 
     pub fn limits(&self) -> Limits {
-        let mut bytes = [0; Limits::LEN];
-        bytes.copy_from_slice(&self.limits[..Limits::LEN]);
-        Limits::decode(&bytes)
+        Limits::decode(&self.limits)
     }
 
     pub fn set_limits(&mut self, limits: &Limits) {
-        self.limits[..Limits::LEN].copy_from_slice(&limits.encode());
+        self.limits = limits.encode();
     }
 
     /// Holders, burn, treasury, in bps.
@@ -565,7 +584,7 @@ mod tests {
     const SPLIT: (u16, u16, u16) = (5_000, 3_000, 2_000);
 
     fn limits() -> Limits {
-        Limits { min_interval_secs: 900, max_rule_secs: 2 * 3_600, max_treasury_bps: 3_000, min_rename_secs: 86_400 }
+        Limits { min_interval_secs: 900, max_rule_secs: 2 * 3_600, min_treasury_bps: 1_000, max_treasury_bps: 3_000, min_rename_secs: 86_400 }
     }
 
     fn when(group: u8, fact: u8, op: u8, value: u64) -> Condition {
@@ -619,16 +638,20 @@ mod tests {
         book.cosigner = [4; 32];
         book.exempt = [5; 32];
         book.curve_vault = [6; 32];
+        book.keeper = [8; 32];
         book.set_limits(&limits());
         assert!(book.set_names(&names()));
         book.set_renamed_at(NOW - 86_400);
         let rule = [when(0, fact::SIZE, op::LE, 10_000), when(1, fact::MINUTE, op::MOD_EQ, 2 << 32)];
         book.rewrite(&Change::new(600, (4_000, 5_000, 1_000), &rule).unwrap(), [9; 32], NOW).unwrap();
         book.rename(2, NOW).unwrap();
-        for (at, byte) in [(8, 1), (40, 2), (72, 3), (104, 4), (136, 5), (168, 6), (248, 9)] {
+        for (at, byte) in [(8, 1), (40, 2), (72, 3), (104, 4), (136, 5), (168, 6), (248, 9), (864, 8)] {
             assert_eq!(data[at..at + 32], [byte; 32], "key at {at}");
         }
-        assert_eq!(data[200..214], limits().encode());
+        assert_eq!(data[200..216], limits().encode());
+        assert_eq!(data[208..210], 3_000u16.to_le_bytes(), "the treasury's cap");
+        assert_eq!(data[210..214], 86_400u32.to_le_bytes());
+        assert_eq!(data[214..216], 1_000u16.to_le_bytes(), "the treasury's floor, in what were two spare bytes");
         assert_eq!((data[480], data[481]), (2, 3), "the name in use, and how many there are");
         assert_eq!(data[488..496], NOW.to_le_bytes());
         assert_eq!(data[512..512 + 3 * NAME_ENTRY_LEN], names());
@@ -720,8 +743,30 @@ mod tests {
         assert_eq!(l.admit(&change(60, (5_001, 3_000, 2_000), &[]), true), Err(Refusal::BadSplit));
         assert_eq!(l.admit(&change(60, (7_000, 0, 3_000), &[]), true), Ok(()));
         assert_eq!(l.admit(&change(60, (6_999, 0, 3_001), &[]), true), Err(Refusal::OutsideLimits));
+        // the treasury is owed its floor as surely as it is held to its cap
+        assert_eq!(l.admit(&change(60, (9_000, 0, 1_000), &[]), true), Ok(()));
+        assert_eq!(l.admit(&change(60, (9_001, 0, 999), &[]), true), Err(Refusal::OutsideLimits));
+        assert_eq!(l.admit(&change(60, (5_000, 5_000, 0), &[]), true), Err(Refusal::OutsideLimits));
         // u16 shares that would wrap if added as u16
         assert_eq!(l.admit(&change(60, (40_000, 35_536, 0), &[]), true), Err(Refusal::BadSplit));
+    }
+
+    #[test]
+    fn the_treasury_has_a_floor_under_its_cap() {
+        let with = |min_treasury_bps, max_treasury_bps| Limits { min_treasury_bps, max_treasury_bps, ..limits() };
+        assert!(with(1_000, 3_000).sane());
+        assert!(with(0, 0).sane() && with(0, BPS).sane() && with(BPS, BPS).sane());
+        assert!(with(4_000, 4_000).sane(), "a floor that meets the cap fixes the share");
+        assert!(!with(3_001, 3_000).sane(), "a floor above the cap leaves no share the treasury could take");
+        assert!(!with(0, BPS + 1).sane() && !with(BPS + 1, BPS + 1).sane());
+
+        let l = with(4_000, 5_000);
+        assert_eq!([3_999, 4_000, 4_500, 5_000, 5_001].map(|bps| l.treasury_fits(bps)), [false, true, true, true, false]);
+        assert_eq!([3_999, 4_000, 4_001].map(|bps| with(4_000, 4_000).treasury_fits(bps)), [false, true, false]);
+        // limits written before there was a floor read as a floor of zero
+        let mut old = limits().encode();
+        old[14..16].fill(0);
+        assert_eq!(Limits::decode(&old), with(0, 3_000));
     }
 
     #[test]
@@ -730,11 +775,14 @@ mod tests {
         let rule = [when(0, fact::SIZE, op::LE, 10_000)];
         assert_eq!(b.rewrite(&Change::new(600, SPLIT, &rule).unwrap(), [1; 32], NOW), Ok(())); // the first one needs no wait
         assert_eq!((b.epoch(), b.updated_at(), b.rule().1, b.rule_until()), (1, NOW, 1, NOW + 600));
-        let open = Change::new(300, (7_000, 3_000, 0), &[]).unwrap();
+        let open = Change::new(300, (6_000, 3_000, 1_000), &[]).unwrap();
         assert_eq!(b.rewrite(&open, [2; 32], NOW + 899), Err(Refusal::TooSoon));
         assert_eq!(b.rule().1, 1, "a refused rewrite changes nothing");
         assert_eq!(b.rewrite(&open, [2; 32], NOW + 900), Ok(()));
-        assert_eq!((b.epoch(), b.note, b.rule().1, b.rule_until(), b.split()), (2, [2; 32], 0, NOW + 1_200, (7_000, 3_000, 0)));
+        assert_eq!((b.epoch(), b.note, b.rule().1, b.rule_until(), b.split()), (2, [2; 32], 0, NOW + 1_200, (6_000, 3_000, 1_000)));
+        // a split outside the limits is refused whole as well
+        assert_eq!(b.rewrite(&Change::new(300, (7_000, 3_000, 0), &[]).unwrap(), [3; 32], NOW + 1_800), Err(Refusal::OutsideLimits));
+        assert_eq!((b.epoch(), b.split()), (2, (6_000, 3_000, 1_000)));
         assert!(!b.rule_in_force(NOW + 900), "an edict with no conditions has a term but restricts nothing");
         b.paused = 1;
         assert_eq!(b.rewrite(&open, [3; 32], NOW + 10_000), Err(Refusal::Paused));

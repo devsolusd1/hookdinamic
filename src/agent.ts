@@ -7,11 +7,11 @@
 // to it. It only ever sees numbers read from the chain and its own earlier edicts, never text written by other people, so nobody can talk it into anything through a
 // post or a memo.
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, fsyncSync, openSync, readFileSync, readSync, renameSync, rmSync, writeSync } from "node:fs";
 import Anthropic from "@anthropic-ai/sdk";
 import { betaZodOutputFormat } from "@anthropic-ai/sdk/helpers/beta/zod";
 import { getPriceFromSqrtPrice, type DynamicBondingCurveClient } from "@meteora-ag/dynamic-bonding-curve-sdk";
-import { type Connection, type Keypair, PublicKey, sendAndConfirmTransaction, SystemProgram, Transaction } from "@solana/web3.js";
+import { type Connection, type Keypair, PublicKey, SendTransactionError, SystemProgram, Transaction } from "@solana/web3.js";
 import { z } from "zod";
 import { BUYING_HOOKS, buyingHooksFor, FEE_HOOKS, IDENTITY_HOOK, recogniseRule, recogniseSplit, ruleOf, worded } from "../site/hooks.js";
 import { TOKEN_DECIMALS, TOTAL_SUPPLY } from "./curve.js";
@@ -59,7 +59,14 @@ export type Snapshot = {
   fee_hooks: { id: string; shares: string }[];
   names: { number: number; name: string; ticker: string; current: boolean }[];
   name_change: { allowed_now: boolean; allowed_in_minutes: number; at_most_once_every_hours: number };
-  limits: { shortest_edict_minutes: number; longest_edict_minutes: number; app_available: boolean };
+  limits: {
+    shortest_edict_minutes: number;
+    longest_edict_minutes: number;
+    /** The least and the most of the fees the treasury may be given. Every fee hook stays between them. */
+    treasury_least_pct: number;
+    treasury_most_pct: number;
+    app_available: boolean;
+  };
   market: {
     market_cap_sol: number;
     market_cap_usd: number | null;
@@ -112,7 +119,11 @@ export type Context = {
   mint: PublicKey;
   pool: PublicKey;
   agent: Keypair;
-  /** A JSON-lines file: the agent's memory and the public record of its decisions. */
+  /**
+   * A JSON-lines file: the agent's memory and the public record of its decisions. Next to it,
+   * under the same name with ".pending" added, an edict's line waits from before its
+   * transaction is sent until it is in this file (see `mendLog`).
+   */
   logPath: string;
   decide: Decide;
   solPriceUsd?: () => Promise<number>;
@@ -122,8 +133,11 @@ export type Context = {
 
 export type Outcome =
   | { status: "paused" }
+  /** The chain's own interval is still closed, or an edict already sent may still land. */
   | { status: "too-soon"; seconds: number }
   | { status: "in-force"; seconds: number }
+  /** An edict is due, and the caller asked for the model to be left alone for now (`ask: false`). */
+  | { status: "resting" }
   | { status: "held"; reasoning: string; usage?: Usage }
   | { status: "rewritten"; choice: Choice; change: Change; announcement: string; reasoning: string; signature: string | null; usage?: Usage };
 
@@ -149,7 +163,7 @@ export function changeOf(choice: Choice, limits: Limits): Change {
   return {
     ruleSecs: Math.round(choice.minutes * 60),
     rule: choice.buying ? ruleOf(choice.buying.hook, choice.buying.setting) : [],
-    ...fees.split(limits.maxTreasuryBps),
+    ...fees.split(limits.maxTreasuryBps, limits.minTreasuryBps),
   };
 }
 
@@ -161,6 +175,7 @@ export function outsideLimits(change: Change, limits: Limits, appAvailable: bool
   if (change.ruleSecs < 1 || change.ruleSecs > limits.maxRuleSecs) return `an edict stands for between 1 and ${Math.floor(limits.maxRuleSecs / 60)} minutes`;
   if (change.holdersBps + change.burnBps + change.treasuryBps !== BPS) return "the three fee shares must add up to exactly 100%";
   if (change.treasuryBps > limits.maxTreasuryBps) return `the treasury can get at most ${limits.maxTreasuryBps / 100}% of the fees`;
+  if (change.treasuryBps < limits.minTreasuryBps) return `the treasury has to get at least ${limits.minTreasuryBps / 100}% of the fees`;
   return null;
 }
 
@@ -247,28 +262,32 @@ export function unfit(choice: Choice, book: Rulebook, facts: { now: number; curv
   return somebodyCanBuy(change, { ...facts, appAvailable }) ? null : "nobody could buy at any point while that hook is on";
 }
 
-/** The catalogue as the model reads it, for a token that does or does not name an app. */
-function catalogue(appAvailable: boolean): string {
+/**
+ * The catalogue as the model reads it, for a token that does or does not name an app, and
+ * that has or has not another name to change to.
+ */
+function catalogue(appAvailable: boolean, renamable: boolean): string {
   const buying = buyingHooksFor(appAvailable).map((hook) => {
     const settings = hook.settings.length > 1 ? `Settings: ${hook.settings.map((setting, i) => `${i + 1}) ${setting.label}`).join("  ")}` : "One setting.";
     return `- ${hook.id}: ${worded(hook.name)}. ${worded(hook.about)} ${settings}`;
   });
   const fees = FEE_HOOKS.map((hook) => `- ${hook.id}: ${hook.name}. ${hook.about}`);
-  return `Buying hooks\n${buying.join("\n")}\n\nFee hooks\n${fees.join("\n")}\n\n${IDENTITY_HOOK.name}\n${IDENTITY_HOOK.about}`;
+  const identity = `\n\n${IDENTITY_HOOK.name}\n${IDENTITY_HOOK.about} The message lists the names, says which is in use and whether a change is allowed right now; the program allows one only every so often. A new name is an occasion, not a habit: most edicts keep the name.`;
+  return `Buying hooks\n${buying.join("\n")}\n\nFee hooks\n${fees.join("\n")}${renamable ? identity : ""}`;
 }
 
-const MECHANICS = (appAvailable: boolean) => `You are in charge of a token on Solana. It trades on one bonding curve, and a program attached to the token checks every buy. You change what the token does by issuing edicts, and you are the only one who can. Nobody approves an edict before it goes out.
+const MECHANICS = (appAvailable: boolean, renamable: boolean) => `You are in charge of a token on Solana. It trades on one bonding curve, and a program attached to the token checks every buy. You change what the token does by issuing edicts, and you are the only one who can. Nobody approves an edict before it goes out.
 
 You do not invent rules. Every hook you can use was written before launch and is listed below. What you decide is which hooks are on, at which setting, and for how long.
 
-One edict sets three things at once:
+One edict sets ${renamable ? "three" : "two"} things at once:
 1. The buying hook: one of the buying hooks below, or "none". Only buying is ever restricted. Selling, and moving tokens between wallets, are never restricted by you or by anyone, so do not describe a hook as locking people in.
-2. The fee hook: where the project's part of the trading fees goes. One is always on. The message shows what each would come to in numbers right now.
-3. The token's name: keep it, or change it to another of the names in the message.
+2. The fee hook: where the project's part of the trading fees goes. One is always on. The treasury's share is held between a least and a most, both fixed at launch and given in the message. The message also shows what each hook would come to in numbers right now.
+${renamable ? "3. The token's name: keep it, or change it to another of the names in the message." : "The token has one name, written at launch, and it cannot change: always answer 0 for the name."}
 
 An edict stands for the number of minutes you give it, between the shortest and the longest the message allows. When that time is up its buying hook stops applying by itself, and you are called to write the next edict.
 
-${catalogue(appAvailable)} The message lists the names, says which is in use and whether a change is allowed right now; the program allows one only every so often. A new name is an occasion, not a habit: most edicts keep the name.
+${catalogue(appAvailable, renamable)}
 
 How to choose. The choice is yours, and there is no right answer to find. Look at the market in the message and at your own earlier edicts, and pick what you judge fits the moment: something tighter when buying is frantic, something looser or nothing at all when it is quiet, and another fee hook when the last one has had its turn. Do not settle into a pattern. Unless you have a reason you can state, do not switch on a buying hook you used in either of your last two edicts.
 
@@ -303,7 +322,7 @@ export function askClaude(options: { persona: string; model?: string; effort?: "
           betas: ["server-side-fallback-2026-07-01"],
           fallbacks: "default",
           output_config: { effort: options.effort ?? "medium", format: betaZodOutputFormat(Decision) },
-          system: `${options.persona.trim()}\n\n${MECHANICS(hasApp(book))}`,
+          system: `${options.persona.trim()}\n\n${MECHANICS(hasApp(book), book.names.length > 1)}`,
           messages,
         });
       } catch (error) {
@@ -328,15 +347,164 @@ export function askClaude(options: { persona: string; model?: string; effort?: "
   };
 }
 
-export function readLog(path: string): LogEntry[] {
+/**
+ * The lines of a log. With `mint`, only that token's: a file that was first used for another
+ * token, a rehearsal on devnet say, still holds that one's edicts, and they are not this
+ * token's past.
+ */
+export function readLog(path: string, mint?: string): LogEntry[] {
   if (!existsSync(path)) return [];
-  return readFileSync(path, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as LogEntry);
+  return readFileSync(path, "utf8").split("\n").filter(Boolean).flatMap((line) => {
+    try {
+      const entry = JSON.parse(line) as LogEntry;
+      return mint === undefined || entry.record?.mint === mint ? [entry] : [];
+    } catch {
+      // A line a crash cut short. If it was an edict's, `mendLog` has written it again, whole.
+      return [];
+    }
+  });
 }
 
 /** The sha256 the rulebook stores next to a change, so anyone can match it to the published text. */
 export const noteOf = (record: LogEntry["record"]) => createHash("sha256").update(JSON.stringify(record)).digest();
 
 const logged = (change: Change): LoggedChange => ({ ...change, rule: change.rule.map((c) => ({ ...c, value: c.value.toString() })) });
+
+// ---------------------------------------------------------------------------------------------
+// Never losing an edict's words.
+//
+// The rulebook keeps only the hash of an edict's text. The text lives in the log, and nowhere
+// else. If it were written there only once the transaction is confirmed, a process that dies
+// in between, or a confirmation that times out on a transaction that lands anyway, would
+// leave the chain holding the hash of words nobody has. So an edict's whole log line, with the
+// signature of its transaction, goes to a file of its own before the transaction is sent, and
+// stays there until the line is in the log. Whenever the rulebook shows an edict the log does
+// not have, the line is taken from that file, if its hash is the one on chain.
+
+/** An edict's log line as it waits, and the last block height its transaction can land at. */
+type Waiting = { line: LogEntry & { note: string; signature: string }; lastValidBlockHeight: number };
+
+/** Where an edict's line waits from before its transaction is sent until it is in the log. */
+export const waitingPath = (logPath: string) => `${logPath}.pending`;
+
+/** Blocks past a transaction's last valid height before it is taken for one that can no longer land. */
+const EXPIRY_MARGIN = 30;
+
+/** A transaction that is in a block as a failure. */
+class Refused extends Error {}
+
+/**
+ * The key this process holds is not the one the rulebook names as the agent: the guardian has
+ * put another in, or the settings point at the wrong token. Trying again changes nothing; a
+ * person has to.
+ */
+export class NotTheAgent extends Error {}
+
+const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+/** A transaction's signature as explorers and RPC nodes write it. */
+function base58(bytes: Uint8Array): string {
+  let number = BigInt(`0x${Buffer.from(bytes).toString("hex") || "0"}`);
+  let text = "";
+  for (; number > 0n; number /= 58n) text = ALPHABET[Number(number % 58n)] + text;
+  for (let i = 0; i < bytes.length && bytes[i] === 0; i++) text = `1${text}`;
+  return text;
+}
+
+/** One whole line at the end of the log, on the disk before this returns. */
+function appendLine(path: string, entry: LogEntry) {
+  const file = openSync(path, "a+");
+  try {
+    const { size } = fstatSync(file);
+    const last = Buffer.alloc(1);
+    // A line a crash cut short is closed off, so that this one starts on a line of its own.
+    const torn = size > 0 && readSync(file, last, 0, 1, size - 1) === 1 && last[0] !== 10;
+    writeSync(file, `${torn ? "\n" : ""}${JSON.stringify(entry)}\n`);
+    fsyncSync(file);
+  } finally {
+    closeSync(file);
+  }
+}
+
+function readWaiting(logPath: string): Waiting | null {
+  try {
+    return JSON.parse(readFileSync(waitingPath(logPath), "utf8")) as Waiting;
+  } catch {
+    // Nothing waits. The file is put in place whole, so it is never found half written.
+    return null;
+  }
+}
+
+/** Puts the line where it waits, on the disk before this returns. A reader finds the earlier one or this one, never half of either. */
+function writeWaiting(logPath: string, waiting: Waiting) {
+  const path = waitingPath(logPath);
+  const file = openSync(`${path}.tmp`, "w");
+  try {
+    writeSync(file, JSON.stringify(waiting));
+    fsyncSync(file);
+  } finally {
+    closeSync(file);
+  }
+  renameSync(`${path}.tmp`, path);
+}
+
+/**
+ * What a check of the log against the rulebook found. "whole": the log has the text of the
+ * edict in force, or no edict was ever issued. "restored": it had not, the line written before
+ * the transaction was sent is the one the chain's hash names, and it is in the log now.
+ * "missing": the chain holds an edict whose text is in neither place. It was not written from
+ * these files: another copy of the agent is running, the key is in other hands, or the disk
+ * was put back from an older copy.
+ */
+export type LogCheck = "whole" | "restored" | "missing";
+
+/**
+ * Makes sure the log has the text of the edict the rulebook holds, taking it from the line
+ * that was written before its transaction went out if that is what it takes. It asks the
+ * network nothing: `book` is a rulebook the caller has just read. `runOnce` and `watch` call
+ * it by themselves; a service calls it too, to learn of an edict that is "missing".
+ */
+export function mendLog(ctx: Pick<Context, "logPath">, book: Rulebook): LogCheck {
+  if (book.epoch === 0n) return "whole";
+  const note = book.note.toString("hex");
+  const inLog = () => readLog(ctx.logPath).some((entry) => entry.note === note);
+  const waiting = readWaiting(ctx.logPath);
+  // The hash is worked out again from the record itself: what goes into the log is what the chain vouches for.
+  if (waiting && noteOf(waiting.line.record).equals(book.note)) {
+    // It may be there already: a process can die after writing the log and before clearing this file.
+    const there = inLog();
+    if (!there) appendLine(ctx.logPath, { ...waiting.line, note });
+    rmSync(waitingPath(ctx.logPath), { force: true });
+    return there ? "whole" : "restored";
+  }
+  return inLog() ? "whole" : "missing";
+}
+
+/**
+ * Deals with a line that is still waiting when a look starts. If its edict is on chain, the
+ * line goes into the log. If its transaction can still land, nothing new is decided yet:
+ * `wait` is roughly how many seconds until it no longer can. Otherwise it never landed and
+ * never will, and the line is dropped. Returns the rulebook as last read.
+ */
+async function settleWaiting(ctx: Context, book: Rulebook): Promise<{ book: Rulebook; wait?: number }> {
+  mendLog(ctx, book);
+  const waiting = readWaiting(ctx.logPath);
+  if (!waiting) return { book };
+  // A line left by another token that once used these files. Its block heights are another
+  // network's, and nothing here should wait on them.
+  if (waiting.line.record?.mint !== ctx.mint.toBase58()) {
+    rmSync(waitingPath(ctx.logPath), { force: true });
+    return { book };
+  }
+  const left =waiting.lastValidBlockHeight + EXPIRY_MARGIN - (await ctx.connection.getBlockHeight("confirmed"));
+  // A block takes about 0.4 seconds.
+  if (left >= 0) return { book, wait: Math.max(1, Math.ceil((left + 1) * 0.4)) };
+  // It no longer can. The rulebook as it is from here on says whether it did at the last moment.
+  const last = await readBook(ctx);
+  mendLog(ctx, last);
+  rmSync(waitingPath(ctx.logPath), { force: true });
+  return { book: last };
+}
 
 async function chainTime(connection: Connection): Promise<number> {
   const time = await connection.getBlockTime(await connection.getSlot());
@@ -377,16 +545,18 @@ export async function takeSnapshot(ctx: Context, book: Rulebook, now: number, hi
       minutes_since_last_edict: book.updatedAt ? round((now - book.updatedAt) / 60, 0) : null,
       buying: !standing || book.rule.length === 0 ? "none" : rule ? buyingLabel({ hook: rule.hook.id, setting: rule.setting }) : describe(book.rule).join("; or if "),
       minutes_left: standing ? round((book.ruleUntil - now) / 60, 0) : 0,
-      fees: recogniseSplit(book, book.limits.maxTreasuryBps)?.hook.name ?? "shares outside the catalogue",
+      fees: recogniseSplit(book, book.limits.maxTreasuryBps, book.limits.minTreasuryBps)?.hook.name ?? "shares outside the catalogue",
       fee_shares: sharesInWords(book),
       name: nameInWords(book.names[book.name]),
     },
-    fee_hooks: FEE_HOOKS.map((hook) => ({ id: hook.id, shares: sharesInWords(hook.split(book.limits.maxTreasuryBps)) })),
+    fee_hooks: FEE_HOOKS.map((hook) => ({ id: hook.id, shares: sharesInWords(hook.split(book.limits.maxTreasuryBps, book.limits.minTreasuryBps)) })),
     names: book.names.map((name, i) => ({ number: i + 1, name: name.name, ticker: name.symbol, current: i === book.name })),
     name_change: { allowed_now: book.names.length > 1 && renameIn === 0, allowed_in_minutes: Math.ceil(renameIn / 60), at_most_once_every_hours: round(book.limits.minRenameSecs / 3_600, 1) },
     limits: {
       shortest_edict_minutes: Math.max(5, Math.ceil(book.limits.minIntervalSecs / 60)),
       longest_edict_minutes: Math.floor(book.limits.maxRuleSecs / 60),
+      treasury_least_pct: book.limits.minTreasuryBps / 100,
+      treasury_most_pct: book.limits.maxTreasuryBps / 100,
       app_available: hasApp(book),
     },
     market: {
@@ -426,27 +596,39 @@ async function rentForName(ctx: Context, book: Rulebook, index: number): Promise
 /**
  * One look at the token: issue an edict, or leave things as they are, and write down which
  * and why. With `letRuleRun`, an edict whose term is still running is left alone, so that it
- * stands for as long as it said; without it, the look replaces whatever is in force.
+ * stands for as long as it said; without it, the look replaces whatever is in force. With
+ * `ask: false` everything short of the model is done, the reading of the rulebook and the
+ * settling of an edict still on its way, and where the model would be asked the answer is
+ * "resting": that is how `watch` keeps its eyes on the chain while it spaces out its looks.
  */
-export async function runOnce(ctx: Context, options: { letRuleRun?: boolean } = {}): Promise<Outcome> {
-  // The cheap checks come first: this runs on every poll while an edict is running or the chain's own interval is closed.
-  const book = await readBook(ctx);
-  if (!book.agent.equals(ctx.agent.publicKey)) throw new Error(`${ctx.agent.publicKey.toBase58()} is not this token's agent (${book.agent.toBase58()} is)`);
+export async function runOnce(ctx: Context, options: { letRuleRun?: boolean; ask?: boolean } = {}): Promise<Outcome> {
+  // The cheap checks come first: this runs on every poll, and most polls end in one of them.
+  let book = await readBook(ctx);
+  if (!book.agent.equals(ctx.agent.publicKey)) throw new NotTheAgent(`${ctx.agent.publicKey.toBase58()} is not this token's agent (${book.agent.toBase58()} is)`);
+  // An edict that was sent and not seen to land comes before anything else: its text goes into
+  // the log if it did land, and nothing new is decided while it still can.
+  if (!ctx.dryRun && existsSync(waitingPath(ctx.logPath))) {
+    const settled = await settleWaiting(ctx, book);
+    if (settled.wait) return { status: "too-soon", seconds: settled.wait };
+    book = settled.book;
+  }
   if (book.paused) return { status: "paused" };
   const now = await chainTime(ctx.connection);
   const left = book.ruleUntil - now;
   if (options.letRuleRun && left > 0) return { status: "in-force", seconds: left };
   const wait = book.updatedAt === 0 ? 0 : book.updatedAt + book.limits.minIntervalSecs - now;
   if (wait > 0) return { status: "too-soon", seconds: wait };
+  if (options.ask === false) return { status: "resting" };
 
-  const snapshot = await takeSnapshot(ctx, book, now, readLog(ctx.logPath));
+  // Its memory is its own token's lines, and no other's.
+  const snapshot = await takeSnapshot(ctx, book, now, readLog(ctx.logPath, ctx.mint.toBase58()));
   const verdict = await ctx.decide(snapshot, book);
   const base = { mint: ctx.mint.toBase58(), at: snapshot.now, reasoning: verdict.reasoning, model: verdict.model };
   const entry = { marketCapSol: snapshot.market.market_cap_sol, ...(verdict.usage ? { usage: verdict.usage } : {}) };
   if (verdict.action === "hold") {
     // A dry run leaves no trace: the log is the public record, and it only holds what really happened.
     const record: LogEntry["record"] = { ...base, epoch: Number(book.epoch), action: "hold" };
-    if (!ctx.dryRun) appendFileSync(ctx.logPath, `${JSON.stringify({ record, ...entry } satisfies LogEntry)}\n`);
+    if (!ctx.dryRun) appendLine(ctx.logPath, { record, ...entry });
     return { status: "held", reasoning: verdict.reasoning, usage: verdict.usage };
   }
 
@@ -479,8 +661,37 @@ export async function runOnce(ctx: Context, options: { letRuleRun?: boolean } = 
     if (short > 0) tx.add(SystemProgram.transfer({ fromPubkey: ctx.agent.publicKey, toPubkey: ctx.mint, lamports: short }));
     tx.add(setNameIx({ program: ctx.hookProgram, agent: ctx.agent.publicKey, mint: ctx.mint, index: choice.name }));
   }
-  const signature = await sendAndConfirmTransaction(ctx.connection, tx, [ctx.agent], { commitment: "confirmed" });
-  appendFileSync(ctx.logPath, `${JSON.stringify({ record, ...entry, note: note.toString("hex"), signature } satisfies LogEntry)}\n`);
+  // Signed here, so that the signature is known before anything is sent.
+  const recent = await ctx.connection.getLatestBlockhash("confirmed");
+  tx.feePayer = ctx.agent.publicKey;
+  tx.recentBlockhash = recent.blockhash;
+  tx.lastValidBlockHeight = recent.lastValidBlockHeight;
+  tx.sign(ctx.agent);
+  const signature = base58(tx.signature!);
+  const line = { record, ...entry, note: note.toString("hex"), signature } satisfies LogEntry;
+
+  // The line is on disk before the transaction leaves. From here on, whatever becomes of this
+  // process, the words of an edict that reaches the chain can be put into the log.
+  writeWaiting(ctx.logPath, { line, lastValidBlockHeight: recent.lastValidBlockHeight });
+  try {
+    await ctx.connection.sendRawTransaction(tx.serialize(), { preflightCommitment: "confirmed" });
+    const { value } = await ctx.connection.confirmTransaction({ signature, ...recent }, "confirmed");
+    if (value.err) throw new Refused(`the edict's transaction ${signature} failed on chain: ${JSON.stringify(value.err)}`);
+  } catch (error) {
+    // The node turned it away before sending it on, or a block has it as a failure: it changed
+    // nothing and never will, so nothing waits for it.
+    if (error instanceof SendTransactionError || error instanceof Refused) {
+      rmSync(waitingPath(ctx.logPath), { force: true });
+      throw error;
+    }
+    // Anything else says nothing either way: a confirmation that times out, or a connection
+    // that drops, on a transaction that lands all the same. The rulebook knows. If it cannot
+    // be read now, the line stays where it waits and the next call settles it.
+    const now = await readBook(ctx).catch(() => null);
+    if (!now?.note.equals(note)) throw error;
+  }
+  appendLine(ctx.logPath, line);
+  rmSync(waitingPath(ctx.logPath), { force: true });
   return { status: "rewritten", ...decided, signature };
 }
 
@@ -495,10 +706,12 @@ export function inWords(choice: Choice, change: Change, names: Name[] = []): str
 }
 
 export type WatchOptions = {
-  /** How often it checks whether it is time to write again, in seconds. */
+  /** How often it reads the rulebook to see whether it is time to write again, in seconds. */
   pollSecs: number;
-  /** How long it waits before trying again after a look that issued nothing, in seconds. */
+  /** How long it leaves the model alone after a look that issued nothing, in seconds. */
   thinkEverySecs: number;
+  /** How long the model is left alone at the start, in seconds: what was left of such a wait when the process last stopped. */
+  firstLookInSecs?: number;
   signal?: AbortSignal;
   report?: (event: Outcome | { status: "error"; error: unknown }) => void;
 };
@@ -507,27 +720,45 @@ export type WatchOptions = {
  * The agent on its own, for as long as the process lives: it issues an edict, lets it stand
  * for the time it gave it, and issues the next one when that time is up. Nobody approves
  * anything; the only brakes are the limits in the rulebook and the guardian's pause.
+ *
+ * The rulebook is read at every poll, which costs up to three calls to the node and nothing
+ * else. So a pause, its end, a key that is no longer the agent's and an edict that landed
+ * unseen are all noticed within one poll. Only the model, which is paid for by the call, is
+ * spaced out.
  */
 export async function watch(ctx: Context, options: WatchOptions): Promise<void> {
-  let lookedAt = 0;
+  const clock = () => Date.now() / 1000;
+  /** The model is not asked before this moment. */
+  let restUntil = clock() + (options.firstLookInSecs ?? 0);
+  /** Whether the look in hand got as far as the model: from there on it has been paid for. */
+  let asked = false;
+  const looking: Context = { ...ctx, decide: (snapshot, book) => (asked = true, ctx.decide(snapshot, book)) };
   while (!options.signal?.aborted) {
+    asked = false;
     try {
-      const clock = Date.now() / 1000;
-      if (clock - lookedAt >= options.thinkEverySecs) {
-        const outcome = await runOnce(ctx, { letRuleRun: true });
-        options.report?.(outcome);
-        // Being turned away by an edict still running, or by the chain's own interval, is not a
-        // look: it tries again on the next poll. So does an edict just issued, which has its own term.
-        if (outcome.status === "held" || outcome.status === "paused") lookedAt = clock;
-      }
+      const outcome = await runOnce(looking, { letRuleRun: true, ask: clock() >= restUntil });
+      options.report?.(outcome);
+      // An edict just issued holds the next look back by itself, for its own term. A look that
+      // issued nothing has no such thing, so the model is left alone for a while.
+      if (outcome.status === "held") restUntil = clock() + options.thinkEverySecs;
+      // Nor has a dry run, which sends nothing: the edict it would have issued is given its
+      // term here, so that a rehearsal asks the model as often as the real thing would, and
+      // not at every poll.
+      if (outcome.status === "rewritten" && outcome.signature === null) restUntil = clock() + Math.max(options.thinkEverySecs, outcome.change.ruleSecs);
     } catch (error) {
       // An RPC hiccup or a failed transaction must not stop the agent.
       options.report?.({ status: "error", error });
-      lookedAt = Date.now() / 1000;
+      // What failed before the model was asked cost nothing, and is tried again at the next
+      // poll. What failed after it is not paid for again so soon.
+      if (asked) restUntil = clock() + options.thinkEverySecs;
     }
+    // Asked to stop in the middle of a look: the look has been finished, and there is nothing to wait for.
+    if (options.signal?.aborted) break;
     await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, options.pollSecs * 1000);
-      options.signal?.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+      // The listener goes when the wait is over: one left behind at every poll would add up over months.
+      const done = () => { clearTimeout(timer); options.signal?.removeEventListener("abort", done); resolve(); };
+      const timer = setTimeout(done, options.pollSecs * 1000);
+      options.signal?.addEventListener("abort", done, { once: true });
     });
   }
 }

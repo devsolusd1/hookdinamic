@@ -12,6 +12,12 @@
 //! hook cannot move value): it sits there so that one change by the agent sets both, and so
 //! that whatever pays the fees out reads the split from the same place.
 //!
+//! What pays them out is a third key, the keeper. Meteora lets one address take a curve's
+//! fees and never lets it be changed, so that address is the rulebook's own, which no key
+//! controls. The keeper asks this program to claim, the program signs as the rulebook, for
+//! the curve of its own token and no other, and the fees can only land in the keeper's own
+//! accounts. The guardian can replace the keeper.
+//!
 //! Last, the rulebook holds the names the token can go by, written at launch, and its address
 //! is the only one allowed to edit the token's metadata. The agent can switch between those
 //! names as part of an edict; nobody can put any other name on the token.

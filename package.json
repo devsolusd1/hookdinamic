@@ -16,7 +16,13 @@
     "site:local": "node scripts/site.mjs --port 4322 --config .local/site/config.js --log .local/site/log.jsonl",
     "launch": "tsx scripts/launch.ts",
     "smoke": "tsx scripts/smoke.ts",
-    "site:devnet": "node scripts/site.mjs --port 4323 --config .local/devnet/site-config.js --log .local/devnet/agent-log.jsonl"
+    "site:devnet": "node scripts/site.mjs --port 4323 --config .local/devnet/site-config.js --log .local/devnet/agent-log.jsonl",
+    "keeper": "tsx scripts/keeper.ts",
+    "serve": "node --import tsx scripts/serve.ts",
+    "guardian": "tsx scripts/guardian.ts",
+    "test:keeper": "tsx scripts/keeper-sim.ts",
+    "test:serve": "node --import tsx scripts/serve.check.ts",
+    "e2e:keeper": "tsx scripts/e2e-keeper.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.131.0",

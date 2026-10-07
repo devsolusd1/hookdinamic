@@ -4,26 +4,24 @@
   "payerKeypair": "payer.json",
   "guardian": "<carteira do guardião>",
   "agent": "<carteira do agente>",
-  "cosigner": "<carteira assinante do app>",
-  "feeBps": 200,
+  "keeper": "<carteira do keeper, que retira as taxas e paga; o guardião pode trocar>",
+  "feeBps": 300,
   "startCapSol": 30,
   "graduationCapUsd": 1000000000,
   "limits": {
     "minIntervalSecs": 600,
     "maxRuleSecs": 7200,
-    "maxTreasuryBps": 3000,
+    "minTreasuryBps": 4000,
+    "maxTreasuryBps": 5000,
     "minRenameSecs": 86400
   },
   "split": {
-    "holdersBps": 4000,
-    "burnBps": 4000,
-    "treasuryBps": 2000
+    "holdersBps": 3000,
+    "burnBps": 3000,
+    "treasuryBps": 4000
   },
   "names": [
-    { "name": "Edict", "symbol": "EDICT" },
-    { "name": "Decree", "symbol": "DECREE" },
-    { "name": "By Order", "symbol": "BYORDER" },
-    { "name": "Same Coin", "symbol": "SAME" }
+    { "name": "Veluno", "symbol": "VELUNO" }
   ],
-  "uri": "https://<seu domínio>/metadata.json"
+  "uri": "https://www.veluno.li/metadata.json"
 }

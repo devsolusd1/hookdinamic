@@ -1,9 +1,15 @@
 // Puts a token on the local validator and has the agent issue a few edicts, so the site can be
 // seen reading a real rulebook: `npm run validator`, `npm run site:seed`, `npm run site:local`.
 //
+// The token has the shape of the one that launches (launch.example.json): Veluno, one name, no
+// app key, the same limits and opening split. Only the wait between two edicts is shorter, so
+// that seeding takes a minute and not an hour.
+//
 // The model is replaced by a stand-in (scripts/stand-in.ts) that takes the hooks of the
 // catalogue in order. Everything else is the real path: the edicts go on chain through the
-// agent's key, and the log the page reads is the agent's own.
+// agent's key, and the log the page reads is the agent's own. No keeper runs here, so the page
+// has no ledger to show: `node scripts/site.mjs --ledger <file>` puts one in for a preview.
+import "../src/quiet.js";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { DynamicBondingCurveClient, SwapMode } from "@meteora-ag/dynamic-bonding-curve-sdk";
@@ -20,14 +26,25 @@ const HOOK = new PublicKey(local.hookProgram);
 const dbc = DynamicBondingCurveClient.create(connection, "confirmed");
 const out = new URL("../.local/site/", import.meta.url);
 
-const FEE_BPS = 200;
+const FEE_BPS = 300;
 const EDICTS = 5;
-// The name may change every twenty seconds here, so that the page has a change of name to show.
-const LIMITS: Limits = { minIntervalSecs: 5, maxRuleSecs: 2 * 3600, maxTreasuryBps: 3_000, minRenameSecs: 20 };
-const SPLIT: Split = { holdersBps: 4_000, burnBps: 4_000, treasuryBps: 2_000 };
-const NAMES: Name[] = [{ name: "Edict", symbol: "EDICT" }, { name: "Decree", symbol: "DECREE" }, { name: "By Order", symbol: "BYORDER" }, { name: "Same Coin", symbol: "SAME" }];
+// As in launch.example.json, except minIntervalSecs, which is ten minutes there.
+const LIMITS: Limits = { minIntervalSecs: 5, maxRuleSecs: 2 * 3600, minTreasuryBps: 4_000, maxTreasuryBps: 5_000, minRenameSecs: 86_400 };
+const SPLIT: Split = { holdersBps: 3_000, burnBps: 3_000, treasuryBps: 4_000 };
+const NAMES: Name[] = [{ name: "Veluno", symbol: "VELUNO" }];
 
-const [payer, guardian, agent, alice, mint, config] = Array.from({ length: 6 }, () => Keypair.generate());
+/**
+ * The page's settings as they ship. site/config.js is a script for a browser, so it is run
+ * here with a stand-in for the window. Taking them from there means a setting added to the
+ * page is in the seeded page too, without this file being told.
+ */
+function shippedSettings(): Record<string, unknown> {
+  const page = { SITE: {} as Record<string, unknown> };
+  new Function("window", "document", readFileSync(new URL("../site/config.js", import.meta.url), "utf8"))(page, { documentElement: { dataset: {} } });
+  return page.SITE;
+}
+
+const [payer, guardian, agent, keeper, treasury, alice, mint, config] = Array.from({ length: 8 }, () => Keypair.generate());
 for (const wallet of [payer, agent, alice]) {
   const signature = await connection.requestAirdrop(wallet.publicKey, 100 * LAMPORTS_PER_SOL);
   await connection.confirmTransaction({ signature, ...(await connection.getLatestBlockhash()) }, "confirmed");
@@ -36,10 +53,10 @@ for (const wallet of [payer, agent, alice]) {
 const { pool } = await launch(
   {
     dbc, hookProgram: HOOK, payer, mint, config,
-    feeClaimer: payer.publicKey, guardian: guardian.publicKey, agent: agent.publicKey, cosigner: Keypair.generate().publicKey,
+    guardian: guardian.publicKey, agent: agent.publicKey, keeper: keeper.publicKey,
     limits: LIMITS, split: SPLIT,
     curve: { startCapSol: 30, graduationCapSol: 8_000_000, feeBps: FEE_BPS },
-    names: NAMES, uri: "https://example.com/edict.json",
+    names: NAMES, uri: "https://www.veluno.li/metadata.json",
   },
   (_what, tx, signers) => sendAndConfirmTransaction(connection, tx, signers, { commitment: "confirmed" }),
 );
@@ -64,15 +81,16 @@ for (let i = 1; i <= EDICTS; i++) {
   console.log(`${i}/${EDICTS} ${outcome.status}${outcome.status === "rewritten" ? `: ${outcome.announcement}` : ""}`);
 }
 
+// The page as it ships, pointed at this token. The treasury is a made-up address: nothing is
+// ever sent to it here, and the real one has no place next to a token on a local chain.
 const site = {
+  ...shippedSettings(),
   rpc: local.rpc,
   rulebook: rulebookAddress(HOOK, mint.publicKey).toBase58(),
   program: HOOK.toBase58(),
   pool: pool.toBase58(),
-  log: "data/log.jsonl",
+  treasury: treasury.publicKey.toBase58(),
   feeBps: FEE_BPS,
-  app: "FOMO",
-  explorer: "https://solscan.io",
   trade: [{ label: "Jupiter", url: `https://jup.ag/swap/SOL-${mint.publicKey.toBase58()}` }],
 };
 writeFileSync(

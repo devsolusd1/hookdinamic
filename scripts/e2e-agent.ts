@@ -12,7 +12,7 @@ import { getTokenMetadata, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, sendAndConfirmTransaction, Transaction } from "@solana/web3.js";
 import BN from "bn.js";
 import { FEE_HOOKS, recogniseRule, recogniseSplit, worded } from "../site/hooks.js";
-import { buyingLabel, changeOf, noteOf, readBook, readLog, runOnce, somebodyCanBuy, unfit, watch, type Choice, type Context, type Decide, type Outcome, type Snapshot } from "../src/agent.js";
+import { buyingLabel, changeOf, noteOf, outsideLimits, readBook, readLog, runOnce, somebodyCanBuy, unfit, watch, type Choice, type Context, type Decide, type Outcome, type Snapshot } from "../src/agent.js";
 import { compile, describe, pauseIx, type Change, type Clause, type Limits, type Name, type Split } from "../src/hook.js";
 import { launch } from "../src/launch.js";
 import { byRote } from "./stand-in.js";
@@ -22,8 +22,9 @@ const connection = new Connection(local.rpc, "confirmed");
 const HOOK = new PublicKey(local.hookProgram);
 const dbc = DynamicBondingCurveClient.create(connection, "confirmed");
 
-const LIMITS: Limits = { minIntervalSecs: 6, maxRuleSecs: 6 * 3600, maxTreasuryBps: 3_000, minRenameSecs: 30 };
-const SPLIT: Split = { holdersBps: 5_000, burnBps: 3_000, treasuryBps: 2_000 };
+// The treasury's floor and cap are the ones the token launches with, and so is the fee.
+const LIMITS: Limits = { minIntervalSecs: 6, maxRuleSecs: 6 * 3600, minTreasuryBps: 4_000, maxTreasuryBps: 5_000, minRenameSecs: 30 };
+const SPLIT: Split = { holdersBps: 3_000, burnBps: 3_000, treasuryBps: 4_000 };
 const NAMES: Name[] = [{ name: "Agent Hook Test", symbol: "AHT" }, { name: "Second Name", symbol: "SECOND" }, { name: "A Third And Rather Longer Name", symbol: "THIRD" }];
 const rule = (clauses: Clause[], seconds = 3600, split = SPLIT): Change => ({ ruleSecs: seconds, rule: compile(clauses), ...split });
 const sleep = (seconds: number) => new Promise((r) => setTimeout(r, seconds * 1000));
@@ -62,9 +63,9 @@ for (const wallet of [payer, guardian, agent, alice]) {
 
 const { pool } = await launch({
   dbc, hookProgram: HOOK, payer, mint, config,
-  feeClaimer: payer.publicKey, guardian: guardian.publicKey, agent: agent.publicKey, cosigner: Keypair.generate().publicKey,
+  guardian: guardian.publicKey, agent: agent.publicKey, keeper: Keypair.generate().publicKey, cosigner: Keypair.generate().publicKey,
   limits: LIMITS, split: SPLIT,
-  curve: { startCapSol: 30, graduationCapSol: 8_000_000, feeBps: 200 },
+  curve: { startCapSol: 30, graduationCapSol: 8_000_000, feeBps: 300 },
   names: NAMES, uri: "https://example.com/aht.json",
 }, (_what, tx, signers) => sendAndConfirmTransaction(connection, tx, signers, { commitment: "confirmed" }));
 const launchedAt = Date.now();
@@ -104,7 +105,7 @@ let book = await readBook(ctx);
   const pick = (over: Partial<Choice>): Choice => ({ buying: { hook: "max-buy", setting: 3 }, fees: "buyback-burn", name: null, minutes: 30, ...over });
   const why = (over: Partial<Choice>, at = facts) => unfit(pick(over), book, at);
   const change = changeOf(pick({}), LIMITS);
-  check(why({}) === null && describe(change.rule)[0] === "the buy is at most 1% of supply" && change.ruleSecs === 1800 && change.burnBps === 6_300, "a hook at one of its settings is, and comes to a rule, a term and fee shares");
+  check(why({}) === null && describe(change.rule)[0] === "the buy is at most 1% of supply" && change.ruleSecs === 1800 && change.burnBps === 4_200 && change.treasuryBps === 4_000, "a hook at one of its settings is, and comes to a rule, a term and fee shares");
   check(!!why({ buying: { hook: "max-sell", setting: 1 } })?.includes("no buying hook"), "a hook the catalogue does not have is not");
   check(!!why({ buying: { hook: "max-buy", setting: 9 } })?.includes("settings 1 to 4"), "nor a setting the hook does not have");
   check(!!why({ buying: { hook: "slow-open", setting: 1 }, minutes: 10 })?.includes("at least 15 minutes"), "nor a slow opening in an edict too short for it to open");
@@ -112,7 +113,18 @@ let book = await readBook(ctx);
   check(!!why({ fees: "to-me" })?.includes("no fee hook"), "nor a fee hook the catalogue does not have");
   check(!!why({ name: 3 })?.includes("names 1 to 3") && !!why({ name: 0 })?.includes("already goes by"), "nor a name the token does not have, or the one it has");
   check(!!why({ name: 1 })?.includes("cannot change for another") && why({ name: 1 }, { ...facts, now: book.renamedAt + LIMITS.minRenameSecs }) === null, "nor a new name before the old one has had its time");
-  check(FEE_HOOKS.every((hook) => changeOf(pick({ fees: hook.id }), { ...LIMITS, maxTreasuryBps: 500 }).treasuryBps <= 500), "no fee hook gives the treasury more than a token's cap");
+  const within = (minTreasuryBps: number, maxTreasuryBps: number) =>
+    FEE_HOOKS.every((hook) => {
+      const limits = { ...LIMITS, minTreasuryBps, maxTreasuryBps };
+      const shares = changeOf(pick({ fees: hook.id }), limits);
+      return shares.treasuryBps >= minTreasuryBps && shares.treasuryBps <= maxTreasuryBps && outsideLimits(shares, limits, true) === null;
+    });
+  check(within(0, 500) && within(1_000, 3_000) && within(2_500, 2_500) && within(LIMITS.minTreasuryBps, LIMITS.maxTreasuryBps), "no fee hook gives the treasury more than a token's cap or less than its floor");
+  const inShort = FEE_HOOKS.map((hook) => changeOf(pick({ fees: hook.id }), LIMITS)).map((shares) => `${shares.holdersBps / 100}/${shares.burnBps / 100}/${shares.treasuryBps / 100}`).join(" ");
+  check(inShort === "30/30/40 18/42/40 42/18/40 25/25/50", `between a floor of 40% and a cap of 50% the four fee hooks come to ${inShort} (holders/burn/treasury)`);
+  const under = outsideLimits({ ...change, holdersBps: 6_001, burnBps: 0, treasuryBps: 3_999 }, LIMITS, true);
+  const over = outsideLimits({ ...change, holdersBps: 4_999, burnBps: 0, treasuryBps: 5_001 }, LIMITS, true);
+  check(!!under?.includes("at least 40%") && !!over?.includes("at most 50%") && outsideLimits({ ...change, holdersBps: 6_000, burnBps: 0, treasuryBps: 4_000 }, LIMITS, true) === null, "shares that leave the treasury under its floor or over its cap are caught before they are sent");
 }
 
 console.log("one look at a time");
@@ -123,13 +135,14 @@ const sent = first.status === "rewritten" ? first : null;
 book = await readBook(ctx);
 const onChain = recogniseRule(book.rule);
 check(book.epoch === 1n && onChain?.hook.id === sent?.choice.buying?.hook && onChain?.setting === 1, `the rule in the rulebook is the hook it picked: ${onChain ? worded(onChain.hook.name) : "none"}`);
-check(recogniseSplit(book, LIMITS.maxTreasuryBps)?.hook.id === sent?.choice.fees && book.ruleUntil - book.updatedAt === (sent?.choice.minutes ?? 0) * 60, "with that fee hook's shares, for the time it gave");
+check(recogniseSplit(book, LIMITS.maxTreasuryBps, LIMITS.minTreasuryBps)?.hook.id === sent?.choice.fees && book.ruleUntil - book.updatedAt === (sent?.choice.minutes ?? 0) * 60, "with that fee hook's shares, for the time it gave");
 const [line] = readLog(logPath);
 check(Buffer.from(book.note).equals(noteOf(line.record)) && line.note === book.note.toString("hex"), "the note in the rulebook is the hash of the logged decision");
 check(line.record.hooks?.buying?.hook === sent?.choice.buying?.hook && line.record.hooks?.fees === sent?.choice.fees, "which names the hooks by their place in the catalogue");
 check(seen[0].market.market_cap_sol > 30 && seen[0].market.sol_in_curve > 0.9 && seen[0].market.pool_transactions_since_last_edict >= 1 && seen[0].limits.longest_edict_minutes === 360, `it was shown the market: ${JSON.stringify(seen[0].market)}`);
 check(seen[0].in_force.buying === "none" && seen[0].in_force.name === full(NAMES[0]) && seen[0].names.length === 3, "what was in force and the token's names");
-check(seen[0].fee_hooks.find((hook) => hook.id === "buyback-burn")?.shares === "holders 27%, burn 63%, treasury 10%", "and what each fee hook would come to");
+check(seen[0].fee_hooks.find((hook) => hook.id === "buyback-burn")?.shares === "holders 18%, burn 42%, treasury 40%", "and what each fee hook would come to");
+check(seen[0].limits.treasury_least_pct === 40 && seen[0].limits.treasury_most_pct === 50 && seen[0].in_force.fees === FEE_HOOKS[0].name, "the least and the most the treasury may get, and the opening split by its hook's name");
 const second = await runOnce(ctx);
 check(second.status === "too-soon", "a second look right away is turned back before the model is even asked");
 check(seen.length === 1, "and costs no model call");
@@ -147,7 +160,7 @@ check(third.status === "rewritten", "a look that was not told to wait replaces t
 book = await readBook(ctx);
 check(book.epoch === 2n && book.rule.length === 0 && book.ruleUntil - book.updatedAt === 18, "an edict with no buying hook has a term all the same");
 check(book.name === 2 && book.renamedAt === book.updatedAt && (await tokenName()) === full(NAMES[2]), `the token is now called ${await tokenName()}`);
-check(book.burnBps === 6_300 && readLog(logPath).at(-1)?.record.hooks?.name === 2, "the fee hook it came with is on chain too, and the record names the new name");
+check(book.burnBps === 4_200 && book.treasuryBps === 4_000 && readLog(logPath).at(-1)?.record.hooks?.name === 2, "the fee hook it came with is on chain too, and the record names the new name");
 const last = seen.at(-1)!;
 check(last.history.length === 1 && last.history[0].buying === buyingLabel(sent?.choice.buying ?? null) && last.history[0].fees === FEE_HOOKS[0].name, "it is shown its own earlier edicts by the names of their hooks");
 check(last.in_force.minutes_left > 0 && last.name_change.allowed_now, "what was in force when it looked, and that a new name was allowed");

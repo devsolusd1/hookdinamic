@@ -9,7 +9,7 @@
 
 use {
     agent_hook::{
-        processor::{tag, INIT, POOL_AUTHORITY, VALIDATION_LEN},
+        processor::{tag, INIT, METEORA_DBC, POOL_AUTHORITY, VALIDATION_LEN},
         state::{
             fact, op, Change, Condition, Limits, Refusal, Rulebook, MAX_CONDITIONS, MAX_NAMES, NAME_ENTRY_LEN, NAME_LEN, RULEBOOK_LEN, RULEBOOK_SEED,
             VALIDATION_SEED,
@@ -44,6 +44,8 @@ const TOKEN_2022: Address = Address::from_str_const("TokenzQdBNbLqP5VEhdkAS6EPFL
 const TOKEN: Address = Address::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const COMPUTE_BUDGET: Address = Address::from_str_const("ComputeBudget111111111111111111111111111111");
 const INSTRUCTIONS_SYSVAR: Address = Address::from_str_const("Sysvar1nstructions1111111111111111111111111");
+/// The mint of wrapped SOL, which the trading fees are paid in.
+const WRAPPED_SOL: Address = Address::from_str_const("So11111111111111111111111111111111111111112");
 const PROGRAM: Address = Address::new_from_array([0x48; 32]);
 
 /// A mint with the transfer-hook extension: 165 bytes of base state, the account type, then
@@ -63,6 +65,7 @@ struct Env {
     guardian: Keypair,
     agent: Keypair,
     cosigner: Keypair,
+    keeper: Keypair,
     /// The delegate that moves tokens out of the curve's vault.
     curve: Keypair,
     vault: Address,
@@ -73,7 +76,7 @@ struct Env {
 }
 
 fn limits() -> Limits {
-    Limits { min_interval_secs: HOUR as u32, max_rule_secs: 6 * HOUR as u32, max_treasury_bps: 3_000, min_rename_secs: 24 * HOUR as u32 }
+    Limits { min_interval_secs: HOUR as u32, max_rule_secs: 6 * HOUR as u32, min_treasury_bps: 1_000, max_treasury_bps: 3_000, min_rename_secs: 24 * HOUR as u32 }
 }
 
 fn when(group: u8, fact: u8, op: u8, value: u64) -> Condition {
@@ -121,11 +124,29 @@ fn refused(result: TransactionResult, why: Refusal) {
     assert_eq!(custom(result), why as u32, "expected {why:?}");
 }
 
+fn failed(result: TransactionResult, why: InstructionError) {
+    assert_eq!(result.expect_err("the transaction should have failed").err, TransactionError::InstructionError(0, why));
+}
+
+/// Where the compiled program is.
+fn hook_so() -> String {
+    std::env::var("HOOK_SO").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../hook/target/deploy/agent_hook.so").into())
+}
+
+/// Whether a transaction got as far as calling Meteora's program, read from the line the
+/// runtime logs when one program calls another.
+fn reached_meteora(result: &TransactionResult) -> bool {
+    let logs = match result {
+        Ok(meta) => &meta.logs,
+        Err(failure) => &failure.meta.logs,
+    };
+    logs.iter().any(|line| line == "Program dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN invoke [2]")
+}
+
 impl Env {
     /// A funded payer and the program, before any token exists.
     fn new() -> Self {
-        let so = std::env::var("HOOK_SO")
-            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../hook/target/deploy/agent_hook.so").into());
+        let so = hook_so();
         let mut svm = LiteSVM::new();
         svm.add_program_from_file(PROGRAM, &so)
             .unwrap_or_else(|e| panic!("build the program first; could not load {so}: {e:?}"));
@@ -145,6 +166,7 @@ impl Env {
             guardian: Keypair::new(),
             agent: Keypair::new(),
             cosigner: Keypair::new(),
+            keeper: Keypair::new(),
             curve: Keypair::new(),
             vault: Address::default(),
             sol_vault: Keypair::new().pubkey(),
@@ -294,7 +316,7 @@ impl Env {
 
     fn init_ix_named(&self, limits: &Limits, split: (u16, u16, u16), exempt: Address, names: &[u8]) -> Instruction {
         let mut data = INIT.to_vec();
-        for key in [self.guardian.pubkey(), self.agent.pubkey(), self.cosigner.pubkey(), exempt, self.sol_vault] {
+        for key in [self.guardian.pubkey(), self.agent.pubkey(), self.cosigner.pubkey(), exempt, self.sol_vault, self.keeper.pubkey()] {
             data.extend_from_slice(key.as_ref());
         }
         data.extend_from_slice(&limits.encode());
@@ -473,6 +495,60 @@ impl Env {
         self.guardian_ix(&guardian, tag::PAUSE, &[paused as u8])
     }
 
+    /// A wrapped-SOL token account owned by `owner`, written straight into the ledger. Only
+    /// who owns it is ever read here.
+    fn sol_account(&mut self, owner: &Address) -> Address {
+        let address = Keypair::new().pubkey();
+        let mut data = vec![0; 165];
+        data[..32].copy_from_slice(WRAPPED_SOL.as_ref());
+        data[32..64].copy_from_slice(owner.as_ref());
+        // token account layout: state at 108, 1 for an account in use
+        data[108] = 1;
+        self.svm.set_account(address, Account { lamports: SOL, data, owner: TOKEN, executable: false, rent_epoch: 0 }).unwrap();
+        address
+    }
+
+    /// Puts a program at Meteora's address, so that a claim that passes every check has
+    /// something to call. It is this program's own code: it knows nothing of Meteora's
+    /// instruction and answers that the data is not an instruction of its own.
+    fn stand_in_for_meteora(&mut self) {
+        self.svm.add_program_from_file(METEORA_DBC, hook_so()).unwrap();
+    }
+
+    /// A claim of the fees the way a keeper sends it: the keeper, Meteora's fourteen accounts
+    /// in Meteora's order, then the five a transfer of the token carries for the hook. The
+    /// curve's config, its pool and Meteora's event authority are made-up addresses: this
+    /// program passes them on without reading them.
+    fn claim_ix(&self, keeper: Address, token_account: Address, sol_account: Address) -> Instruction {
+        let made_up = |byte: u8| Address::new_from_array([byte; 32]);
+        let mut data = vec![tag::CLAIM_FEES];
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&u64::MAX.to_le_bytes());
+        let accounts = vec![
+            AccountMeta::new_readonly(keeper, true),
+            AccountMeta::new_readonly(POOL_AUTHORITY, false),
+            AccountMeta::new_readonly(made_up(1), false),
+            AccountMeta::new(made_up(2), false),
+            AccountMeta::new(token_account, false),
+            AccountMeta::new(sol_account, false),
+            AccountMeta::new(self.vault, false),
+            AccountMeta::new(self.sol_vault, false),
+            AccountMeta::new_readonly(self.mint.pubkey(), false),
+            AccountMeta::new_readonly(WRAPPED_SOL, false),
+            AccountMeta::new_readonly(self.book, false),
+            AccountMeta::new_readonly(TOKEN_2022, false),
+            AccountMeta::new_readonly(TOKEN, false),
+            AccountMeta::new_readonly(made_up(3), false),
+            AccountMeta::new_readonly(METEORA_DBC, false),
+            AccountMeta::new_readonly(self.book, false),
+            AccountMeta::new_readonly(INSTRUCTIONS_SYSVAR, false),
+            AccountMeta::new_readonly(self.sol_vault, false),
+            AccountMeta::new_readonly(PROGRAM, false),
+            AccountMeta::new_readonly(self.validation, false),
+        ];
+        Instruction { program_id: PROGRAM, accounts, data }
+    }
+
     fn balance(&self, token_account: &Address) -> u64 {
         let data = self.svm.get_account(token_account).unwrap().data;
         u64::from_le_bytes(data[64..72].try_into().unwrap())
@@ -494,7 +570,11 @@ fn init_writes_the_rulebook_and_the_list_token_2022_reads() {
     assert_eq!(book.agent, env.agent.pubkey().to_bytes());
     assert_eq!(book.cosigner, env.cosigner.pubkey().to_bytes());
     assert_eq!(book.curve_vault, env.sol_vault.to_bytes());
+    assert_eq!(book.keeper, env.keeper.pubkey().to_bytes());
+    assert_eq!(data[864..896], env.keeper.pubkey().to_bytes(), "the keeper, where the site reads it");
     assert_eq!(book.limits(), limits());
+    // the treasury's cap and its floor, where the site and the agent read them
+    assert_eq!((&data[208..210], &data[214..216]), (&3_000u16.to_le_bytes()[..], &1_000u16.to_le_bytes()[..]));
     assert_eq!((book.split(), book.rule().1, book.rule_until()), (SPLIT, 0, 0));
     assert_eq!((book.epoch(), book.updated_at(), book.paused), (0, 0, 0));
     assert_eq!((book.name, book.name_count as usize, book.renamed_at()), (0, NAMES.len(), T0));
@@ -526,10 +606,15 @@ fn init_needs_the_mint_to_sign_and_happens_once() {
     let mint = env.mint.insecure_clone();
     assert_eq!(env.send(ix, &[&mint]).unwrap_err().err, TransactionError::InstructionError(0, InstructionError::InvalidSeeds));
 
-    // an opening fee split that is not one, or that gives the treasury more than the limit
+    // an opening fee split that is not one, or that gives the treasury more than its cap or
+    // less than its floor
     refused(env.init(&limits(), (5_001, 3_000, 2_000), Address::default()), Refusal::BadSplit);
     refused(env.init(&limits(), (3_999, 3_000, 3_001), Address::default()), Refusal::OutsideLimits);
-    assert!(env.init(&Limits { max_treasury_bps: 10_001, ..limits() }, SPLIT, Address::default()).is_err());
+    refused(env.init(&limits(), (6_001, 3_000, 999), Address::default()), Refusal::OutsideLimits);
+    // limits that make no sense: a cap above the whole, a floor above the cap
+    let senseless = TransactionError::InstructionError(0, InstructionError::InvalidInstructionData);
+    assert_eq!(env.init(&Limits { max_treasury_bps: 10_001, ..limits() }, SPLIT, Address::default()).unwrap_err().err, senseless);
+    assert_eq!(env.init(&Limits { min_treasury_bps: 3_001, ..limits() }, (4_000, 3_000, 3_000), Address::default()).unwrap_err().err, senseless);
 
     // names: at least the one it launches with, eight at most, each with a ticker, in readable text
     let mint = env.mint.insecure_clone();
@@ -751,8 +836,10 @@ fn the_agent_cannot_leave_the_limits() {
     data.extend_from_slice(&bytes);
     data.extend_from_slice(&[0; 12 + 32]);
     refused(env.set_rules_raw(&agent, data), Refusal::BadRule);
-    // the fee split
+    // the fee split: it adds up, and the treasury gets no more than its cap and no less than its floor
     refused(env.set_rules(&Change::new(HOUR as u32, (6_999, 0, 3_001), &[]).unwrap()), Refusal::OutsideLimits);
+    refused(env.set_rules(&Change::new(HOUR as u32, (9_001, 0, 999), &[]).unwrap()), Refusal::OutsideLimits);
+    refused(env.set_rules(&Change::new(HOUR as u32, (5_000, 5_000, 0), &[]).unwrap()), Refusal::OutsideLimits);
     refused(env.set_rules(&Change::new(HOUR as u32, (5_001, 3_000, 2_000), &[]).unwrap()), Refusal::BadSplit);
     assert_eq!(Rulebook::cast(&env.book()).unwrap().epoch(), 0, "nothing was written");
 
@@ -773,6 +860,39 @@ fn the_agent_cannot_leave_the_limits() {
     let book = Rulebook::cast(&data).unwrap();
     // no rule, and a term of its own: an hour from when it was written
     assert_eq!((book.epoch(), book.rule().1, book.rule_until()), (2, 0, T0 + 2 * HOUR));
+}
+
+#[test]
+fn the_treasury_is_never_left_under_its_floor() {
+    let mut env = Env::launched();
+    let split = |env: &Env| {
+        let data = env.book();
+        let book = Rulebook::cast(&data).unwrap();
+        (book.epoch(), book.split())
+    };
+    // one bps under the floor is refused and nothing is written
+    refused(env.set_rules(&Change::new(HOUR as u32, (6_001, 3_000, 999), &[]).unwrap()), Refusal::OutsideLimits);
+    assert_eq!(split(&env), (0, SPLIT));
+    // at the floor it passes
+    env.set_rules(&Change::new(HOUR as u32, (6_000, 3_000, 1_000), &[]).unwrap()).unwrap();
+    assert_eq!(split(&env), (1, (6_000, 3_000, 1_000)));
+    // and the floor holds for an edict that carries a rule as much as for one that does not
+    env.warp(HOUR);
+    refused(env.set_rules(&Change::new(HOUR as u32, (10_000, 0, 0), closed().conditions()).unwrap()), Refusal::OutsideLimits);
+    assert_eq!(split(&env), (1, (6_000, 3_000, 1_000)));
+
+    // a token whose floor meets its cap: the treasury's share is fixed, the rest is the agent's to move
+    let mut env = Env::new();
+    env.create_mint();
+    let fixed = Limits { min_treasury_bps: 4_000, max_treasury_bps: 4_000, ..limits() };
+    refused(env.init(&fixed, (3_000, 3_001, 3_999), Address::default()), Refusal::OutsideLimits);
+    refused(env.init(&fixed, (3_000, 2_999, 4_001), Address::default()), Refusal::OutsideLimits);
+    env.init(&fixed, (3_000, 3_000, 4_000), Address::default()).unwrap();
+    assert_eq!(Rulebook::cast(&env.book()).unwrap().limits(), fixed);
+    refused(env.set_rules(&Change::new(HOUR as u32, (3_001, 3_000, 3_999), &[]).unwrap()), Refusal::OutsideLimits);
+    refused(env.set_rules(&Change::new(HOUR as u32, (2_999, 3_000, 4_001), &[]).unwrap()), Refusal::OutsideLimits);
+    env.set_rules(&Change::new(HOUR as u32, (1_800, 4_200, 4_000), &[]).unwrap()).unwrap();
+    assert_eq!(split(&env), (1, (1_800, 4_200, 4_000)));
 }
 
 #[test]
@@ -840,6 +960,166 @@ fn the_guardian_can_pause_and_replace_but_only_that() {
     env.send(signed, &[&guardian, &new_guardian]).unwrap();
     refused(env.pause(true), Refusal::NotGuardian);
     env.guardian_ix(&new_guardian, tag::PAUSE, &[1]).unwrap();
+}
+
+#[test]
+fn only_the_guardian_replaces_the_keeper() {
+    let mut env = Env::launched();
+    let (guardian, agent, keeper) = (env.guardian.insecure_clone(), env.agent.insecure_clone(), env.keeper.insecure_clone());
+    let new_keeper = Keypair::new();
+    let keeper_now = |env: &Env| Address::new_from_array(Rulebook::cast(&env.book()).unwrap().keeper);
+
+    // not the agent, not the keeper itself, not the key that wants the job, not a stranger
+    for signer in [&agent, &keeper, &new_keeper, &Keypair::new()] {
+        refused(env.guardian_ix(signer, tag::SET_KEEPER, new_keeper.pubkey().as_ref()), Refusal::NotGuardian);
+    }
+    // the guardian's key without its signature
+    let mut data = vec![tag::SET_KEEPER];
+    data.extend_from_slice(new_keeper.pubkey().as_ref());
+    let accounts = vec![AccountMeta::new_readonly(guardian.pubkey(), false), AccountMeta::new(env.book, false)];
+    failed(env.send(Instruction { program_id: PROGRAM, accounts, data }, &[]), InstructionError::MissingRequiredSignature);
+    // a key cut short
+    failed(env.guardian_ix(&guardian, tag::SET_KEEPER, &new_keeper.pubkey().to_bytes()[..31]), InstructionError::InvalidInstructionData);
+    assert_eq!(keeper_now(&env), keeper.pubkey(), "nothing was written");
+
+    env.guardian_ix(&guardian, tag::SET_KEEPER, new_keeper.pubkey().as_ref()).unwrap();
+    assert_eq!(keeper_now(&env), new_keeper.pubkey());
+    // and nothing else moved: the same agent writes the rules, the same guardian pauses
+    let data = env.book();
+    let book = Rulebook::cast(&data).unwrap();
+    assert_eq!((book.agent, book.guardian, book.cosigner), (agent.pubkey().to_bytes(), guardian.pubkey().to_bytes(), env.cosigner.pubkey().to_bytes()));
+    env.set_rules(&open()).unwrap();
+    // being the keeper gives no say over who the keeper is
+    refused(env.guardian_ix(&new_keeper, tag::SET_KEEPER, keeper.pubkey().as_ref()), Refusal::NotGuardian);
+}
+
+/// Meteora is not in LiteSVM, so what is tested here is everything before the call to it:
+/// who is refused, and that a rightful claim does get as far as calling Meteora's address
+/// with the rulebook signing. The claim itself runs on the local validator (scripts/e2e.ts).
+#[test]
+fn only_the_keeper_claims_and_only_into_its_own_accounts() {
+    let mut env = Env::launched();
+    env.stand_in_for_meteora();
+    let (guardian, agent, keeper) = (env.guardian.insecure_clone(), env.agent.insecure_clone(), env.keeper.insecure_clone());
+    let (token_account, sol_account) = (env.token_account(&keeper.pubkey()), env.sol_account(&keeper.pubkey()));
+    // What goes wrong first is what is reported, so each refusal below is the only thing wrong with its claim.
+    let stopped = |env: &mut Env, ix: Instruction, signer: &Keypair| {
+        let result = env.send(ix, &[signer]);
+        assert!(!reached_meteora(&result), "a refused claim never gets to Meteora");
+        result
+    };
+
+    // the keeper's key without its signature
+    let mut unsigned = env.claim_ix(keeper.pubkey(), token_account, sol_account);
+    unsigned.accounts[0].is_signer = false;
+    let result = env.send(unsigned, &[]);
+    assert!(!reached_meteora(&result));
+    failed(result, InstructionError::MissingRequiredSignature);
+
+    // anybody else, into accounts of their own: a stranger, the agent, the guardian
+    let stranger = Keypair::new();
+    for other in [&stranger, &agent, &guardian] {
+        let (theirs, their_sol) = (env.token_account(&other.pubkey()), env.sol_account(&other.pubkey()));
+        let ix = env.claim_ix(other.pubkey(), theirs, their_sol);
+        refused(stopped(&mut env, ix, other), Refusal::NotKeeper);
+    }
+    // or into the keeper's accounts, which does not make the signer the keeper
+    let ix = env.claim_ix(stranger.pubkey(), token_account, sol_account);
+    refused(stopped(&mut env, ix, &stranger), Refusal::NotKeeper);
+
+    // the keeper, towards an account that is somebody else's: the tokens' side, then the SOL's
+    let (theirs, their_sol) = (env.token_account(&stranger.pubkey()), env.sol_account(&stranger.pubkey()));
+    let ix = env.claim_ix(keeper.pubkey(), theirs, sol_account);
+    refused(stopped(&mut env, ix, &keeper), Refusal::NotKeepersAccount);
+    let ix = env.claim_ix(keeper.pubkey(), token_account, their_sol);
+    refused(stopped(&mut env, ix, &keeper), Refusal::NotKeepersAccount);
+    // towards a plain wallet, the keeper's own included: the fees arrive in token accounts
+    env.svm.airdrop(&keeper.pubkey(), SOL).unwrap();
+    for wallet in [keeper.pubkey(), stranger.pubkey()] {
+        let ix = env.claim_ix(keeper.pubkey(), token_account, wallet);
+        refused(stopped(&mut env, ix, &keeper), Refusal::NotKeepersAccount);
+    }
+    // towards an account of some other program that has the keeper's key written where a
+    // token account names its owner
+    let lookalike = Keypair::new().pubkey();
+    let mut data = vec![0; 165];
+    data[32..64].copy_from_slice(keeper.pubkey().as_ref());
+    env.svm.set_account(lookalike, Account { lamports: SOL, data, owner: Address::new_from_array([9; 32]), executable: false, rent_epoch: 0 }).unwrap();
+    let ix = env.claim_ix(keeper.pubkey(), lookalike, sol_account);
+    refused(stopped(&mut env, ix, &keeper), Refusal::NotKeepersAccount);
+
+    // another program where Meteora's goes: this one, the token program
+    for other in [PROGRAM, TOKEN_2022] {
+        let mut ix = env.claim_ix(keeper.pubkey(), token_account, sol_account);
+        ix.accounts[14] = AccountMeta::new_readonly(other, false);
+        failed(stopped(&mut env, ix, &keeper), InstructionError::IncorrectProgramId);
+    }
+    // something that is not a rulebook where the fee claimer goes
+    let mut ix = env.claim_ix(keeper.pubkey(), token_account, sol_account);
+    ix.accounts[10] = AccountMeta::new_readonly(keeper.pubkey(), false);
+    failed(stopped(&mut env, ix, &keeper), InstructionError::InvalidAccountOwner);
+    // fewer accounts than Meteora's claim has, more than it could have, amounts cut short
+    let mut ix = env.claim_ix(keeper.pubkey(), token_account, sol_account);
+    ix.accounts.truncate(14);
+    // The runtime still reports too few accounts under this name, which it means to retire.
+    #[allow(deprecated)]
+    failed(stopped(&mut env, ix, &keeper), InstructionError::NotEnoughAccountKeys);
+    let mut ix = env.claim_ix(keeper.pubkey(), token_account, sol_account);
+    ix.accounts.extend((0..4).map(|_| AccountMeta::new_readonly(INSTRUCTIONS_SYSVAR, false)));
+    failed(stopped(&mut env, ix, &keeper), InstructionError::InvalidArgument);
+    let mut ix = env.claim_ix(keeper.pubkey(), token_account, sol_account);
+    ix.data.pop();
+    failed(stopped(&mut env, ix, &keeper), InstructionError::InvalidInstructionData);
+
+    // The keeper, into its own two accounts: the program calls Meteora's address, and the
+    // runtime lets it sign as the rulebook. What answers there is the stand-in, which has no
+    // such instruction; the real one is met on the local validator.
+    let ix = env.claim_ix(keeper.pubkey(), token_account, sol_account);
+    let result = env.send(ix, &[&keeper]);
+    assert!(reached_meteora(&result), "a rightful claim is passed on to Meteora");
+    failed(result, InstructionError::InvalidInstructionData);
+    // the same with none of the hook's accounts behind Meteora's own
+    let mut ix = env.claim_ix(keeper.pubkey(), token_account, sol_account);
+    ix.accounts.truncate(15);
+    assert!(reached_meteora(&env.send(ix, &[&keeper])));
+
+    // the guardian puts another keeper in: the old one is refused, the new one is passed on
+    let new_keeper = Keypair::new();
+    env.guardian_ix(&guardian, tag::SET_KEEPER, new_keeper.pubkey().as_ref()).unwrap();
+    let ix = env.claim_ix(keeper.pubkey(), token_account, sol_account);
+    refused(stopped(&mut env, ix, &keeper), Refusal::NotKeeper);
+    let (new_token_account, new_sol_account) = (env.token_account(&new_keeper.pubkey()), env.sol_account(&new_keeper.pubkey()));
+    // the new keeper cannot send the fees to the old one's accounts either
+    let ix = env.claim_ix(new_keeper.pubkey(), token_account, sol_account);
+    refused(stopped(&mut env, ix, &new_keeper), Refusal::NotKeepersAccount);
+    let ix = env.claim_ix(new_keeper.pubkey(), new_token_account, new_sol_account);
+    assert!(reached_meteora(&env.send(ix, &[&new_keeper])));
+}
+
+/// Anybody can make a curve on Meteora for a token of their own whose config names this
+/// rulebook as its fee claimer. The rulebook must not sign a claim there: the keeper, or
+/// whoever has its key, could then have it sign in front of that other token's hook program.
+#[test]
+fn the_rulebook_signs_only_for_its_own_tokens_curve() {
+    let mut env = Env::launched();
+    env.stand_in_for_meteora();
+    let keeper = env.keeper.insecure_clone();
+    let (token_account, sol_account) = (env.token_account(&keeper.pubkey()), env.sol_account(&keeper.pubkey()));
+    // Everything about the claim is rightful but the token: another mint stands where the
+    // rulebook's own should, first a made-up address and then a real mint of somebody else's.
+    let other = Env::launched();
+    let other_mint = other.svm.get_account(&other.mint.pubkey()).unwrap();
+    env.svm.set_account(other.mint.pubkey(), other_mint).unwrap();
+    for mint in [Address::new_from_array([7; 32]), other.mint.pubkey(), WRAPPED_SOL] {
+        let mut ix = env.claim_ix(keeper.pubkey(), token_account, sol_account);
+        ix.accounts[8] = AccountMeta::new_readonly(mint, false);
+        let result = env.send(ix, &[&keeper]);
+        assert!(!reached_meteora(&result), "the rulebook signed a claim on a curve that is not its token's");
+        failed(result, InstructionError::InvalidAccountData);
+    }
+    // With its own token's mint there, the same claim is passed on.
+    let ix = env.claim_ix(keeper.pubkey(), token_account, sol_account);
+    assert!(reached_meteora(&env.send(ix, &[&keeper])));
 }
 
 #[test]

@@ -2,6 +2,9 @@
 // rulebook, the pool and, for a token with more than one name, the handing of its name to
 // the rulebook. The caller supplies `send`, which signs, sends and waits for each one. A step
 // already done on chain is skipped, so a launch that stopped halfway can be run again.
+//
+// The config names the rulebook's address as the one that claims the trading fees. No key
+// controls that address: the hook program claims for the keeper written in the rulebook.
 import { deriveDbcPoolAddress, deriveDbcTokenVaultAddress, type DynamicBondingCurveClient } from "@meteora-ag/dynamic-bonding-curve-sdk";
 import { getTokenMetadata, NATIVE_MINT, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
 import { createUpdateAuthorityInstruction } from "@solana/spl-token-metadata";
@@ -16,13 +19,21 @@ export type Launch = {
   payer: Keypair;
   mint: Keypair;
   config: Keypair;
-  /** Receives the trading fees Meteora does not keep. */
-  feeClaimer: PublicKey;
   guardian: PublicKey;
   agent: PublicKey;
-  /** The app's signing key, for app-only windows. */
-  cosigner: PublicKey;
-  /** An owner no rule applies to (the buyback vault). */
+  /**
+   * Takes the trading fees Meteora does not keep out of the curve and pays them out. It is
+   * written in the rulebook, where the guardian can replace it. The curve itself names the
+   * rulebook's address as its fee claimer, which is not a choice: Meteora never lets that
+   * address change, so it must not be a key somebody holds.
+   */
+  keeper: PublicKey;
+  /** The app's signing key, for app-only windows. Left out, the token names no app, until the guardian names one. */
+  cosigner?: PublicKey;
+  /**
+   * An owner no rule applies to. Left out, there is none, and that is how this token launches:
+   * the keeper is not exempt, and its buyback is judged by the rule in force like any buy.
+   */
   exempt?: PublicKey;
   limits: Limits;
   /** The fee split the token opens with. It opens with no rule. */
@@ -50,13 +61,20 @@ export async function launch(p: Launch, send: Send): Promise<{ pool: PublicKey; 
     const config = await p.dbc.partner.createConfigWithTransferHook({
       ...params,
       config: p.config.publicKey,
-      feeClaimer: p.feeClaimer,
-      leftoverReceiver: p.feeClaimer,
+      // The fees can be claimed only by the rulebook's address, which is to say only by the
+      // hook program, for the keeper. Tokens left over if the curve ever filled would go to
+      // the same address; the curve is built to leave none.
+      feeClaimer: book,
+      leftoverReceiver: book,
       quoteMint: NATIVE_MINT,
       payer: p.payer.publicKey,
       transferHookProgram: p.hookProgram,
     });
     await send("create the curve's config", config, [p.payer, p.config]);
+  } else {
+    // A config left by an earlier run is reused, and who claims its fees can never change.
+    const made = await p.dbc.state.getPoolConfig(p.config.publicKey);
+    if (!made?.feeClaimer.equals(book)) throw new Error(`the curve config ${p.config.publicKey.toBase58()} gives its fees to ${made?.feeClaimer.toBase58() ?? "nobody"}, not to this token's rulebook, and that cannot be changed: launch with a new config`);
   }
 
   // The rulebook goes in before the pool: the mint's own key signs it, and without it no
@@ -73,6 +91,7 @@ export async function launch(p: Launch, send: Send): Promise<{ pool: PublicKey; 
         exempt: p.exempt,
         // The pool's address follows from the mint and the config, so its SOL vault is known before it exists.
         curveVault: deriveDbcTokenVaultAddress(pool, NATIVE_MINT),
+        keeper: p.keeper,
         limits: p.limits,
         split: p.split,
         names: p.names,
