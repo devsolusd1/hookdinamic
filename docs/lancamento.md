@@ -7,10 +7,12 @@ Para o dono do projeto. Siga de cima para baixo, sem pular. Os comandos são par
 Solana, com SOL de mentira: é o ensaio, e a parte 0 diz o que muda nele. A segunda na
 **mainnet**, com SOL de verdade.
 
-**O que já foi ensaiado e o que não foi.** O comando de lançamento, o de criar chaves e o do
-guardião foram rodados numa rede local de teste. A publicação do programa foi ensaiada só nessa
-rede local. Nada disto foi rodado ainda na devnet nem na mainnet com esta versão. Por isso o
-ensaio na devnet vem primeiro, e não é opcional.
+**O que já foi feito e o que não foi (8 de outubro de 2026).** O comando de lançamento, o de
+criar chaves e o do guardião foram rodados numa rede local de teste, contra o programa real da
+Meteora. **Na mainnet, o programa já está publicado** (parte 4) e o serviço já roda na Railway
+em modo de ensaio, à espera do token. O token em si ainda não foi criado, e o ensaio na devnet
+(parte 0) foi pulado por decisão do dono: a primeira vez desta versão numa rede de verdade é o
+próprio lançamento.
 
 As saídas dos comandos aparecem em inglês. Este documento diz o que procurar nelas.
 
@@ -192,8 +194,8 @@ Envie da sua carteira pessoal, para os **endereços** anotados:
 |---|---|---|
 | pagador | ter **0,5 SOL** | Publicar o programa custa cerca de 0,3 SOL. O lançamento custa cerca de 0,03 SOL. O resto é folga. |
 | guardião | **0,01 SOL** | Para ele conseguir agir numa emergência sem você precisar mandar SOL antes. |
-| agente | **0,05 SOL** | Taxas de rede dos éditos. É tudo o que um ladrão levaria dessa carteira. |
-| keeper | **0,05 SOL** | Taxas de rede dos pagamentos. Esse SOL é dele; ele nunca usa as taxas dos holders para isso. Numa semana de muito movimento ele pode gastar perto de 0,2 SOL: recarregue quando o servidor pedir (`docs/hospedagem.md`). |
+| agente | **0,05 SOL** | Taxas de rede dos éditos. No preço do dia do lançamento (`AGENT_PRIORITY_MICROLAMPORTS=1000000`, em `docs/hospedagem.md`) cada édito custa perto de 0,0001 SOL, então 0,05 SOL dão para **uns 500 éditos**; no preço padrão, para uns 5 mil. Se o SOL acabar, o agente para de escrever éditos e o servidor avisa (`the agent's wallet needs topping up`): é só mandar mais. É tudo o que um ladrão levaria dessa carteira. |
+| keeper | **0,05 SOL** | Taxas de rede dos pagamentos. Esse SOL é dele; ele nunca usa as taxas dos holders para isso. Numa semana de muito movimento ele pode gastar perto de 0,2 SOL: recarregue quando o servidor pedir (`docs/hospedagem.md`). Se um dia você subir a taxa de prioridade dele até `1000000` (`docs/hospedagem.md`, "Se as transações não entram"), deixe antes **0,5 SOL** nessa carteira. |
 | tesouraria | **0,01 SOL** | O keeper se recusa a ligar enquanto nunca houve nada no endereço da tesouraria. É o jeito de ele pegar um endereço digitado errado antes de mandar dinheiro para um lugar de onde ninguém tira. |
 
 Para a tesouraria, copie o endereço daqui: `6Zudkofv2WFz2XdAR43cozs7rJavhyn5UmQw7E9QSDph`.
@@ -208,15 +210,25 @@ só que de ninguém.
 Depois do lançamento, **ninguém** muda isto, nem você, nem o guardião:
 
 - A **taxa** de 3% por trade, e o quinto dela que fica com a Meteora.
-- A **curva**: começa em 30 SOL de valor de mercado e **não gradua**. "Graduar" é o que a
-  Meteora faz quando uma curva enche: ela tira o hook do token, e as regras do agente deixam
-  de valer. Esta curva só encheria com **9 bilhões de SOL** dentro dela, e todo o SOL que
-  existe soma cerca de 635 milhões: 14 vezes menos. (Você confere esse total em qualquer
-  explorador da Solana, procurando por "supply". Ele cresce menos de 4% ao ano; nesse ritmo
-  levaria uns 175 anos para existirem 9 bilhões de SOL, e todos teriam de estar nesta curva ao
-  mesmo tempo.) O número é em SOL e está fixo no código: não depende do preço do SOL no dia do
-  lançamento, e não existe linha no `launch.json` para mudá-lo. O resumo da parte 6 mostra
-  esse número.
+- A **curva**: começa em 30 SOL de valor de mercado e **não gradua, do jeito que o programa
+  da Meteora é hoje**. "Graduar" é o que a Meteora faz quando uma curva enche: ela tira o hook
+  do token, e as regras do agente deixam de valer. Esta curva só encheria com **9 bilhões de
+  SOL** dentro dela, **mais de dez vezes todo o SOL que existe**. (Em outubro de 2026 o total
+  era de cerca de 635 milhões; você confere em qualquer explorador da Solana, procurando por
+  "supply". Ele cresce menos de 4% ao ano; nesse ritmo levaria uns 175 anos para existirem
+  9 bilhões de SOL, e todos teriam de estar nesta curva ao mesmo tempo.) O número é em SOL e
+  está fixo no código: não depende do preço do SOL no dia do lançamento, e não existe linha no
+  `launch.json` para mudá-lo. O comando recusa lançar uma curva que pedisse menos de dez vezes
+  todo o SOL que existe. O resumo da parte 6 mostra esse número, e depois do lançamento o
+  comando o lê de volta da blockchain (parte 7).
+  - **A ressalva, que vale para qualquer token na Meteora:** o programa da Meteora pode ser
+    atualizado por ela. **Só a Meteora, mudando o programa dela, poderia tirar o hook; nenhuma
+    chave nossa pode**, nem a do guardião, nem a do pagador. Nenhum número da curva protege
+    contra isso.
+  - **Nos sites de negociação, o "progresso da curva" deste token fica em zero para sempre.
+    Está certo.** Esse progresso é o SOL que está na curva dividido pelo que ela precisa para
+    graduar: com 1.000 SOL dentro, dá 0,00001%. O token nunca vai aparecer como "prestes a
+    graduar" nem como "graduado". Não é defeito e não é para consertar.
 - Os **limites do agente**: um édito a cada 10 minutos no máximo; um édito vale no máximo
   2 horas; a tesouraria recebe no mínimo 40% e no máximo 50% das taxas.
 - O **nome** e o **ticker**: Veluno, VELUNO. Com um nome só, ele nunca muda.
@@ -249,6 +261,15 @@ mais pode ser corrigido nem trocado). Não faça isso sem conversar com quem pro
 ---
 
 ## 4. Publicar o programa (gasta SOL de verdade)
+
+**Na mainnet isto já foi feito, em 7 de outubro de 2026: não rode de novo.** O programa está
+em `AzoQSz4jMRXuezfS1HuRbNm3AphjN8CUC6u74rbaFUYT`, com 56752 bytes, e os bytes publicados foram
+conferidos um a um contra a compilação que os testes usam. Quem pode atualizá-lo é a chave
+`C:\Users\John\veluno-mainnet\pagador.json` (endereço
+`FJ8ttB1jCAYzmmX7vP8zNAexv9M7KwAaxWACiDCSUee2`): guarde esse arquivo como o do guardião. Rodar
+o comando abaixo outra vez escreveria por cima do programa o que estiver compilado no
+computador naquele momento. Para só conferir, use o `solana program show` do fim desta parte.
+O que segue fica como registro de como foi feito, e para um ensaio noutra rede.
 
 Você precisa do **endereço do RPC** da mainnet (parte 1, item 5). Ele é segredo.
 
@@ -329,9 +350,12 @@ Atenção:
 
 - Os endereços vão **entre aspas**, sem os sinais `<` e `>` do exemplo.
 - **Não** existe linha `feeClaimer`. Se ela aparecer, o comando recusa.
-- **Não** existe mais a linha `graduationCapUsd`. O exemplo antigo tinha; se o seu
-  `launch.json` foi copiado dele e ainda tem essa linha, **apague a linha inteira**. Enquanto
-  ela estiver lá, o comando recusa com `the launch file cannot name a graduationCapUsd`.
+- **O `launch.json` de verdade não pode ter a linha `graduationCapUsd`.** O exemplo antigo
+  tinha. Se o seu arquivo foi copiado dele (o da pasta `veluno-mainnet`, por exemplo, se você
+  o preparou antes desta versão), abra e confira: se a linha ainda estiver lá, **apague a
+  linha inteira**, com a vírgula do fim. Enquanto ela estiver lá, o comando recusa com
+  `the launch file cannot name a graduationCapUsd` e nada é enviado. Onde a curva graduaria
+  não é mais uma escolha do arquivo (parte 3).
 - **Não** acrescente a linha `cosigner` (a chave de app): o Veluno nasce sem ela.
 - O endereço da tesouraria **não** entra neste arquivo. Ele vai só para o servidor.
 
@@ -376,6 +400,15 @@ arquivo, por exemplo `the launch file needs guardian, a public key`. Corrija e r
 Na primeira vez, este comando cria `mint.json` e `curve-config.json` na pasta. **Não apague.**
 O endereço do token (`mint`) já é o definitivo.
 
+Este mesmo comando, sem `--send`, pode ser rodado quantas vezes você quiser, antes e depois
+do lançamento. Ele também olha o que já existe na blockchain:
+
+- Se um lançamento parou no meio, a última linha diz até onde ele foi, por exemplo
+  `Nothing was sent. An earlier run already made the curve's config, as this file describes it`.
+- Depois do lançamento, ele mostra o token **lido de volta da blockchain** (as linhas
+  `read back from the chain`, explicadas na parte 7) e termina com
+  `Nothing was sent. This token is already launched`.
+
 ---
 
 ## 7. Lançar (gasta SOL de verdade, não tem volta)
@@ -386,7 +419,8 @@ Só depois de a conferência da parte 6 estar certa, e de o `metadata.json` esta
 npm run launch -- C:\Users\John\veluno-mainnet\launch.json --send --mainnet
 ```
 
-Aparece o mesmo resumo e depois três linhas, cada uma com o código de uma transação:
+Aparece o mesmo resumo e depois três linhas, cada uma com o código de uma transação. Em
+seguida o comando **lê o token de volta da blockchain** e mostra o que ela diz:
 
 ```
   create the curve's config: ...
@@ -394,10 +428,68 @@ Aparece o mesmo resumo e depois três linhas, cada uma com o código de uma tran
   create the pool: ...
 
   launched. Addresses are in C:\Users\John\veluno-mainnet\token.json
+
+  read back from the chain
+  curve          one segment, starting at 30 SOL of market cap; graduating takes
+                 9,000,000,000 SOL in the curve, more than 10 times all the SOL there is
+  trading fee    3% per trade, the same for good, taken in SOL
+  fee claimer    ..., the token's rulebook
+  hook           on the mint: ...
+  token          Veluno (VELUNO), card https://www.veluno.li/metadata.json
 ```
 
-- **Se parar no meio:** rode o mesmo comando de novo. Ele pula o que já foi feito.
+As linhas depois de `read back from the chain` não vêm do seu arquivo: vêm do que ficou
+gravado. Confira:
+
+| Linha | Tem que dizer |
+|---|---|
+| `curve` | `one segment` (uma curva só), `starting at 30 SOL of market cap` e `9,000,000,000 SOL in the curve`: é o que ela precisaria ter dentro para graduar (parte 3) |
+| `trading fee` | `3% per trade, the same for good, taken in SOL` |
+| `fee claimer` | o mesmo endereço da linha `fee claimer` do resumo, seguido de `the token's rulebook` |
+| `hook` | `on the mint:` e o `Program Id` do passo 4. É a prova de que o hook está no token. |
+| `token` | `Veluno (VELUNO)` e o endereço do `metadata.json` |
+
 - **Custo:** cerca de 0,03 SOL.
+- **Se parar no meio** (erro de rede, tempo esgotado): rode o mesmo comando de novo, **sem
+  mudar nada no `launch.json` nem na pasta**. Ele pula o que já foi feito e continua. A
+  mensagem nesse caso começa com `The launch stopped:` e termina dizendo
+  `Run the same command again`.
+- **Se aparecer `The token is launched, and it could not be read back just now`:** o token
+  foi lançado e o `token.json` foi gravado; só a leitura de volta falhou (o RPC demorou a
+  mostrar). Rode o mesmo comando de novo: ele não envia mais nada e faz a leitura.
+- **Rodar de novo depois de pronto não gasta nada.** O comando vê que o token já existe,
+  diz `already launched: this run sent nothing`, mostra a leitura de volta e deixa o
+  `token.json` como estava.
+
+### Se o comando recusar por causa de um lançamento anterior
+
+Antes de enviar qualquer coisa, o comando compara **tudo** o que um lançamento anterior
+deixou na blockchain com o que o `launch.json` pede agora: a curva inteira, a taxa, quem
+retira as taxas, o guardião, o agente, o keeper, os limites, a divisão inicial, os nomes.
+Havendo uma diferença, ele não envia mais nada e diz qual é a primeira. Uma recusa dessas só
+aparece se um lançamento parou no meio **e** o arquivo (ou a pasta) foi mudado antes de rodar
+de novo. Por exemplo:
+
+```
+  The launch stopped, and this run sent nothing: the curve config ..., left on chain by an earlier run, has a trading fee of 3%, and this launch asks for 2%.
+```
+
+A frase mostra primeiro o que **está gravado** e depois o que **o arquivo pede**. Na linha
+seguinte o comando diz o que ainda dá para fazer. O que vale em cada caso:
+
+| Até onde o lançamento anterior foi | O que dá para fazer |
+|---|---|
+| Só a primeira transação (`create the curve's config`) | **Ou** volte o `launch.json` ao que era e rode de novo: ele continua. **Ou**, para lançar o que o arquivo diz agora, apague `curve-config.json` e rode de novo: o comando cria uma configuração nova. O que a antiga custou (cerca de 0,009 SOL) se perde. |
+| Até a segunda (`write the rulebook`) | **Ou** volte o `launch.json` e a pasta ao que eram e rode de novo: ele continua. **Ou comece numa pasta nova**, com uma cópia do `launch.json` e do `pagador.json`, **sem** o `mint.json` e o `curve-config.json` desta: o comando cria os dois de novo, e **o token passa a ter outro endereço**. O que foi gasto na pasta antiga (cerca de 0,018 SOL) se perde. Apagar só o `curve-config.json` **não resolve** aqui: o livro de regras é escrito uma vez só, para este token e esta curva. |
+| Até o fim (o token existe) | Nada no arquivo muda o token. Volte o `launch.json` ao que era. O que o arquivo diz agora seria **outro token**, lançado de uma pasta nova. |
+
+Uma exceção boa de saber: se a diferença for no **agente** ou no **keeper**, o caminho mais
+barato é voltar o arquivo, terminar o lançamento e depois trocar a chave com o comando do
+guardião (`docs/emergencia.md`). Vale também para a **chave de app**, mas essa troca o comando
+do guardião ainda não oferece: fale com quem programa. O comando avisa quando é esse o caso
+(`Once the token is launched its guardian can replace the agent, the keeper and the app key`).
+**Não vale para o guardião:** se o endereço de guardião que ficou gravado não for o da sua
+chave, ninguém mais consegue trocá-lo. Nesse caso comece numa pasta nova.
 
 O arquivo `token.json` tem os endereços de tudo. **Não publique esse arquivo**: ele guarda o
 endereço do RPC com a sua chave. Você vai usar ele três vezes: no servidor, no site e no

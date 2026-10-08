@@ -38,6 +38,13 @@
 // soon as the port is open. /health is for people and alarms: it answers 503 the moment a
 // loop cannot do its work, and a host that took that for a failed start would take down a
 // copy that still serves the records and is saying what is wrong.
+//
+// Two of the things /health lists are no failure of a loop, and only somebody with SOL or with
+// the settings can end them: "the agent's wallet needs topping up" (an edict is due and the
+// agent's wallet could not be sure of paying for one; "agent.wallet" says how much is short,
+// and "agent.address" where to send it) and "the keeper's transactions are not landing" (three
+// rounds in a row ended with a transaction that never got into a block: the price it bids,
+// "microLamportsPerUnit" in KEEPER_SETTINGS, is too low for the day).
 import "../src/quiet.js";
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statfsSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -46,8 +53,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 import { DynamicBondingCurveClient } from "@meteora-ag/dynamic-bonding-curve-sdk";
-import { Connection, Keypair, PublicKey } from "@solana/web3.js";
-import { askClaude, EDICT_UNITS_MOST, edictFee, figuresInWords, inSol, memoInWords, mendLog, NotTheAgent, priorityFrom, readBook, readLog, watch, type Context, type Decide, type LogCheck, type Outcome } from "../src/agent.js";
+import { Connection, Keypair, PublicKey, SendTransactionError } from "@solana/web3.js";
+import { askClaude, EDICT_UNITS_MOST, edictFee, figuresInWords, inSol, memoInWords, mendLog, NotTheAgent, priorityFrom, readBook, readLog, shortInWords, watch, type Context, type Decide, type Funds, type LogCheck, type Outcome } from "../src/agent.js";
 import { AlreadyRunning, Retired, round, settingsFrom, type KeeperContext, type KeeperOutcome } from "../src/keeper/index.js";
 import { solPriceUsd } from "../src/price.js";
 
@@ -65,6 +72,26 @@ const TAILS = [100, 500, 2000];
  * (src/keeper/round.ts), and when a payout round runs short halfway (src/keeper/holders.ts).
  */
 const KEEPER_SHORT = /needs topping up|is topped up/;
+/**
+ * The two ways the keeper says a transaction of its own never got into a block: a claim, a
+ * payment to the treasury or a buyback whose time ran out (src/keeper/round.ts), and a payment
+ * to holders whose time did (src/keeper/holders.ts). scripts/keeper-sim.ts holds both sentences
+ * to these words. A node that calls a transaction dead while the chain shows it landed is said
+ * in other words, and is not this.
+ */
+const KEEPER_LOST = /never landed and no longer can|^transaction \S+ expired$/;
+/**
+ * The ways it says one did, and did its work: fees claimed, the treasury sent its share, a
+ * buyback, and a payout that reached at least one holder (src/keeper/round.ts).
+ */
+const KEEPER_LANDED = /^(?:claimed|sent the treasury|bought back) |^paid [1-9]/;
+/**
+ * How many rounds have to end with a transaction lost, with no round between them in which
+ * one landed, before /health says so. A round whose claim goes nowhere takes a minute and a
+ * half to two minutes, so this is five or six minutes of a network too busy for what the
+ * keeper bids.
+ */
+const KEEPER_LOST_ROUNDS = 3;
 
 /** What a test may put in the place of the real thing. Nothing here is read from the environment. */
 export type Options = {
@@ -117,10 +144,17 @@ const sleep = (ms: number, signal?: AbortSignal) =>
 
 const stamp = () => new Date().toISOString();
 
+/**
+ * An error's first line. For a transaction a node refused, the library's first line is only
+ * "Simulation failed.": the node's own reason is what tells a busy node from a refusal by a
+ * program, so that is what is kept.
+ */
+const said = (error: unknown): string =>
+  (error instanceof SendTransactionError ? `the node refused the transaction: ${error.transactionError.message}` : error instanceof Error ? error.message : String(error)).split("\n")[0];
+
 /** An error as one line that is safe to print: an RPC address carries its key, so only the host of any address is kept. */
 export function plain(error: unknown): string {
-  const text = error instanceof Error ? error.message : String(error);
-  return text.split("\n")[0].replace(/\b(?:https?|wss?):\/\/[^\s"'<>]+/g, (address) => {
+  return said(error).replace(/\b(?:https?|wss?):\/\/[^\s"'<>]+/g, (address) => {
     try {
       return new URL(address).origin;
     } catch {
@@ -137,7 +171,7 @@ export function plain(error: unknown): string {
  */
 export function inPublic(error: unknown): string {
   const kind = error instanceof Error ? error.constructor.name : "unknown";
-  const text = (error instanceof Error ? error.message : String(error)).split("\n")[0];
+  const text = said(error);
   return /:\/\/|(?:api[-_]?key|token|secret)\s*=|x-api-key\s*:|authorization\s*:|bearer\s+\S/i.test(text) || text.length > 400 ? kind : text;
 }
 
@@ -205,14 +239,19 @@ export async function serve(options: Options = {}): Promise<Service> {
   const startedAt = Date.now();
   const health = {
     starting: true,
-    /** `withoutText`: the edicts found on chain whose text is in neither the log nor the line written before sending. They stay listed until the service is started again. */
-    agent: { ...quiet(), address: null as string | null, lastEdictAt: null as number | null, withoutText: [] as number[] },
+    /**
+     * `withoutText`: the edicts found on chain whose text is in neither the log nor the line written before sending. They stay listed until the service is started again.
+     * `wallet`: what the agent's wallet held the last time it was read, which is just before the model is asked, what it has to hold, and how much is missing, in SOL.
+     * `short`: at that reading it held too little, and the model was not asked. Never in a dry run, which only says so.
+     */
+    agent: { ...quiet(), address: null as string | null, lastEdictAt: null as number | null, withoutText: [] as number[], wallet: null as { holdsSol: string; needsSol: string; shortSol: string; readAt: string } | null, short: false },
     /**
      * `saying`: the last thing the keeper did, or what it waits for, in its own words.
      * `short`: it has said its wallet is out of SOL, and has not had a round with nothing in its way since.
+     * `lostRounds`: how many rounds have ended with a transaction of its own that never got into a block, since the last round in which one did.
      * `finished`: the guardian has named another keeper and this one has paid out what it held, in its own words. It takes no more rounds.
      */
-    keeper: { ...quiet(), address: null as string | null, saying: null as string | null, short: false, finished: null as string | null },
+    keeper: { ...quiet(), address: null as string | null, saying: null as string | null, short: false, lostRounds: 0, finished: null as string | null },
   };
 
   function beat(of: Beat, event: { status: string; error?: unknown }) {
@@ -251,6 +290,12 @@ export async function serve(options: Options = {}): Promise<Service> {
     for (const epoch of health.agent.withoutText) found.push(`edict ${epoch} is on chain and its text is not in the log`);
     // The keeper says so itself, in a round that otherwise went well.
     if (health.keeper.short) found.push("the keeper's wallet needs topping up");
+    // So does the agent, at a look that went as it should: an edict was due, and it did not ask
+    // the model for one it could not be sure of paying for.
+    if (health.agent.short) found.push("the agent's wallet needs topping up");
+    // A transaction that never gets into a block costs the keeper nothing and fails nothing: it
+    // signs another. Round after round of that, with nothing landing, is a price too low for the day.
+    if (health.keeper.lostRounds >= KEEPER_LOST_ROUNDS) found.push("the keeper's transactions are not landing");
     try {
       if (freeBytes() < MIN_FREE_BYTES) found.push("the disk is nearly full");
     } catch {
@@ -356,8 +401,8 @@ export async function serve(options: Options = {}): Promise<Service> {
         problems: found,
         since: iso(startedAt),
         dryRun,
-        agent: { ...loop(health.agent), address: health.agent.address, lastEdictAt: iso(health.agent.lastEdictAt), withoutText: health.agent.withoutText },
-        keeper: { ...loop(health.keeper), address: health.keeper.address, saying: health.keeper.saying },
+        agent: { ...loop(health.agent), address: health.agent.address, wallet: health.agent.wallet, lastEdictAt: iso(health.agent.lastEdictAt), withoutText: health.agent.withoutText },
+        keeper: { ...loop(health.keeper), address: health.keeper.address, saying: health.keeper.saying, lostRounds: health.keeper.lostRounds },
         records: { log: file(logPath), ledger: file(ledgerPath), ledgerHead: file(headPath) },
         diskFreeMb,
       };
@@ -533,6 +578,9 @@ export async function serve(options: Options = {}): Promise<Service> {
     const firstLookInSecs = last?.record.action === "hold" && since >= 0 && since < thinkEverySecs ? thinkEverySecs - since : 0;
 
     let saidLast: string | null = null;
+    /** What a rehearsal last said of a wallet that holds too little, so that it says it once and not at every look. */
+    let saidOfWallet: string | null = null;
+    const walletAs = (funds: Funds) => ({ holdsSol: inSol(funds.holds), needsSol: inSol(funds.needs), shortSol: inSol(Math.max(0, funds.needs - funds.holds)), readAt: stamp() });
     await watch(ctx, {
       pollSecs,
       thinkEverySecs,
@@ -545,6 +593,17 @@ export async function serve(options: Options = {}): Promise<Service> {
         if (event.status === "resting") Object.assign(health.agent, { last: event.status, lastAt: Date.now() });
         else beat(health.agent, event);
         if (event.status === "rewritten" && event.signature) health.agent.lastEdictAt = Date.now();
+        // The agent's wallet, as the look found it. It stays listed as short until a look
+        // finds enough in it, or an edict goes out, which only a wallet that could pay does.
+        if (event.status === "short") Object.assign(health.agent, { wallet: walletAs(event.funds), short: true });
+        else if ((event.status === "held" || event.status === "rewritten") && event.funds) {
+          const enough = event.funds.holds >= event.funds.needs;
+          Object.assign(health.agent, { wallet: walletAs(event.funds), ...(enough ? { short: false } : {}) });
+          // Only a rehearsal gets this far with too little in the wallet. It sends nothing, so it only says so.
+          const lacking = enough ? null : `my wallet ${health.agent.address} needs topping up before this is for real: ${shortInWords(event.funds)}. A dry run goes on all the same; for real I would ask the model nothing until SOL arrives.`;
+          if (lacking !== null && lacking !== saidOfWallet) say(`agent: ${lacking}`);
+          saidOfWallet = lacking;
+        } else if (event.status === "rewritten" && event.signature) health.agent.short = false;
         const line =
           // An edict that was sent says so of its memo only when it had to be cut. A rehearsal
           // says what the memo would be either way, and what the transaction it built comes to.
@@ -557,10 +616,12 @@ export async function serve(options: Options = {}): Promise<Service> {
           : event.status === "too-soon" ? `the last edict is too recent; ${event.seconds}s to go`
           : event.status === "paused" ? "paused by the guardian"
           : event.status === "resting" ? "the next look is not due yet"
+          : event.status === "short" ? `my wallet ${health.agent.address} needs topping up: ${shortInWords(event.funds)}. I ask the model nothing until SOL arrives, and go on by myself once it has.`
           : `error: ${plain(event.error)}`;
         // Waiting repeats on every poll, a pause for as long as it lasts, and an error that does
-        // not go away at every try: each is said once.
-        const news = event.status === "in-force" || event.status === "too-soon" || event.status === "paused" || event.status === "resting" ? event.status : event.status === "error" ? line : null;
+        // not go away at every try: each is said once. So is a wallet that holds too little,
+        // which is found again at every poll, and said again when what it holds has changed.
+        const news = event.status === "in-force" || event.status === "too-soon" || event.status === "paused" || event.status === "resting" ? event.status : event.status === "error" || event.status === "short" ? line : null;
         if (news !== null && news === saidLast) return;
         saidLast = news;
         say(`agent: ${line}`);
@@ -584,6 +645,8 @@ export async function serve(options: Options = {}): Promise<Service> {
     // the same lines every few seconds: a line the round before also said is not printed again.
     let saidBefore = new Set<string>();
     let saidNow = new Set<string>();
+    /** What the round in hand has said of its own transactions so far: that one never got into a block, that one landed. */
+    const sent = { lost: false, landed: false };
     const ctx: KeeperContext = {
       connection,
       dbc,
@@ -601,6 +664,8 @@ export async function serve(options: Options = {}): Promise<Service> {
         health.keeper.lastAt = Date.now();
         health.keeper.saying = line;
         if (KEEPER_SHORT.test(line)) health.keeper.short = true;
+        if (KEEPER_LOST.test(line)) sent.lost = true;
+        if (KEEPER_LANDED.test(line)) sent.landed = true;
         saidNow.add(line);
         if (!dryRun || !saidBefore.has(line)) say(`keeper: ${line}`);
       },
@@ -637,7 +702,7 @@ export async function serve(options: Options = {}): Promise<Service> {
         // so none is taken: the loop ends, and what to do next is said once. A wallet that has
         // nothing more to send needs no topping up either.
         if (error instanceof Retired) {
-          Object.assign(health.keeper, { on: false, last: "retired", lastAt: Date.now(), errorsInARow: 0, short: false, finished: inPublic(error) });
+          Object.assign(health.keeper, { on: false, last: "retired", lastAt: Date.now(), errorsInARow: 0, short: false, lostRounds: 0, finished: inPublic(error) });
           say(`keeper: finished: ${plain(error)}`);
           say(`keeper: it takes no more rounds. The fees in the pool wait for the new keeper. What to do next: put the new keeper's key in KEEPER_KEYPAIR_JSON. The new keeper also needs a folder of its own: the books and the ledger in ${keeperDir} are this keeper's, and another keeper refuses them. If the guardian names this key again instead, start the service again: it is the keeper as before.`);
           return;
@@ -646,6 +711,17 @@ export async function serve(options: Options = {}): Promise<Service> {
         const news = `error: ${plain(error)}`;
         if (news !== said) say(`keeper: ${news}`);
         said = news;
+      }
+      // The round is over, however it ended: what it said of its own transactions is counted.
+      // One that landed something ends the count. One that lost a transaction and landed none
+      // adds to it. A round that sent nothing leaves it where it was: nothing was shown either way.
+      const before = health.keeper.lostRounds;
+      health.keeper.lostRounds = sent.landed ? 0 : before + (sent.lost ? 1 : 0);
+      sent.lost = sent.landed = false;
+      if (before < KEEPER_LOST_ROUNDS && health.keeper.lostRounds >= KEEPER_LOST_ROUNDS) {
+        say(`keeper: its transactions are not landing: ${health.keeper.lostRounds} rounds have ended with one that never got into a block, and none has landed in between. Nothing is lost by it: what did not go through is still owed, and is tried again. If trades on the pool are going through meanwhile, what it bids is too low for the day: that is "microLamportsPerUnit" in KEEPER_SETTINGS.`);
+      } else if (before >= KEEPER_LOST_ROUNDS && health.keeper.lostRounds === 0) {
+        say("keeper: its transactions are landing again");
       }
       [saidBefore, saidNow] = [saidNow, new Set()];
       await sleep(everySecs * 1000, stopping.signal);

@@ -11,7 +11,9 @@ documento diz o que procurar nelas. Se a primeira linha for
 
 **Ensaiado numa rede local de teste**, com o serviço rodando: pausar, despausar, trocar o
 agente, trocar o keeper, e a recusa de uma chave errada. **Ainda não foi rodado na devnet nem
-na mainnet.** Ensaie uma vez na devnet antes do lançamento (fim deste documento).
+na mainnet.** O ensaio na devnet (fim deste documento) foi pulado antes do lançamento; logo
+depois de lançar, rode ao menos o `status`, que não gasta nada, para ver que o comando alcança
+o token.
 
 ---
 

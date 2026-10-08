@@ -1,6 +1,7 @@
 // Checks of the service (scripts/serve.ts); of what keeps an edict's words, of the transaction
-// that carries them and what it asks of the network, of what the model is told and of how often
-// it is asked (src/agent.ts); and of the guardian's command when its node does not answer.
+// that carries them and what it asks of the network, of what the model is told, of how often
+// it is asked and of the wallet the agent reads before it asks (src/agent.ts); and of the
+// guardian's command when its node does not answer.
 //
 //   npm run test:serve                  offline: no chain, no model, no key. About half a minute.
 //   npm run test:serve -- --validator   the same service as a process of its own, with both loops, and the
@@ -29,11 +30,11 @@ import { base58, decodeRulebook as pageRulebook, hashOf, readLog as pageReadLog 
 import { BUYING_HOOKS, FEE_HOOKS, ruleOf } from "../site/hooks.js";
 import { readLedger } from "../site/ledger.js";
 import {
-  ANNOUNCEMENT_MAX, announced, askClaude, buyingLabel, EDICT_UNITS_MOST, edictFee, edictTransaction, edictUnits, figuresInWords, MEMO_PROGRAM, MEMO_UNITS, memoInWords, memoUnits, mendLog, NAME_UNITS, noteOf,
-  PRIORITY_MICROLAMPORTS, PRIORITY_MICROLAMPORTS_MOST, priorityFrom, readLog, RULE_UNITS, runOnce, saysNothing, takeSnapshot, TRANSACTION_MAX, TRANSACTION_UNITS_MAX, waitingPath, watch, type Context, type Decide, type LogEntry,
+  ANNOUNCEMENT_MAX, announced, askClaude, buyingLabel, EDICT_UNITS_MOST, edictFee, edictTransaction, edictUnits, figuresInWords, inSol, lamportsForAnEdict, MEMO_PROGRAM, MEMO_UNITS, memoInWords, memoUnits, mendLog, NAME_UNITS, noteOf,
+  PRIORITY_MICROLAMPORTS, PRIORITY_MICROLAMPORTS_MOST, priorityFrom, readLog, RULE_UNITS, runOnce, saysNothing, shortInWords, takeSnapshot, TRANSACTION_MAX, TRANSACTION_UNITS_MAX, waitingPath, WALLET_LEAST, watch, type Context, type Decide, type LogEntry,
 } from "../src/agent.js";
 import { decodeRulebook, MAX_CONDITIONS, RULEBOOK_LEN, rulebookAddress, type Condition, type Limits, type Split } from "../src/hook.js";
-import { AlreadyRunning, type KeeperContext, type KeeperOutcome } from "../src/keeper/index.js";
+import { AlreadyRunning, Retired, type KeeperContext, type KeeperOutcome } from "../src/keeper/index.js";
 import { launch } from "../src/launch.js";
 import { inPublic, main, plain, serve, type Service } from "./serve.js";
 import { byRote } from "./stand-in.js";
@@ -140,8 +141,8 @@ type Health = {
   ok: boolean;
   problems: string[];
   dryRun: boolean;
-  agent: { on: boolean; address: string | null; last: string | null; errorsInARow: number; lastError: string | null; lastEdictAt: string | null; withoutText: number[] };
-  keeper: { on: boolean; address: string | null; last: string | null; saying: string | null; errorsInARow: number };
+  agent: { on: boolean; address: string | null; last: string | null; errorsInARow: number; lastError: string | null; lastEdictAt: string | null; withoutText: number[]; wallet: { holdsSol: string; needsSol: string; shortSol: string; readAt: string } | null };
+  keeper: { on: boolean; address: string | null; last: string | null; saying: string | null; errorsInARow: number; lostRounds: number };
   records: { log: { bytes: number }; ledger: { bytes: number }; ledgerHead: { bytes: number } };
 };
 const healthOf = async (port: number) => {
@@ -240,6 +241,14 @@ function madeUpChain() {
     asked: new Map<string, { units: number | null; price: number | null; bytes: number; to: string[] }>(),
     /** Called as a transaction arrives, before anything is done with it. */
     onSend: undefined as (() => void) | undefined,
+    /**
+     * What the agent's wallet holds, in lamports: a transaction that lands is charged its fee
+     * out of it, and one it could not pay for is turned away. `walletQuiet`: the node cannot
+     * say what it holds. `walletReads`: how often it was asked.
+     */
+    wallet: LAMPORTS_PER_SOL,
+    walletQuiet: false,
+    walletReads: 0,
     note: () => book.subarray(248, 280).toString("hex"),
     epoch: () => Number(book.readBigUInt64LE(232)),
     /** What the program does with an edict: the term, the shares, the count, the hash and the time. */
@@ -273,6 +282,11 @@ function madeUpChain() {
     getBlockTime: async () => chain.clock,
     getBlockHeight: async () => chain.height,
     getSignaturesForAddress: async () => [],
+    getBalance: async () => {
+      chain.walletReads++;
+      if (chain.walletQuiet) throw new Error("fetch failed: https://rpc.example/?api-key=SECRET");
+      return chain.wallet;
+    },
     getLatestBlockhash: async () => ({ blockhash: Keypair.generate().publicKey.toBase58(), lastValidBlockHeight: chain.height + 150 }),
     sendRawTransaction: async (raw: Buffer) => {
       chain.onSend?.();
@@ -281,12 +295,22 @@ function madeUpChain() {
         chain.next = "lands";
         throw new SendTransactionError({ action: "simulate", signature: "", transactionMessage: "Transaction simulation failed: custom program error: 0xd", logs: [] });
       }
+      // What a node does with a payer that cannot pay the fee, or that paying it would leave with less than a wallet has to keep.
+      const bid = budgetOf(tx);
+      const fee = edictFee(bid.units ?? 0, bid.price ?? 0);
+      const left = chain.wallet - fee;
+      if (left < 0 || (left > 0 && left < WALLET_LEAST)) {
+        throw new SendTransactionError({ action: "simulate", signature: "", transactionMessage: left < 0 ? "Transaction simulation failed: Attempt to debit an account but found no record of a prior credit." : "Transaction simulation failed: Transaction results in an account (0) with insufficient funds for rent", logs: [] });
+      }
       chain.sent.push(base58(tx.signature!));
       const memo = tx.instructions.find((instruction) => instruction.programId.equals(MEMO_PROGRAM));
       if (memo) chain.memos.set(chain.sent.at(-1)!, { text: memo.data.toString("utf8"), signers: memo.keys.filter((key) => key.isSigner).map((key) => key.pubkey.toBase58()) });
-      chain.asked.set(chain.sent.at(-1)!, { ...budgetOf(tx), bytes: raw.length, to: tx.instructions.map((instruction) => instruction.programId.toBase58()) });
+      chain.asked.set(chain.sent.at(-1)!, { ...bid, bytes: raw.length, to: tx.instructions.map((instruction) => instruction.programId.toBase58()) });
       // The edict is the first thing in its transaction that goes to the hook program, whatever stands before and after it.
-      if (chain.next !== "lost") chain.land(tx.instructions.find((instruction) => instruction.programId.equals(hookProgram))!.data);
+      if (chain.next !== "lost") {
+        chain.land(tx.instructions.find((instruction) => instruction.programId.equals(hookProgram))!.data);
+        chain.wallet = left;
+      }
       return chain.sent.at(-1)!;
     },
     confirmTransaction: async () => {
@@ -569,14 +593,45 @@ async function offline() {
   const inDear = carrying(tooDear);
   check(memoUnits(tooDear) > MEMO_UNITS && inDear.memo !== null && affordable(inDear.memo) && cutAtAWord(inDear.memo, tooDear, affordable), `words the Memo program could not afford (reckoned at ${memoUnits(tooDear)} units) are cut after a whole word and closed with an ellipsis: ${inDear.memo?.length} of ${tooDear.length} characters, reckoned at ${memoUnits(inDear.memo ?? "")}`);
   check(inDear.record.memo === inDear.memo && inDear.record.announcement === tooDear && inDear.noted && inDear.signedByAgent, "the record then says what the memo was, next to the announcement whole, and the note is the hash of both");
-  const allSigns = carrying("€".repeat(ANNOUNCEMENT_MAX));
-  const allFaces = carrying("\u{1f642}".repeat(ANNOUNCEMENT_MAX / 2));
-  check(/^€+…$/u.test(allSigns.memo ?? "") && affordable(allSigns.memo!) && !affordable(`€${allSigns.memo}`), `words with no space to cut at are cut where they have to be (${allSigns.memo?.length} characters of ${ANNOUNCEMENT_MAX})`);
-  check(/^\u{1f642}+…$/u.test(allFaces.memo ?? "") && affordable(allFaces.memo!) && !affordable(`\u{1f642}${allFaces.memo}`), `and never through the middle of a character that takes two units (${[...(allFaces.memo ?? "")].length - 1} emoji of ${ANNOUNCEMENT_MAX / 2})`);
+  // Letters that are dear to write: Chinese ones, and letters from far up in Unicode, which take two units each.
+  const [dearLetter, widerLetter] = ["好", "\u{1d400}"];
+  const allLetters = carrying(dearLetter.repeat(ANNOUNCEMENT_MAX));
+  const allWide = carrying(widerLetter.repeat(ANNOUNCEMENT_MAX / 2));
+  check(/^好+…$/u.test(allLetters.memo ?? "") && affordable(allLetters.memo!) && !affordable(`${dearLetter}${allLetters.memo}`), `words with no space to cut at are cut where they have to be (${allLetters.memo?.length} characters of ${ANNOUNCEMENT_MAX})`);
+  check(/^\u{1d400}+…$/u.test(allWide.memo ?? "") && affordable(allWide.memo!) && !affordable(`${widerLetter}${allWide.memo}`), `and never through the middle of a character that takes two units (${[...(allWide.memo ?? "")].length - 1} letters of ${ANNOUNCEMENT_MAX / 2})`);
 
   // Words of which nothing can be kept: every one of them is a sign that closes a word.
   const allDashes = carrying("— ".repeat(60).trim());
-  check(allDashes.memo === null && allDashes.record.memo === "" && allDashes.noted && allDashes.to.join() === programs(BUDGET, BUDGET, aProgram, SystemProgram.programId, aProgram), "where not one word can be kept the transaction has no memo at all, and the record says that too: its memo is the empty text, which is not the same as a record that does not speak of a memo");
+  const noMemo = programs(BUDGET, BUDGET, aProgram, SystemProgram.programId, aProgram);
+  check(allDashes.memo === null && allDashes.record.memo === "" && allDashes.noted && allDashes.to.join() === noMemo, "where not one word can be kept the transaction has no memo at all, and the record says that too: its memo is the empty text, which is not the same as a record that does not speak of a memo");
+
+  // An announcement that has words, and opens with signs so dear that the cut falls before the first word.
+  const sentence = "Max Buy · 1% is on for 30 minutes. Selling is never restricted.";
+  const signsFirst = [`${"\u{1f680}".repeat(20)} ${sentence}`, `${"”".repeat(30)} ${sentence}`, `${"€".repeat(40)} ${sentence}`, "\u{1f642}".repeat(ANNOUNCEMENT_MAX / 2), "€".repeat(ANNOUNCEMENT_MAX)];
+  const cutToSigns = signsFirst.map((text) => carrying(text));
+  /** The signs `text` opens with, as many as the Memo program could afford with an ellipsis after them: what such a cut leaves. */
+  const signsLeft = (text: string) => {
+    let kept = "";
+    for (const sign of text) {
+      if (!saysNothing(sign) || !affordable(`${kept}${sign}…`)) break;
+      kept += sign;
+    }
+    return kept;
+  };
+  const leftovers = signsFirst.map(signsLeft);
+  check(
+    signsFirst.every((text, i) => !affordable(text) && leftovers[i].length > 0 && saysNothing(`${leftovers[i]}…`)) && signsFirst.slice(0, 3).every((text) => !saysNothing(text)),
+    `an announcement that opens with dear signs is cut before its first word: of twenty rockets and a sentence the Memo program could afford ${[...leftovers[0]].length} rockets and an ellipsis, and of thirty curly quotes ${[...leftovers[1]].length}`,
+  );
+  check(
+    cutToSigns.every((one) => one.memo === null && one.record.memo === "" && one.said.memo === "" && one.noted && one.to.join() === noMemo && one.asked.units === edictUnits("", true) && one.said.units === one.asked.units),
+    `what is left then says nothing, by the test an announcement is held to, so it is sent as no memo: the transaction has no Memo instruction, the record's memo is the empty text and the note is the hash of that record, and it asks for the ${edictUnits("", true)} units of an edict that carries no words`,
+  );
+  check(cutToSigns.every((one, i) => one.record.announcement === signsFirst[i]) && memoInWords(signsFirst[0], cutToSigns[0].said.memo) === "memo: none, not one word of the announcement fits", "the record still holds the announcement whole, and a line of the log says of the memo: none, not one word of the announcement fits");
+  // A few dear signs in front of words that fit are no reason to drop anything.
+  const fewSigns = carrying(`${"\u{1f680}".repeat(3)} ${sentence}`);
+  const signsThenWords = carrying(`${"”".repeat(5)} ${"Max Buy is on. ".repeat(14)}${"“—” ".repeat(40)}`.slice(0, ANNOUNCEMENT_MAX).trim());
+  check(fewSigns.memo === `${"\u{1f680}".repeat(3)} ${sentence}` && !!signsThenWords.memo?.endsWith("…") && signsThenWords.memo.includes("Max Buy is on") && signsThenWords.record.memo === signsThenWords.memo, "a memo that has words in it goes as before: whole when it fits, and cut at a word when it does not, whatever signs it opens with");
 
   // What the model is told about the allowance: twenty curly quotes and dashes, or a dozen emoji, in an announcement of full length.
   const among =(sign: string, count: number) => `${`${sign} `.repeat(count)}${"Plain words, and nothing else. ".repeat(8)}`.slice(0, ANNOUNCEMENT_MAX);
@@ -597,7 +652,7 @@ async function offline() {
   // -------------------------------------------------------------------------------------------
   console.log("what an edict asks of the network, and what it bids (the same transactions, and a few more)");
 
-  const made = { inPlain, inType, inHeavy, inDear, allSigns, allFaces, allDashes, inLong, fullRule };
+  const made = { inPlain, inType, inHeavy, inDear, allLetters, allWide, allDashes, inLong, fullRule, fewSigns, signsThenWords, ...Object.fromEntries(cutToSigns.map((one, i) => [`cutToSigns${i}`, one])) };
   const asWritten = (one: ReturnType<typeof carrying>, price: number, renames = true) =>
     one.asked.units === edictUnits(one.memo ?? "", renames) && one.asked.price === (price > 0 ? price : null) && one.said.units === one.asked.units && one.said.bytes === one.bytes && one.said.memo === (one.memo ?? "") && one.said.feeLamports === edictFee(one.said.units, price);
   check(Object.values(made).every((one) => asWritten(one, PRIORITY_MICROLAMPORTS)), `every transaction above asks for exactly what its own memo is reckoned at, ${RULE_UNITS} for the rule, ${NAME_UNITS} for the change of name and a tenth on top, and bids ${PRIORITY_MICROLAMPORTS} micro-lamports for each unit; what the agent's code says of each (its memo, its bytes, its units, its fee) is what the signed bytes hold`);
@@ -687,6 +742,15 @@ async function offline() {
   const wordless: string[] = [];
   for (const nothing of ["", "  \n ", "… — !?", "\u{1f642}\u{1f680}"]) wordless.push(await failure(runOnce(saying(nothing))).then((error) => error?.message ?? "it went through"));
   check(wordless.every((message) => message === "the decision cannot be used: the announcement has no words in it, and it has to tell holders which hooks are on and for how long") && inked.epoch() === 2 && inked.sent.length === 2 && readLog(inkedLog).length === 2 && !existsSync(waitingPath(inkedLog)), "a look whose announcement says nothing (empty, only spaces, only punctuation, only emoji) is dropped before anything is built, and leaves no trace");
+
+  // An announcement that does say something, and whose memo would have been rockets and an ellipsis.
+  const rehearsedSigns = await runOnce({ ...saying(signsFirst[0]), dryRun: true });
+  outcome = await runOnce(saying(signsFirst[0]));
+  penned = readLog(inkedLog)[2];
+  const pennedSent = inked.asked.get(penned?.signature ?? "");
+  check(outcome.status === "rewritten" && outcome.memo === "" && outcome.announcement === signsFirst[0] && penned.record.memo === "" && penned.record.announcement === signsFirst[0] && inked.epoch() === 3, "a look whose words would be cut down to signs and an ellipsis goes through all the same: the edict lands, and its record keeps the announcement whole and says there is no memo");
+  check(!inked.memos.has(penned.signature!) && pennedSent?.to.join() === programs(BUDGET, BUDGET, inked.hookProgram) && pennedSent.units === edictUnits("", false) && penned.note === inked.note() && (await hashOf(penned.record)) === inked.note(), `its transaction has no Memo instruction and asks for the ${edictUnits("", false)} units of an edict without one, and the note on chain is the hash of that record, as the page's own code finds`);
+  check(rehearsedSigns.status === "rewritten" && outcome.status === "rewritten" && rehearsedSigns.memo === "" && JSON.stringify(rehearsedSigns.transaction) === JSON.stringify(outcome.transaction) && memoInWords(rehearsedSigns.announcement, rehearsedSigns.memo) === "memo: none, not one word of the announcement fits", "and a dry run says so beforehand: no memo, and the same transaction to the byte");
 
   // -------------------------------------------------------------------------------------------
   console.log("what the model is told, and an answer that says nothing (the agent's own askClaude, with a scripted model in Claude's place)");
@@ -901,28 +965,36 @@ async function offline() {
   console.log("a rehearsal (the service in a dry run, on a chain in memory)");
 
   const stage = madeUpChain();
+  // As on the host before the launch: the agent's wallet has not been sent its SOL yet.
+  stage.wallet = 0;
   const dirR = folder();
   const staged: string[] = [];
-  // Each edict it would issue would stand for a second, and every other one says more than the chain can afford.
+  // Each edict it would issue would stand for a second. The second says more than the chain can afford, and the third opens with signs it cannot afford at all.
   const brief = byRote({ minutes: 1 / 60, keepName: true });
   let turns = 0;
   const rehearsal = await serve({
     env: { DATA_DIR: dirR, PORT: "0", RPC_URL: "http://127.0.0.1:9", HOOK_PROGRAM: stage.hookProgram.toBase58(), MINT: stage.mint.toBase58(), POOL: address(), AGENT_KEYPAIR_JSON: keyJson(stage.agent), KEEPER_OFF: "1", DRY_RUN: "1", AGENT_POLL_SECS: "0.1", AGENT_THINK_EVERY_SECS: "0.2" },
     connection: stage.connection,
     dbc: stage.dbc,
-    decide: async (snapshot, book) => ({ ...(await brief(snapshot, book)), announcement: turns++ % 2 ? tooDear : plainWords }),
+    decide: async (snapshot, book) => ({ ...(await brief(snapshot, book)), announcement: [plainWords, tooDear, signsFirst[0]][turns++ % 3] }),
     print: (line) => void staged.push(line),
   });
   // Its lines without the time in front, and with the size of the transaction, which depends on the rule, set apart.
   const would = () => staged.filter((line) => line.includes("agent: would issue an edict")).map((line) => line.slice(line.indexOf("agent: ")));
-  await until("in a dry run the service says what it would issue, look after look", () => would().length >= 2, 15);
-  const [wholeLine, cutLineDry] = [would()[0] ?? "", would()[1] ?? ""];
+  await until("in a dry run the service says what it would issue, look after look", () => would().length >= 3, 20);
+  const [wholeLine, cutLineDry, noMemoLine] = [would()[0] ?? "", would()[1] ?? "", would()[2] ?? ""];
   const sized = (line: string) => Number(line.match(/transaction: (\d+) bytes/)?.[1] ?? 0);
   const unsized = (line: string) => line.replace(/transaction: \d+ bytes/, "transaction: N bytes");
   check(unsized(wholeLine) === `agent: would issue an edict (dry run, nothing sent): ${plainWords} [memo: the announcement, whole; transaction: N bytes, 118,140 compute units, fee 0.000010907 SOL]` && sized(wholeLine) > bytesOf(plainWords) + 200 && sized(wholeLine) <= TRANSACTION_MAX, `its line says that the memo would be the announcement whole, and what the transaction it built comes to: ${wholeLine.replace(plainWords, "(the announcement)")}`);
   check(unsized(cutLineDry) === `agent: would issue an edict (dry run, nothing sent): ${tooDear} [memo, cut to the first ${(inDear.memo?.length ?? 0) - 1} of ${tooDear.length} characters: ${inDear.memo}; transaction: N bytes, 388,806 compute units, fee 0.000024441 SOL]` && sized(cutLineDry) > 0 && sized(cutLineDry) <= TRANSACTION_MAX, `and of words the chain could not afford whole, that the memo would be cut and to what: ${cutLineDry.replace(tooDear, "(the announcement)").replace(inDear.memo ?? "", "(the memo)")}`);
+  check(unsized(noMemoLine) === `agent: would issue an edict (dry run, nothing sent): ${signsFirst[0]} [memo: none, not one word of the announcement fits; transaction: N bytes, 5,500 compute units, fee 0.000005275 SOL]` && sized(noMemoLine) > 0 && sized(noMemoLine) < sized(wholeLine), `and of words that would be cut down to signs, that there would be no memo at all: ${noMemoLine.replace(signsFirst[0], "(the announcement)")}`);
   health = await healthOf(rehearsal.port);
   check(health.body.dryRun && health.body.agent.on && stage.sent.length === 0 && stage.epoch() === 0 && !existsSync(join(dirR, "agent-log.jsonl")) && staged.some((line) => line.endsWith("agent: an edict bids 50,000 micro-lamports for each compute unit it asks for (AGENT_PRIORITY_MICROLAMPORTS), and pays the network at most 0.0000259 SOL")), "nothing was sent and nothing was written, and with no setting the service says it would bid 50,000 micro-lamports a unit");
+  // The wallet in a dry run: said, and no more.
+  const stagedWallet = staged.filter((line) => line.includes("needs topping up"));
+  const dryWalletLine = `agent: my wallet ${stage.agent.publicKey.toBase58()} needs topping up before this is for real: it holds 0 SOL and has to hold 0.00091678 SOL for me to be sure of paying for an edict: 0.0000259 SOL for the dearest edict there can be at the price I bid, and the 0.00089088 SOL a wallet has to keep. It is 0.00091678 SOL short. A dry run goes on all the same; for real I would ask the model nothing until SOL arrives.`;
+  check(stagedWallet.length === 1 && stagedWallet[0].endsWith(dryWalletLine) && staged.indexOf(stagedWallet[0]) < staged.findIndex((line) => line.includes("agent: would issue an edict")) && turns >= 3, `with an empty wallet a dry run only says what it would do: once in ${turns} looks, before its first edict, and the looks go ahead (${dryWalletLine.replace(stage.agent.publicKey.toBase58(), "(the address)")})`);
+  check(health.status === 200 && health.body.ok && health.body.problems.length === 0 && health.body.agent.wallet?.shortSol === "0.00091678" && health.body.agent.wallet.holdsSol === "0" && health.body.agent.last !== "short", "/health does not list it in a dry run and answers 200; the agent's entry shows how much is short all the same");
   await rehearsal.stop();
 
   // -------------------------------------------------------------------------------------------
@@ -970,6 +1042,267 @@ async function offline() {
   pace.agent.publicKey.toBuffer().copy(pace.book, 72);
   await loop.stop();
   check(loop.asks() === 1 && count(loop.events, "held") === 1, "all of it without the model being asked again");
+
+  // -------------------------------------------------------------------------------------------
+  console.log("the agent's own wallet (the agent's own code, on a chain in memory)");
+
+  const purse = madeUpChain();
+  const purseLog = join(folder(), "agent-log.jsonl");
+  const purseModel = { asked: 0, holds: false };
+  const purseCtx: Context = {
+    connection: purse.connection, dbc: purse.dbc, hookProgram: purse.hookProgram, mint: purse.mint, pool: Keypair.generate().publicKey, agent: purse.agent, logPath: purseLog,
+    decide: async (snapshot, book) => {
+      purseModel.asked++;
+      return purseModel.holds ? { action: "hold", reasoning: "Nothing to change.", model: "stand-in" } : rote(snapshot, book);
+    },
+  };
+  const needs = lamportsForAnEdict(PRIORITY_MICROLAMPORTS);
+  check(WALLET_LEAST === 890_880 && needs === edictFee(EDICT_UNITS_MOST, PRIORITY_MICROLAMPORTS) + WALLET_LEAST && needs === 916_780 && lamportsForAnEdict(1_000_000) === 1_313_880 && lamportsForAnEdict(0) === 895_880, `to be sure of paying for an edict the agent's wallet has to hold the fee of the dearest edict there can be and the ${WALLET_LEAST} lamports a wallet has to keep: ${needs} lamports (${inSol(needs)} SOL) at the price it bids with no setting, and ${inSol(lamportsForAnEdict(1_000_000))} SOL with the setting at 1000000`);
+
+  purse.wallet = needs - 1;
+  let look = await runOnce(purseCtx);
+  check(look.status === "short" && look.funds.holds === needs - 1 && look.funds.needs === needs && purseModel.asked === 0 && purse.walletReads === 1, "one lamport short of that, a look at which an edict is due ends before the model is asked, and says what the wallet holds and what it has to hold");
+  check(purse.sent.length === 0 && purse.epoch() === 0 && !existsSync(purseLog) && !existsSync(waitingPath(purseLog)), "nothing is sent and nothing is written down: such a look leaves no trace");
+  purse.wallet = 0;
+  look = await runOnce(purseCtx);
+  purse.wallet = needs;
+  const atLaunchPrice = await runOnce({ ...purseCtx, priorityMicroLamports: 1_000_000 });
+  check(look.status === "short" && look.funds.holds === 0 && atLaunchPrice.status === "short" && atLaunchPrice.funds.holds === needs && atLaunchPrice.funds.needs === 1_313_880 && purseModel.asked === 0, "an empty wallet ends the look the same way, and so does a wallet that would do at the usual price once the setting says 1000000: what it has to hold is reckoned at the price in force");
+  look = await runOnce(purseCtx);
+  check(look.status === "rewritten" && look.signature === purse.sent[0] && look.funds?.holds === needs && look.funds.needs === needs && purseModel.asked === 1 && purse.epoch() === 1 && purse.wallet === needs - look.transaction.feeLamports && purse.wallet >= WALLET_LEAST, `with exactly what it has to hold the look goes ahead: the model is asked and the edict lands, leaving the wallet ${purse.wallet} lamports, which is above what it has to keep`);
+
+  const readsSoFar = purse.walletReads;
+  const standing = await runOnce(purseCtx, { letRuleRun: true });
+  purse.clock += 1_900;
+  const leftAlone = await runOnce(purseCtx, { ask: false });
+  purse.book[2] = 1;
+  const stoppedByGuardian = await runOnce(purseCtx);
+  purse.book[2] = 0;
+  check(standing.status === "in-force" && leftAlone.status === "resting" && stoppedByGuardian.status === "paused" && purse.walletReads === readsSoFar && purseModel.asked === 1, "the wallet is read only before a look that would ask the model: not while an edict stands, not while the model is being left alone, not during a pause");
+
+  // A node that cannot say what the wallet holds. That is not a wallet with nothing in it, and it stops nothing.
+  purse.walletQuiet = true;
+  purse.wallet = LAMPORTS_PER_SOL;
+  look = await runOnce(purseCtx);
+  check(look.status === "rewritten" && look.funds === undefined && purse.epoch() === 2 && purseModel.asked === 2 && purse.walletReads === readsSoFar + 1, "a balance the node cannot give is not taken for an empty wallet: the look goes ahead and the edict lands, with nothing said of the wallet");
+  purse.clock += 1_900;
+  purse.wallet = 0;
+  const turnedAway = await failure(runOnce(purseCtx));
+  check(turnedAway instanceof SendTransactionError && purseModel.asked === 3 && purse.epoch() === 2 && purse.sent.length === 2 && !existsSync(waitingPath(purseLog)), "nor is anything made up when the wallet really is empty and the node cannot say so: the look goes ahead as it always did, and it is the node that turns the edict away");
+  purse.walletQuiet = false;
+
+  const logSoFar = readFileSync(purseLog, "utf8");
+  const rehearsedEmpty = await runOnce({ ...purseCtx, dryRun: true });
+  check(rehearsedEmpty.status === "rewritten" && rehearsedEmpty.signature === null && rehearsedEmpty.funds?.holds === 0 && rehearsedEmpty.funds.needs === needs && purseModel.asked === 4 && purse.sent.length === 2 && readFileSync(purseLog, "utf8") === logSoFar, "a dry run with an empty wallet goes ahead, since it sends nothing: it asks the model, builds the edict, and carries what the wallet held, so that whoever runs it can say what would happen for real");
+  purse.wallet = LAMPORTS_PER_SOL;
+  purseModel.holds = true;
+  look = await runOnce(purseCtx);
+  purseModel.holds = false;
+  check(look.status === "held" && look.funds?.holds === LAMPORTS_PER_SOL && look.funds.needs === needs && shortInWords({ holds: 4_000, needs }) === "it holds 0.000004 SOL and has to hold 0.00091678 SOL for me to be sure of paying for an edict: 0.0000259 SOL for the dearest edict there can be at the price I bid, and the 0.00089088 SOL a wallet has to keep. It is 0.00091278 SOL short", "a look that issues nothing carries what the wallet held as well; and a wallet that holds too little is put in words to the lamport");
+
+  // The loop. The model would be left alone for an hour after a look that issued nothing, so an edict within seconds shows that a short wallet rests nothing.
+  purse.wallet = needs - 1;
+  const purseEvents: string[] = [];
+  const purseHalt = new AbortController();
+  const askedSoFarOfPurse = purseModel.asked;
+  const purseLoop = watch(purseCtx, { pollSecs: 0.05, thinkEverySecs: 3_600, signal: purseHalt.signal, report: (event) => void purseEvents.push(event.status) });
+  await sleep(600);
+  const shortPolls = purseEvents.length;
+  check(shortPolls >= 5 && purseEvents.every((status) => status === "short") && purseModel.asked === askedSoFarOfPurse && purse.epoch() === 2, `in the agent's loop a wallet that holds too little is found again at every poll (${shortPolls} of them), and the model is asked nothing meanwhile`);
+  purse.wallet = LAMPORTS_PER_SOL;
+  const toppedUpAt = Date.now();
+  await until("when SOL arrives the agent goes on by itself: the next poll asks the model, and the edict goes out", () => purse.epoch() === 3, 5);
+  const tookMs = Date.now() - toppedUpAt;
+  purseHalt.abort();
+  await purseLoop;
+  check(tookMs < 2_000 && purseModel.asked === askedSoFarOfPurse + 1 && count(purseEvents, "rewritten") === 1 && count(purseEvents, "error") === 0 && count(purseEvents, "resting") === 0, `within ${tookMs} ms of the top-up, with one call to the model and no error along the way`);
+
+  // -------------------------------------------------------------------------------------------
+  console.log("the same through the service: what its log and /health say of the agent's wallet");
+
+  const WALLET_LINE = "the agent's wallet needs topping up";
+  const vault = madeUpChain();
+  vault.wallet = 0;
+  const vaultSaid: string[] = [];
+  let vaultAsked = 0;
+  const v = await serve({
+    env: {
+      DATA_DIR: folder(), PORT: "0", RPC_URL: "http://127.0.0.1:9", HOOK_PROGRAM: vault.hookProgram.toBase58(), MINT: vault.mint.toBase58(), POOL: address(), AGENT_KEYPAIR_JSON: keyJson(vault.agent),
+      AGENT_POLL_SECS: "0.1", AGENT_THINK_EVERY_SECS: "3600", KEEPER_OFF: "1", AGENT_PRIORITY_MICROLAMPORTS: "1000000",
+    },
+    connection: vault.connection,
+    dbc: vault.dbc,
+    decide: async (snapshot, book) => (vaultAsked++, rote(snapshot, book)),
+    print: (line) => void vaultSaid.push(line),
+  });
+  const vNow = () => healthOf(v.port);
+  const vaultAddress = vault.agent.publicKey.toBase58();
+  const saidOfVault = () => vaultSaid.filter((line) => line.includes("needs topping up"));
+  await until("an agent whose wallet is empty when an edict is due turns /health to 503", async () => (await vNow()).status === 503, 5);
+  await sleep(1_000);
+  health = await vNow();
+  check(health.status === 503 && !health.body.ok && JSON.stringify(health.body.problems) === JSON.stringify([WALLET_LINE]), `with one line among its problems, exactly "${WALLET_LINE}", and nothing about a loop that keeps failing`);
+  check(health.body.agent.on && health.body.agent.last === "short" && health.body.agent.errorsInARow === 0 && health.body.agent.address === vaultAddress && health.body.agent.wallet?.holdsSol === "0" && health.body.agent.wallet.needsSol === "0.00131388" && health.body.agent.wallet.shortSol === "0.00131388" && !Number.isNaN(Date.parse(health.body.agent.wallet.readAt)), `the agent's own entry gives the address to send to and how much is short: ${JSON.stringify(health.body.agent.wallet)}`);
+  const shortLine = `agent: my wallet ${vaultAddress} needs topping up: it holds 0 SOL and has to hold 0.00131388 SOL for me to be sure of paying for an edict: 0.000423 SOL for the dearest edict there can be at the price I bid, and the 0.00089088 SOL a wallet has to keep. It is 0.00131388 SOL short. I ask the model nothing until SOL arrives, and go on by myself once it has.`;
+  check(saidOfVault().length === 1 && saidOfVault()[0].endsWith(shortLine) && vault.walletReads >= 5 && vaultAsked === 0 && vault.sent.length === 0 && !vaultSaid.some((line) => line.includes("agent: error")), `the log says so once in ${vault.walletReads} polls, and the model is asked nothing: ${shortLine.replace(vaultAddress, "(the address)")}`);
+
+  vault.wallet = 1_000_000;
+  await until("a top-up that is not enough is said once more, with the new figures", async () => saidOfVault().length === 2 && saidOfVault()[1].includes("it holds 0.001 SOL") && saidOfVault()[1].includes("It is 0.00031388 SOL short.") && (await vNow()).body.agent.wallet?.shortSol === "0.00031388", 5);
+  health = await vNow();
+  check(health.status === 503 && health.body.problems.includes(WALLET_LINE) && vaultAsked === 0, "and /health goes on answering 503");
+
+  vault.wallet = 50_000_000;
+  const vaultToppedUpAt = Date.now();
+  await until("when enough SOL arrives the agent goes on by itself at the next poll: it asks the model and issues its edict", () => vault.epoch() === 1 && vaultAsked === 1, 5);
+  const vaultTookMs = Date.now() - vaultToppedUpAt;
+  await until("and /health answers 200 again, with nothing among its problems", async () => {
+    const now = await vNow();
+    return now.status === 200 && now.body.ok && now.body.problems.length === 0;
+  }, 5);
+  health = await vNow();
+  check(vaultTookMs < 2_000 && health.body.agent.wallet?.holdsSol === "0.05" && health.body.agent.wallet.shortSol === "0" && health.body.agent.lastEdictAt !== null && saidOfVault().length === 2, `(${vaultTookMs} ms after the top-up.) Its entry now shows what the wallet held when that edict was decided, with nothing short, and the log has no more to say of it`);
+
+  // A node that cannot say what the wallet holds, at a look where the wallet is in fact under what the agent asks for.
+  vault.wallet = 1_200_000;
+  vault.walletQuiet = true;
+  vault.clock += 1_900;
+  await until("a node that cannot say what the wallet holds stops nothing: the look goes ahead, and the edict, a cheap one that this wallet can pay for, lands", () => vault.epoch() === 2 && vaultAsked === 2, 5);
+  health = await vNow();
+  check(health.status === 200 && !health.body.problems.includes(WALLET_LINE) && health.body.agent.wallet?.holdsSol === "0.05", "/health does not take the node's silence for an empty wallet: nothing is listed, and the entry keeps the last figures it was given");
+  vault.walletQuiet = false;
+  vault.clock += 1_900;
+  await until("once the node answers again the wallet is found short at the next look, listed, and said in the log with what it now holds", async () => {
+    const now = await vNow();
+    return now.status === 503 && now.body.problems.includes(WALLET_LINE) && saidOfVault().length === 3 && saidOfVault()[2].includes(`it holds ${inSol(vault.wallet)} SOL`);
+  }, 5);
+  check(vaultAsked === 2 && vault.epoch() === 2, "with the model left alone");
+  await v.stop();
+
+  // -------------------------------------------------------------------------------------------
+  console.log("the keeper's transactions, round after round, never getting into a block");
+
+  const LOST_LINE = "the keeper's transactions are not landing";
+  const stillDue: KeeperOutcome = { status: "waiting", reason: "nothing is due: 0.3 SOL of fees wait in the pool (I claim at 0.05 SOL), and I hold 0 SOL for the treasury, 0 SOL to buy back with and 0 SOL for holders" };
+  type Step = (keeper: KeeperContext) => KeeperOutcome;
+  const script: Step[] = [];
+  let roundsTaken = 0;
+  const lostSaid: string[] = [];
+  const l = await serve({
+    env: { DATA_DIR: folder(), PORT: "0", RPC_URL: "http://127.0.0.1:9/?api-key=SECRET", HOOK_PROGRAM: address(), MINT: address(), POOL: address(), TREASURY: address(), AGENT_OFF: "1", KEEPER_KEYPAIR_JSON: keyJson(Keypair.generate()), KEEPER_EVERY_SECS: "0.05" },
+    round: async (keeper) => {
+      roundsTaken++;
+      const step = script.shift();
+      return step ? step(keeper) : stillDue;
+    },
+    print: (line) => void lostSaid.push(line),
+  });
+  const lNow = () => healthOf(l.port);
+  /** Has the keeper take these rounds, in order, and waits for the round after them to start: by then the last of them has been counted. */
+  const rounds = async (...steps: Step[]) => {
+    const done = roundsTaken + steps.length + 1;
+    script.push(...steps);
+    for (let i = 0; i < 400 && roundsTaken < done; i++) await sleep(25);
+  };
+  // A signature as the keeper prints one.
+  const signed = () => base58(Keypair.generate().secretKey);
+  /** A round whose claim, payment to the treasury or buyback ran out of time, in the keeper's words, and that ends as such a round does. */
+  const losing = (what: string): Step => (keeper) => {
+    keeper.report?.(`my ${what} ${signed()} never landed and no longer can: nothing moved, and I start it again`);
+    return stillDue;
+  };
+  /** A round whose payout was signed three times and never taken, and which closed with everybody put off. */
+  const payoutLost: Step = (keeper) => {
+    for (let i = 0; i < 3; i++) keeper.report?.(`transaction ${signed()} expired`);
+    const closing = "paid 0 holders 0 SOL in 0 transactions (round 1); 12 put off to the next round";
+    keeper.report?.(closing);
+    return { status: "settled", did: [closing] };
+  };
+  /** A round that did this, and said so. */
+  const did = (line: string): Step => (keeper) => {
+    keeper.report?.(line);
+    return { status: "settled", did: [line] };
+  };
+
+  await until("(the keeper is taking its rounds)", async () => roundsTaken > 0 && (await lNow()).body.keeper.on, 5);
+  await rounds(losing("claim"), losing("claim"));
+  health = await lNow();
+  check(health.status === 200 && health.body.ok && health.body.keeper.lostRounds === 2 && health.body.keeper.last === "waiting", "two rounds whose claim never got into a block: /health still answers 200, and its entry for the keeper counts them");
+  await sleep(300);
+  check((await lNow()).body.keeper.lostRounds === 2 && (await lNow()).status === 200, "rounds that send nothing leave the count where it was");
+  await rounds(losing("buyback"));
+  health = await lNow();
+  check(health.status === 503 && !health.body.ok && JSON.stringify(health.body.problems) === JSON.stringify([LOST_LINE]) && health.body.keeper.lostRounds === 3, `after the third, /health answers 503 with one line among its problems, exactly "${LOST_LINE}"`);
+  check(health.body.keeper.on && health.body.keeper.errorsInARow === 0 && health.body.keeper.last === "waiting" && health.body.keeper.saying === stillDue.reason, "though no round failed, and the keeper's last word is still that nothing is due, with more waiting in the pool than it claims at");
+  const saidNotLanding = () => lostSaid.filter((line) => line.includes("keeper: its transactions are not landing"));
+  const notLandingLine = `keeper: its transactions are not landing: 3 rounds have ended with one that never got into a block, and none has landed in between. Nothing is lost by it: what did not go through is still owed, and is tried again. If trades on the pool are going through meanwhile, what it bids is too low for the day: that is "microLamportsPerUnit" in KEEPER_SETTINGS.`;
+  check(saidNotLanding().length === 1 && saidNotLanding()[0].endsWith(notLandingLine) && lostSaid.filter((line) => line.includes("never landed and no longer can")).length === 3, `the log, which has the keeper's own three lines, says so once: ${notLandingLine}`);
+  await rounds(losing("claim"));
+  await sleep(300);
+  health = await lNow();
+  check(health.status === 503 && health.body.problems.includes(LOST_LINE) && health.body.keeper.lostRounds === 4 && saidNotLanding().length === 1, "it stays listed through more rounds like those, and through rounds that send nothing, and is not said again");
+  await rounds(did(`claimed 0.3 SOL of fees from the pool, counted to edict 4: 0.12 SOL for the treasury, 0.09 SOL to buy back with, 0.09 SOL for holders (${signed()})`));
+  health = await lNow();
+  check(health.status === 200 && health.body.problems.length === 0 && health.body.keeper.lostRounds === 0 && lostSaid.filter((line) => line.endsWith("keeper: its transactions are landing again")).length === 1, "the next round that lands something takes it off the list: /health answers 200, and the log says the transactions are landing again");
+
+  // The holders' payments say it in other words, and a round can end badly after losing one.
+  await rounds(payoutLost, payoutLost, (keeper) => {
+    losing("payment to the treasury")(keeper);
+    throw new Error("fetch failed");
+  });
+  health = await lNow();
+  check(health.status === 503 && JSON.stringify(health.body.problems) === JSON.stringify([LOST_LINE]) && health.body.keeper.lostRounds === 3 && saidNotLanding().length === 2, "a payout signed three times and never taken is such a round too, and closing it with everybody put off lands nothing; so is a round that loses a transaction and then fails");
+  await rounds(did("paid 12 holders 0.09 SOL in 1 transaction (round 2)"));
+  const afterPayout = await lNow();
+  const ended: number[] = [afterPayout.body.keeper.lostRounds];
+  for (const line of [`sent the treasury 0.12 SOL (${signed()})`, `bought back 1,234.5 VELUNO for 0.09 SOL and burned them (${signed()})`]) {
+    await rounds(losing("claim"), losing("claim"), did(line));
+    ended.push((await lNow()).body.keeper.lostRounds);
+  }
+  // A payout of which a part got through: one batch expired, another landed.
+  await rounds(losing("claim"), losing("claim"), (keeper) => {
+    keeper.report?.(`transaction ${signed()} expired`);
+    return did("paid 8 holders 0.06 SOL in 1 transaction (round 3); 4 put off to the next round")(keeper);
+  });
+  ended.push((await lNow()).body.keeper.lostRounds);
+  check(afterPayout.status === 200 && ended.join() === "0,0,0,0" && (await lNow()).status === 200, "a payout that reaches holders ends the count, and so do a payment to the treasury, a buyback, and a round in which one payment was lost and another landed: something got into a block");
+
+  // What the keeper says of other troubles, which are not this one.
+  const others = [
+    `A node tells me my claim ${signed()} never landed, and the chain shows that it did: fees have left the pool that my books do not have. I sign nothing in its place until a node that knows the transaction answers.`,
+    `A node tells me 2 transactions of round 3 never landed (${signed()} for one), and my wallet holds less than my journal accounts for: 5 lamports where it should hold at least 9. I sign nothing in their place until a node that knows those transactions answers.`,
+    `my claim ${signed()} failed on the chain (custom program error: 0x1): it cost its network fee and moved nothing`,
+    `transaction ${signed()} failed: custom program error: 0x1`,
+    "my claim did not pass its rehearsal (the price moved): nothing was sent",
+    "would claim 0.3 SOL of fees from the pool (0.3 SOL of fees are waiting in the pool)",
+    "paid 0 holders 0 SOL in 0 transactions (round 4); 12 put off to the next round",
+    "credited 0.09 SOL to 12 holders, by what each held at slot 5, before my claim",
+  ];
+  await rounds(losing("claim"), losing("claim"));
+  await rounds(...others.map((line): Step => (keeper) => {
+    keeper.report?.(line);
+    return { status: "waiting", reason: line };
+  }));
+  health = await lNow();
+  check(health.status === 200 && health.body.keeper.lostRounds === 2, `${others.length} other things the keeper says neither add to the count nor end it: a node whose word the chain contradicts, a transaction that failed in a block, a rehearsal, a round that paid nobody, a credit`);
+
+  const [roundSource, holdersSource, simSource] = ["../src/keeper/round.ts", "../src/keeper/holders.ts", "./keeper-sim.ts"].map((file) => readFileSync(new URL(file, import.meta.url), "utf8"));
+  check(
+    roundSource.includes("never landed and no longer can: nothing moved, and I start it again`") && holdersSource.includes("`transaction ${fate.signature} ${fate.outcome}") && holdersSource.includes(`outcome: "expired"`)
+      && simSource.includes("never landed and no longer can: nothing moved, and I start it again$/") && simSource.includes("/^transaction \\S+ expired$/"),
+    "those are still the keeper's words for a transaction that never got into a block, and its own checks (npm run test:keeper) hold it to them",
+  );
+  check(["say(run, `claimed ${", "say(run, `sent the treasury ${", "say(run, `bought back ${", "say(run, `paid ${line.payments} holder"].every((start) => roundSource.includes(start)), "and still its words for one that did");
+
+  // A keeper the guardian has replaced sends nothing more: nothing of its is listed as not landing.
+  await rounds(losing("claim"));
+  health = await lNow();
+  const retiredAs = "the rulebook names 8hAD as the keeper, not my key 9Zwp: I have paid out what my books owed and stopped for good. The last line of my ledger says what was left.";
+  script.push(() => { throw new Retired(retiredAs); });
+  await until("a keeper that has finished is listed as that, and no longer as one whose transactions are not landing", async () => {
+    const now = await lNow();
+    return health.body.problems.includes(LOST_LINE) && now.status === 503 && JSON.stringify(now.body.problems) === JSON.stringify([`the keeper has finished and no keeper runs here now: ${retiredAs}`]) && now.body.keeper.lostRounds === 0;
+  }, 5);
+  await l.stop();
 
   // -------------------------------------------------------------------------------------------
   console.log("a log that another token used first");
@@ -1275,6 +1608,10 @@ async function onValidator() {
   let health = await healthOf(port);
   check(health.status === 200 && health.body.ok && health.body.agent.on && health.body.keeper.on, `/health is green: ${JSON.stringify(health.body.problems)}`);
   check(health.body.agent.address === agent.publicKey.toBase58() && health.body.keeper.address === keeper.publicKey.toBase58() && health.body.agent.lastEdictAt !== null, "with the two addresses the rulebook names");
+  // The agent read its own wallet from the node before it asked for that edict: a whole SOL, less nothing yet.
+  const purseSeen = health.body.agent.wallet;
+  check(purseSeen !== null && Number(purseSeen.holdsSol) > 0.99 && Number(purseSeen.holdsSol) <= 1 && purseSeen.needsSol === inSol(lamportsForAnEdict(PRIORITY_MICROLAMPORTS)) && purseSeen.shortSol === "0" && !health.body.problems.includes("the agent's wallet needs topping up"), `and what the agent's wallet held when it last looked, read from the node: ${purseSeen?.holdsSol} SOL, of the ${purseSeen?.needsSol} SOL an edict can take, so nothing is short`);
+  check(!health.body.problems.includes("the keeper's transactions are not landing") && health.body.keeper.lostRounds < 3, `on a network that takes what the keeper sends, nothing is said of its transactions not landing (${health.body.keeper.lostRounds} rounds ended with one lost)`);
 
   const chainNote = async () => pageRulebook(new Uint8Array((await connection.getAccountInfo(book, "confirmed"))!.data)).note;
   const pageLog = await pageReadLog(at("/log.jsonl"));

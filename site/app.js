@@ -93,6 +93,103 @@ const bold = (text) => {
 
 const separated = (parts) => parts.flatMap((part, i) => (i ? [" · ", part] : [part]));
 
+/** An edict's transaction as something to press: the word, the signature shortened, and the way out to the explorer. */
+function txPill(signature) {
+  const node = document.getElementById("tx-template").content.firstElementChild.cloneNode(true);
+  node.href = `${site.explorer}/tx/${signature}`;
+  node.querySelector("code").textContent = shorten(signature);
+  return node;
+}
+
+/**
+ * What an edict's transaction holds of its words, going by its record. I write the announcement
+ * into the transaction as a memo, and the record, which the hash on chain commits to, says what
+ * that memo was. Only a record that names a memo is taken at its word, and only for my own
+ * words: one that says nothing of a memo, names an empty one, or names anything but its
+ * announcement or the start of it, makes no claim here.
+ *   how    "whole" for the announcement itself, "cut" for the start of it, or ""
+ *   held   the text the transaction holds, where it was cut, or ""
+ */
+function memoOf(record) {
+  const { memo, announcement } = record;
+  if (typeof memo !== "string" || !memo) return { how: "", held: "" };
+  if (memo === announcement) return { how: "whole", held: "" };
+  // A memo that would not fit is cut after a whole word and closed with an ellipsis: the start
+  // of the announcement, and less than all of it. One with nothing before its ellipsis holds
+  // no word of mine.
+  const start = memo.slice(0, -1);
+  const cut = memo.endsWith("…") && start.trim() !== "" && start.length < announcement.length && announcement.startsWith(start);
+  return cut ? { how: "cut", held: memo } : { how: "", held: "" };
+}
+
+/**
+ * What is said beside a transaction of the words it holds. The first page, which shows one
+ * edict, says either. The journal says only the second there, the exception, and keeps the
+ * first for the proof behind the press.
+ */
+const MEMO_SAYS = { whole: "My words are in it.", cut: "My words are in it, cut short." };
+
+/** The pill for an edict's transaction and, where `says` has something, the few words beside it. */
+const txBeside = (signature, says) => [txPill(signature), ...(says ? [mark(says, "tx-says")] : [])];
+
+/** A market cap in SOL, to two decimals as the curve's panel has it. */
+const capText = (sol) => sol.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+/**
+ * A market cap this page can show in a result: a number that does not come out as 0.00.
+ * Anything else is null, and no figure and no per cent is made from it.
+ */
+const shownCap = (sol) => (typeof sol === "number" && Number.isFinite(sol) && Number(sol.toFixed(2)) > 0 ? sol : null);
+
+/** The market cap a line of my log carries: what I read as I wrote it. Null where the line has none this page can show. */
+const capOf = (entry) => shownCap(entry?.marketCapSol);
+
+/** How long, to the minute: "under a minute", "30 minutes", "1 hour 12 minutes". */
+const lasting = (seconds) => (seconds < 60 ? "under a minute" : span(Math.floor(seconds / 60) * 60));
+
+/**
+ * From one market cap to another, in plain words: "up 7%", "down 3.3%", "no change". Worked
+ * out from the two figures as they are shown, so that the per cent agrees with them. Nothing
+ * where the first shows as zero: there is no per cent of that.
+ */
+function moved(from, to) {
+  const [a, b] = [Number(from.toFixed(2)), Number(to.toFixed(2))];
+  if (!(a > 0)) return "";
+  if (a === b) return "no change";
+  const size = (Math.abs(b - a) / a) * 100;
+  const figure = Number(size.toFixed(size < 1 ? 2 : size < 100 ? 1 : 0));
+  const way = b > a ? "up" : "down";
+  return figure ? `${way} ${figure.toLocaleString("en-US")}%` : `${way} less than 0.01%`;
+}
+
+/** The market cap's part of a result, where both figures can be shown: the two as text, and what the change comes to. */
+const capMoved = (from, to, tail = "") => (from === null || to === null ? null : { from: capText(from), to: capText(to), change: [moved(from, to), tail].filter(Boolean).join(" ") });
+
+/**
+ * Puts an edict's result on its line, under what it set: plain words, with a dot between the
+ * things said. Up and down are words, and nothing here judges them. `result` may hold
+ *   lasted   how long it was on, for one replaced before its time was up
+ *   cap      the market cap from when I wrote it to when its time was up, or to now
+ *   came     who came to the door while it was on
+ * The line takes no room while there is nothing to say.
+ */
+function showResult(line, { lasted, cap, came }) {
+  const parts = [];
+  if (lasted) parts.push([`Lasted ${lasted}`]);
+  if (cap) {
+    const figures = bold(cap.from);
+    // The arrow is for the eye; a screen reader is given the word.
+    const arrow = document.createElement("span");
+    arrow.textContent = " → ";
+    arrow.setAttribute("aria-hidden", "true");
+    figures.append(arrow, mark(" to ", "unseen"), `${cap.to} SOL`);
+    parts.push(["Market cap ", figures, ...(cap.change ? [`, ${cap.change}`] : [])]);
+  }
+  if (came) parts.push([came]);
+  line.hidden = parts.length === 0;
+  line.replaceChildren(...parts.flatMap((part, i) => (i ? [" · ", ...part] : part)));
+}
+
 /** A buying hook and its setting, the way the catalogue names them: "Max Buy · 1%". */
 const hookLabel = (known) => `${worded(known.hook.name, site.app)}${known.label ? ` · ${known.label}` : ""}`;
 const fullName = (name) => (name ? `${name.name} (${name.symbol})` : "a name this page does not know");
@@ -376,6 +473,8 @@ function renderCatalogue(on, appAvailable = true) {
 
 let book = null;
 let entries = [];
+/** Where each line stands in my log, to find what I wrote after it. */
+let places = new Map();
 /** Whether the last attempt to fetch the log failed: then the page does not know what was published. */
 let logMissing = false;
 /** The published text of the edict in force, once its hash has been checked against the chain. */
@@ -400,6 +499,14 @@ try {
 let doorRead = false;
 /** Whether the last attempt to read it was turned away by the node. */
 let doorShut = false;
+/**
+ * From which second of the chain's clock on this page has read every transaction of the curve,
+ * so that nobody who came since is missing. Infinity while that cannot be said. Counts of who
+ * came during an edict are only given for an edict written after it.
+ */
+let doorWholeFrom = Infinity;
+/** When the door was last read, by the chain's clock. A reading from before an edict says nothing of who came during it. */
+let doorReadAt = 0;
 /** How the page is hearing from the chain: "live" over the socket, anything else by asking. */
 let line = "off";
 /** The chain's clock minus this device's, in seconds. The hook judges by the chain's. */
@@ -442,6 +549,7 @@ async function take(nextBook, nextEntries, slot = bookSlot) {
   const fresh = book && nextBook.epoch > book.epoch;
   inForce = { entry, verified: sound.has(entry) };
   book = nextBook;
+  if (log !== entries) places = new Map(log.map((line, i) => [line, i]));
   entries = log;
   if (fresh) {
     // A new edict while the page is open: the old words step back, and Veluno lifts.
@@ -482,6 +590,8 @@ function takePool(bytes, slot = poolSlot) {
     market = null;
   }
   renderCurve();
+  // The edict in force is measured against the curve as it is now.
+  if (book) renderSoFar();
   // How much of the fees my keeper has taken out is said next to how much there has been.
   renderGoneSum();
 }
@@ -556,6 +666,8 @@ async function readDoor() {
     doorRead = true;
     // Not let in to read the newest one: what is shown may be missing whoever came last.
     doorShut = Boolean(listed.behind);
+    doorWholeFrom = listed.since ?? Infinity;
+    doorReadAt = chainNow();
     // Listed but not readable yet, as happens for a moment after a transaction lands: ask again shortly.
     doorWaits = listed.pending && doorWaits < 3 ? doorWaits + 1 : 0;
     if (doorWaits) doorAgain = true;
@@ -570,7 +682,9 @@ async function readDoor() {
   } catch {
     // The node would not say. The next reading asks again.
     doorShut = true;
+    doorWholeFrom = Infinity;
     showKnocks();
+    if (book) renderSoFar();
   } finally {
     doorBusy = false;
     // Somebody came while this reading was out.
@@ -785,7 +899,97 @@ function renderTerm() {
     // One whose time is up looks like the others: it no longer applies.
     tag.closest(".entry").classList.toggle("is-in-force", standing);
   }
+  renderSoFar();
   for (const node of document.querySelectorAll(".knock-when[data-at]")) node.textContent = ago(now - Number(node.dataset.at));
+}
+
+/**
+ * Who came while the edict the chain has in force was on: buys let in and buys turned away.
+ * Null unless this page has read every transaction of the curve since that edict was written,
+ * for otherwise somebody may be missing and a count would be too low. Whoever came in the very
+ * second the edict was written is left out: the chain dates both to the second, and a buy
+ * that landed just before the edict was judged by the rule before it.
+ */
+function cameDuring() {
+  if (!doorRead || doorShut || doorWholeFrom > book.updatedAt || doorReadAt < book.updatedAt) return null;
+  const until = Math.min(chainNow(), book.ruleUntil);
+  let [buys, refused] = [0, 0];
+  for (const trade of trades.values()) {
+    if (trade.at <= book.updatedAt || trade.at > until) continue;
+    if (trade.kind === "buy") buys++;
+    else if (trade.kind === "refused") refused++;
+  }
+  return { buys, refused };
+}
+
+/**
+ * How late a line of my log may come after an edict's term and still say where the market cap
+ * was when the term ended. I look again within a poll of a term's end, and my log dates an
+ * edict by the moment I looked, a little before it landed, so the next line is ordinarily a
+ * minute or two past the end as my log has it. Five minutes allows for that. A line later than
+ * that means I was not running or not answering, and its figure would be for a longer stretch
+ * than the rule had: then no pair of figures is shown.
+ */
+const CLOSE_SECS = 300;
+
+/**
+ * How an edict ended, going by my log.
+ *   lasted   the seconds it was on, where my next edict took its place before its term was up; else null
+ *   cap      the market cap in the first line I wrote at or after its end, a look that changed
+ *            nothing or my next edict, where that line is within CLOSE_SECS of the end; else null
+ * Between an edict and the next my log holds only looks that changed nothing, each under the
+ * edict's own number and later than it. Anything else is a gap, or a line this page cannot go
+ * by, and then nothing is said.
+ */
+function endOf(entry) {
+  const none = { lasted: null, cap: null };
+  const at = Date.parse(entry.record.at) / 1000;
+  const due = at + entry.record.change.ruleSecs;
+  for (let i = (places.get(entry) ?? Infinity) + 1; i < entries.length; i++) {
+    const line = entries[i];
+    const then = Date.parse(line.record.at) / 1000;
+    const next = line.record.action === "rewrite";
+    if (then < at || line.record.epoch !== entry.record.epoch + (next ? 1 : 0) || (next && !sound.has(line))) return none;
+    // A look during the term changed nothing and ended nothing.
+    if (!next && then < due) continue;
+    // The term ended when it was due, or when the next edict took its place before that.
+    return { lasted: then < due ? then - at : null, cap: then - Math.min(due, then) <= CLOSE_SECS ? capOf(line) : null };
+  }
+  return none;
+}
+
+/** What came of an edict that is over, as showResult takes it: all of it read from my log. */
+function resultOf(entry) {
+  const end = endOf(entry);
+  const cap = capMoved(capOf(entry), end.cap);
+  return { ...(end.lasted === null ? {} : { lasted: lasting(end.lasted) }), ...(cap ? { cap } : {}) };
+}
+
+/**
+ * The result of the edict the chain has in force, on its entry in the journal. While it is on:
+ * the market cap from when I wrote it to what the curve says now. Once its time is up: to where
+ * it was at the end, by my log, or by the curve while the end is still close. And who came to
+ * the door meanwhile, where this page has read all of them. The clock and the curve keep it
+ * filled; it is written only when it changes.
+ */
+function renderSoFar() {
+  const line = document.querySelector(".entry-result[data-so-far]");
+  if (!line || !inForce.entry) return;
+  const { now, standing } = term();
+  const result = {};
+  // While I am suspended no hook applies, so what happens meanwhile is not this edict's doing.
+  if (!book.paused) {
+    const curve = market ? shownCap(market.marketCapSol) : null;
+    const to = standing ? curve : (endOf(inForce.entry).cap ?? (now - book.ruleUntil <= CLOSE_SECS ? curve : null));
+    const cap = capMoved(capOf(inForce.entry), to, standing ? "so far" : "");
+    if (cap) result.cap = cap;
+    const came = cameDuring();
+    if (came) result.came = came.buys + came.refused ? `${came.buys} let in, ${came.refused} turned away` : standing ? "no buys yet" : "no buys";
+  }
+  const key = JSON.stringify(result);
+  if (line.dataset.shown === key) return;
+  line.dataset.shown = key;
+  showResult(line, result);
 }
 
 /** What is on, as last put on the page, so that it is only rebuilt when it changes. */
@@ -823,6 +1027,17 @@ function renderEdict() {
   if (!published) turnBubble(false);
   ask.hidden = !published;
   if (published && slot("edict-reasons").textContent !== published.reasoning) write("edict-reasons", published.reasoning);
+
+  // Its transaction, beside what it says. What of my words it holds is only said of words this page could check.
+  const signature = isSignature(inForce.entry?.signature) ? inForce.entry.signature : "";
+  const says = (signature && published && MEMO_SAYS[memoOf(published).how]) || "";
+  const beside = slot("edict-tx");
+  beside.hidden = !signature;
+  // Built again only when it changes, so that a reading of the chain does not take the link from under a finger.
+  if (beside.dataset.shown !== `${signature} ${says}`) {
+    beside.dataset.shown = `${signature} ${says}`;
+    beside.replaceChildren(...(signature ? txBeside(signature, says) : []));
+  }
 
   const fees = recogniseSplit(book, book.limits.maxTreasuryBps, book.limits.minTreasuryBps);
   write("fees-name", fees ? fees.hook.name : book.epoch ? "Shares that are not on my list" : "Opening split");
@@ -874,8 +1089,12 @@ function termsOf(record) {
   };
 }
 
-/** One edict in the journal: its number, what it set, what I said. Why, and the proof, are one press away. */
-function renderEntry(entry) {
+/**
+ * One edict in the journal: its number, its transaction, what it set and what came of it. What
+ * I said, why, and the proof are one press away. `result` is what came of one that is over
+ * (resultOf); the one in force is filled by the clock.
+ */
+function renderEntry(entry, result) {
   const { record } = entry;
   const node = document.getElementById("entry-template").content.firstElementChild.cloneNode(true);
   const at = Date.parse(record.at);
@@ -887,7 +1106,14 @@ function renderEntry(entry) {
   const mine = entry === inForce.entry;
   node.classList.toggle("is-in-force", mine);
   if (mine) node.querySelector(".entry-tag").dataset.inForce = "";
+  // Its transaction, where the eye meets it. Beside it only the exception is said, words that
+  // were cut short, and only of a record this page could check.
+  const beside = node.querySelector(".entry-tx");
+  const memo = sound.has(entry) ? memoOf(record) : { how: "", held: "" };
+  if (isSignature(entry.signature)) beside.replaceChildren(...txBeside(entry.signature, memo.how === "cut" ? MEMO_SAYS.cut : ""));
+  else beside.remove();
   const why = node.querySelector(".entry-why");
+  const outcome = node.querySelector(".entry-result");
   if (sound.has(entry)) {
     const set = termsOf(record);
     for (const [name, text] of [["buying", set.buying], ["fees", set.fees], ["term", set.term], ["name", set.name]]) {
@@ -902,28 +1128,41 @@ function renderEntry(entry) {
       node.querySelector(".entry-more summary").textContent = "What I said, and the proof";
       node.querySelector(".entry-more").prepend(node.querySelector(".entry-more summary"));
     }
+    // What came of it, on one line. The one in force is measured against the curve as it is,
+    // and the clock keeps that filled (renderSoFar). One that is over has what my log says of
+    // its end, and no line at all where that is nothing.
+    if (mine) outcome.dataset.soFar = "";
+    else showResult(outcome, result);
     // Behind the press: my reasons, then the rule and the shares in full.
     why.textContent = record.reasoning;
-    const fine = [set.rule ? `A buy goes through if ${set.rule}.` : "", `Fees: ${set.shares}.`].filter(Boolean).join(" ");
-    why.after(Object.assign(document.createElement("p"), { className: "entry-fine", textContent: fine }));
+    const fine = [
+      [set.rule ? `A buy goes through if ${set.rule}.` : "", `Fees: ${set.shares}.`].filter(Boolean).join(" "),
+      // The note on chain commits to the whole announcement. Where the transaction holds less, this is what it holds.
+      memo.held ? `In the transaction itself: “${memo.held}”` : "",
+    ];
+    why.after(...fine.filter(Boolean).map((textContent) => Object.assign(document.createElement("p"), { className: "entry-fine", textContent })));
   } else {
     node.classList.add("is-unsound");
     node.querySelector(".entry-text").textContent = "The text logged for this edict does not match its hash, so it is not shown.";
     node.querySelector(".entry-set").remove();
+    outcome.remove();
     why.remove();
     node.querySelector(".entry-more summary").textContent = "The proof";
   }
+  // The proof is for the transaction beside the entry, so it is only given where there is one:
+  // who wrote the words, that the transaction holds them, and the hash it is held to.
   const proof = node.querySelector(".entry-proof");
+  const parts = [];
   if (isSignature(entry.signature)) {
-    const parts = [link(`transaction ${shorten(entry.signature)}`, `${site.explorer}/tx/${entry.signature}`)];
     // Who wrote the words is part of the record that was hashed: the model, or a person testing.
-    if (sound.has(entry) && typeof record.model === "string" && record.model) parts.unshift(`written by ${record.model.slice(0, 40)}`);
+    if (sound.has(entry) && typeof record.model === "string" && record.model) parts.push(`written by ${record.model.slice(0, 40)}`);
+    // Words cut short are said beside the transaction and shown just above, so not here again.
+    if (memo.how === "whole") parts.push("my words are in the transaction, whole");
     if (typeof entry.note === "string") parts.push(`text hash ${entry.note.slice(0, 16)}…`);
     if (mine) parts.push(inForce.verified ? mark("matches the chain", "is-verified") : mark("does not match the chain", "is-mismatch"));
-    proof.replaceChildren(...separated(parts));
-  } else {
-    proof.remove();
   }
+  if (parts.length) proof.replaceChildren(...separated(parts));
+  else proof.remove();
   if (!node.querySelector(".entry-more p")) node.querySelector(".entry-more").remove();
   return node;
 }
@@ -938,16 +1177,19 @@ let doorShown = "";
 function renderRecord() {
   // The journal is the edicts. A look that changed nothing is in the log file, not here.
   const edicts = entries.filter((entry) => entry.record.action === "rewrite");
-  const key = JSON.stringify([journalShows, logMissing, edicts.slice(-Math.min(journalShows, MAX_ENTRIES)).map((entry) => [entry.record.epoch, entry.signature, sound.has(entry), entry === inForce.entry, inForce.verified]), edicts.length]);
+  const showing = edicts.slice(Math.max(0, edicts.length - Math.min(journalShows, MAX_ENTRIES)));
+  // What came of each one that is over, by my log. The one in force is the clock's to fill.
+  const results = showing.map((entry) => (entry !== inForce.entry && sound.has(entry) ? resultOf(entry) : {}));
+  const key = JSON.stringify([journalShows, logMissing, showing.map((entry, i) => [entry.record.epoch, entry.signature, sound.has(entry), entry === inForce.entry, inForce.verified, results[i]]), edicts.length]);
   if (key === recordShown) return;
   recordShown = key;
   const open = new Set([...document.querySelectorAll(".entry-more[open]")].map((node) => node.closest(".entry").dataset.epoch));
   slot("record").replaceChildren(
-    ...edicts
-      .slice(-Math.min(journalShows, MAX_ENTRIES))
+    ...showing
+      .map((entry, i) => [entry, results[i]])
       .reverse()
-      .map((entry) => {
-        const node = renderEntry(entry);
+      .map(([entry, result]) => {
+        const node = renderEntry(entry, result);
         node.dataset.epoch = entry.record.epoch;
         // A new reading of the chain does not shut what somebody has opened.
         const more = open.has(String(entry.record.epoch)) ? node.querySelector(".entry-more") : null;

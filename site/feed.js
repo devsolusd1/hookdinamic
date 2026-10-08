@@ -154,6 +154,26 @@ export function classify(tx, { pool, mint, hookProgram, supply = TOTAL_SUPPLY, p
 }
 
 /**
+ * For each cache a caller keeps: the stretch of the chain's clock over which every one of the
+ * pool's transactions has been read into it, `from` one second `to` another.
+ */
+const whole = new WeakMap();
+
+/**
+ * From which second of the chain's clock on every transaction in `listed`, newest first, has
+ * been read: the second after the newest one that has not. Zero when all of them have and the
+ * list is the pool's whole history. Infinity when the one it turns on has no time to go by.
+ */
+function wholeFrom(listed, limit, got) {
+  const gap = listed.findIndex((entry) => !got(entry.signature));
+  // Nothing missing, and fewer than were asked for: there is nothing older.
+  if (gap < 0 && listed.length < limit) return 0;
+  // With nothing missing, the oldest one listed stands for whatever is older and was not: that may share its second.
+  const edge = gap < 0 ? listed.at(-1) : listed[gap];
+  return Number.isFinite(edge?.blockTime) ? edge.blockTime + 1 : Infinity;
+}
+
+/**
  * The pool's latest transactions, newest first:
  *
  *   { signature, at, kind: "buy" | "sell" | "refused" | "other", sol, tokens, sharePct }
@@ -176,6 +196,11 @@ export function classify(tx, { pool, mint, hookProgram, supply = TOTAL_SUPPLY, p
  * the list fills in by itself. It rejects if the node would not give the list of
  * signatures, or turned away every transaction it was asked for. The list that comes back
  * carries two flags about the newest transaction: `pending` and `behind` (see the end).
+ *
+ * With a Map and no `before` it also carries `since`: the unix second from which on every
+ * transaction of the pool is in the Map, so that whoever counts them knows from when a count
+ * is whole. It reaches back across readings for as long as each one joins the one before it,
+ * and is Infinity when that cannot be said. It costs no call of its own.
  */
 export async function recentTrades(rpcUrl, { pool, mint, hookProgram, limit = 8, before, known, signal, batch = true, ...rest } = {}) {
   const answer = await call(rpcUrl, "getSignaturesForAddress", [pool, { limit, commitment: "confirmed", ...(before ? { before } : {}) }], signal);
@@ -194,7 +219,9 @@ export async function recentTrades(rpcUrl, { pool, mint, hookProgram, limit = 8,
     answers = await callEach(
       rpcUrl,
       "getTransaction",
-      asked.map((entry) => [entry.signature, { encoding: "jsonParsed", maxSupportedTransactionVersion: 0, commitment: "confirmed" }]),
+      // Anybody can trade on the pool, in any format the network carries: mainnet has version 1 as
+      // well as 0, and a node refuses to show one to a caller that asks for less.
+      asked.map((entry) => [entry.signature, { encoding: "jsonParsed", maxSupportedTransactionVersion: 1, commitment: "confirmed" }]),
       { signal, batch },
     );
     if (answers.every((tx) => tx === BUSY)) throw new Error("the RPC is turning requests away");
@@ -219,5 +246,15 @@ export async function recentTrades(rpcUrl, { pool, mint, hookProgram, limit = 8,
   const got = missing ? answers[asked.findIndex((entry) => entry.signature === newest)] : undefined;
   out.pending = missing && got === null;
   out.behind = missing && !out.pending;
+  if (cache && !before) {
+    const since = wholeFrom(listed, limit, (signature) => cache.has(signature));
+    const earlier = whole.get(cache);
+    // This reading joins the ones before it when it reaches back to the newest transaction
+    // they had listed: then nothing can have come and gone unread between them.
+    const joined = earlier !== undefined && since <= earlier.to;
+    const from = joined ? Math.min(earlier.from, since) : since;
+    if (Number.isFinite(since)) whole.set(cache, { from, to: Math.max(joined ? earlier.to : 0, listed[0]?.blockTime ?? 0) });
+    out.since = Number.isFinite(since) ? from : Infinity;
+  }
   return out;
 }

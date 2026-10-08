@@ -14,18 +14,23 @@
 //   AGENT_POLL_SECS                     how often it reads the rulebook to see whether it is time to write again (default 20)
 //   AGENT_THINK_EVERY_SECS              how long it leaves the model alone after a look that issued nothing (default 300)
 //   AGENT_PRIORITY_MICROLAMPORTS        what an edict's transaction bids for each compute unit it asks for, to get into a
-//                                       block on a busy day (default 50000, which comes to about 0.00001 SOL an edict;
+//                                       block (default 50000, a price for a quiet day, which comes to about 0.00001 SOL
+//                                       an edict; 1000000 for a day like the launch's, about 0.0001 SOL an edict;
 //                                       0 bids nothing; at most 5000000)
 //   DRY_RUN=1                           decide and print; send and record nothing. The model is asked as often
 //                                       as it would be for real: once, and again when that edict's time would be up.
 //                                       The edict's transaction is built all the same, and its memo, size and fee are printed.
+//
+// Before it asks the model it reads its own wallet. With too little in it to be sure of paying
+// for an edict it says so, asks nothing, and looks again at every poll: it goes on by itself
+// once SOL has arrived. A dry run says the same and goes ahead.
 import "../src/quiet.js";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { DynamicBondingCurveClient } from "@meteora-ag/dynamic-bonding-curve-sdk";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
-import { askClaude, figuresInWords, inWords, memoInWords, priorityFrom, readBook, runOnce, watch, type Context, type Outcome } from "../src/agent.js";
+import { askClaude, figuresInWords, inWords, memoInWords, priorityFrom, readBook, runOnce, shortInWords, watch, type Context, type Outcome } from "../src/agent.js";
 import { solPriceUsd } from "../src/price.js";
 import { plain } from "./serve.js";
 
@@ -81,7 +86,16 @@ async function run() {
   // The token's names are written at launch and never added to, so they are read once.
   const { names } = await readBook(ctx);
   let saidLast: string | null = null;
+  /** What a rehearsal last said of a wallet that holds too little, so that it says it once and not at every look. */
+  let saidOfWallet: string | null = null;
+  const address = ctx.agent.publicKey.toBase58();
   function report(event: Outcome | { status: "error"; error: unknown }) {
+    // Only a rehearsal gets as far as the model with too little in the wallet, and it only says so.
+    if (event.status === "held" || event.status === "rewritten") {
+      const lacking = event.funds && event.funds.holds < event.funds.needs ? `my wallet ${address} needs topping up before this is for real: ${shortInWords(event.funds)}. A dry run goes on all the same; for real I would ask the model nothing until SOL arrives.` : null;
+      if (lacking !== null && lacking !== saidOfWallet) console.log(`${new Date().toISOString()} ${lacking}`);
+      saidOfWallet = lacking;
+    }
     const line =
       event.status === "rewritten" ? `${event.signature ? "issued an edict" : "would issue an edict (dry run, nothing sent)"}: ${event.announcement}`
       : event.status === "held" ? `issued nothing: ${event.reasoning}`
@@ -89,11 +103,13 @@ async function run() {
       : event.status === "too-soon" ? `wants to look, but the last edict was too recent; ${event.seconds}s to go`
       : event.status === "paused" ? "paused by the guardian"
       : event.status === "resting" ? "the next look is not due yet"
+      : event.status === "short" ? `my wallet ${address} needs topping up: ${shortInWords(event.funds)}. I ask the model nothing until SOL arrives, and go on by myself once it has.`
       // An RPC node's complaint can quote the address it was sent to, which carries its key: only the host is printed.
       : `error: ${plain(event.error)}`;
     // Waiting repeats on every poll, a pause for as long as it lasts, and an error that does
-    // not go away at every try: each is said once.
-    const news = event.status === "in-force" || event.status === "too-soon" || event.status === "paused" || event.status === "resting" ? event.status : event.status === "error" ? line : null;
+    // not go away at every try: each is said once. So is a wallet that holds too little, which
+    // is found again at every poll, and said again when what it holds has changed.
+    const news = event.status === "in-force" || event.status === "too-soon" || event.status === "paused" || event.status === "resting" ? event.status : event.status === "error" || event.status === "short" ? line : null;
     if (news !== null && news === saidLast) return;
     saidLast = news;
     console.log(`${new Date().toISOString()} ${line}`);

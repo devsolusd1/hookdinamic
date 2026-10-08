@@ -2,8 +2,11 @@
 // launch on a curve that cannot graduate, trade under rules built from every fact the hook
 // can see, change the token's name, claim the fees. Then the same for a second token with the
 // shape the real one launches with, and there the whole of how the fees leave the curve: only
-// through the program, only for the keeper, and with a keeper the guardian can replace. Last,
+// through the program, only for the keeper, and with a keeper the guardian can replace. Then
 // one buy of nearly the whole supply, which leaves the curve open and the hook on the token.
+// Last, a third token whose launch dies between its transactions and is run again: unchanged
+// it goes on from where it stopped, finished it sends nothing more, and asked for anything
+// else than the chain already holds it is refused before it sends anything.
 //
 //   npm run validator     (in one terminal; needs WSL)
 //   npm run e2e
@@ -25,9 +28,9 @@ import { FEE_HOOKS, recogniseSplit, ruleOf } from "../site/hooks.js";
 import { GRADUATION_SOL, METEORA_FEE_SHARE, SOL_IN_EXISTENCE, TOKEN_DECIMALS, TOTAL_SUPPLY } from "../src/curve.js";
 import { claimFeesTx, EVERYTHING } from "../src/fees.js";
 import { BPS, claimFeesIx, compile, decodeRulebook, describe, METEORA_DBC, pauseIx, REFUSAL, rulebookAddress, setKeeperIx, setNameIx, setRulesIx, type Change, type Clause, type Limits, type Name, type Split } from "../src/hook.js";
-import { launch } from "../src/launch.js";
+import { earlierRun, launch, mustNotGraduate, readBack, Refused, TIMES_ALL_SOL, type Launch } from "../src/launch.js";
 
-const local = JSON.parse(readFileSync(new URL("../.local/validator.json", import.meta.url), "utf8")) as { rpc: string; hookProgram: string };
+const local =JSON.parse(readFileSync(new URL("../.local/validator.json", import.meta.url), "utf8")) as { rpc: string; hookProgram: string };
 const connection = new Connection(local.rpc, "confirmed");
 const HOOK = new PublicKey(local.hookProgram);
 const dbc = DynamicBondingCurveClient.create(connection, "confirmed");
@@ -94,6 +97,29 @@ async function mustSend(what: string, tx: Transaction, signers: Keypair[]): Prom
 }
 
 const tx = (...ixs: TransactionInstruction[]) => new Transaction().add(...ixs);
+
+/** What a launch that dies between two transactions is stopped with, in place of the next one. */
+class Died extends Error {}
+
+/**
+ * Runs a launch that is let send `allowed` transactions and then dies, the way the launch
+ * command does when its connection is cut. Says which transactions went out and how it ended.
+ */
+async function ranAgain(p: Launch, allowed = Infinity): Promise<{ sent: string[]; refused: Refused | null; died: boolean }> {
+  const sent: string[] = [];
+  try {
+    await launch(p, async (what, transaction, signers) => {
+      if (sent.length >= allowed) throw new Died();
+      await mustSend(what, transaction, signers);
+      sent.push(what);
+    });
+    return { sent, refused: null, died: false };
+  } catch (error) {
+    if (error instanceof Refused) return { sent, refused: error, died: false };
+    if (error instanceof Died) return { sent, refused: null, died: true };
+    throw error;
+  }
+}
 
 async function airdrop(wallet: Keypair, solAmount: number) {
   const signature = await connection.requestAirdrop(wallet.publicKey, solAmount * LAMPORTS_PER_SOL);
@@ -201,21 +227,41 @@ async function main() {
   await fund(partner, guardian, agent, keeper, app, alice, bob, carol);
 
   console.log("launch");
-  await launch({
+  // A curve that could fill is refused before anything is sent, here and in the launch command.
+  const refusedAt = (solToGraduate: number) => {
+    try {
+      mustNotGraduate({ migrationQuoteThreshold: new BN(solToGraduate).mul(new BN(LAMPORTS_PER_SOL)) });
+      return false;
+    } catch {
+      return true;
+    }
+  };
+  check(
+    refusedAt(16_050) && refusedAt(TIMES_ALL_SOL * SOL_IN_EXISTENCE - 1) && !refusedAt(TIMES_ALL_SOL * SOL_IN_EXISTENCE) && !refusedAt(GRADUATION_SOL),
+    `a config that would graduate with less than ${TIMES_ALL_SOL} times all the SOL there is, ${(TIMES_ALL_SOL * SOL_IN_EXISTENCE).toLocaleString("en-US")} SOL, is refused, and one that asks for that much or more is not`,
+  );
+  const asked: Launch = {
     dbc, hookProgram: HOOK, payer: partner, mint, config,
     guardian: guardian.publicKey, agent: agent.publicKey, keeper: keeper.publicKey, cosigner: app.publicKey,
     limits: LIMITS, split: SPLIT,
     curve: { startCapSol: START_CAP_SOL, feeBps: FEE_BPS },
     names: NAMES, uri: "https://example.com/aht.json",
-  }, mustSend);
+  };
+  await launch(asked, mustSend);
   // What the program itself wrote in the config, not what the launch meant to send.
   const made = (await dbc.state.getPoolConfig(config.publicKey))!;
   const segments = made.curve.filter((point) => !point.sqrtPrice.isZero());
   const opening = (await dbc.state.getPool(pool))!.poolState;
   const startsAt = getPriceFromSqrtPrice(opening.sqrtPrice, TOKEN_DECIMALS, 9).toNumber() * TOTAL_SUPPLY;
   check(
-    made.migrationQuoteThreshold.eq(new BN(GRADUATION_SOL).mul(new BN(LAMPORTS_PER_SOL))) && GRADUATION_SOL > 10 * SOL_IN_EXISTENCE && segments.length === 1 && made.migrationSqrtPrice.eq(segments[0].sqrtPrice),
-    `launched on a single curve that cannot graduate: its config asks for ${GRADUATION_SOL.toLocaleString("en-US")} SOL in the curve, ${Math.floor(GRADUATION_SOL / SOL_IN_EXISTENCE)} times all the SOL there is`,
+    made.migrationQuoteThreshold.eq(new BN(GRADUATION_SOL).mul(new BN(LAMPORTS_PER_SOL))) && GRADUATION_SOL > TIMES_ALL_SOL * SOL_IN_EXISTENCE && segments.length === 1 && made.migrationSqrtPrice.eq(segments[0].sqrtPrice),
+    `launched on a single curve that cannot graduate: its config asks for ${GRADUATION_SOL.toLocaleString("en-US")} SOL in the curve, more than ${TIMES_ALL_SOL} times all the SOL there is`,
+  );
+  const again = await ranAgain(asked);
+  const back = await readBack(asked);
+  check(
+    again.sent.length === 0 && !again.refused && back.graduationSol === GRADUATION_SOL && back.segments === 1 && back.startCapSol === START_CAP_SOL && back.feeBps === FEE_BPS && back.feeFlat && back.feeInSol && back.hook.equals(HOOK) && back.since.length === 0,
+    `the same launch run again sends nothing, and the token reads back from the chain as launched: one segment from ${back.startCapSol} SOL, ${back.graduationSol.toLocaleString("en-US")} SOL to graduate, a flat ${back.feeBps / 100}% taken in SOL, the hook on the mint`,
   );
   check(Math.abs(startsAt - START_CAP_SOL) < 1e-6 && opening.quoteReserve.isZero() && opening.baseReserve.eq(new BN(TOTAL_SUPPLY).mul(new BN(10 ** TOKEN_DECIMALS))), `it opens at ${startsAt.toFixed(6)} SOL of market cap, holding the whole supply and no SOL`);
   const vault = await connection.getParsedAccountInfo(deriveDbcTokenVaultAddress(pool, mint.publicKey));
@@ -323,8 +369,13 @@ async function main() {
 
   const last = await book();
   check(last.epoch === 12n && last.paused && last.holdersBps === 6_000 && last.treasuryBps === 4_000 && last.rule.length === 1 && last.name === 1, `the rulebook reads back as the agent and the guardian left it, after ${last.epoch} edicts`);
+  // The split and the name in use are the agent's to change, so a launch run again long after does not hold them against the token.
+  const muchLater = await ranAgain(asked);
+  const now = await readBack(asked);
+  check(muchLater.sent.length === 0 && !muchLater.refused && inFull(now) === inFull(NAMES[1]) && now.since.length === 0, `its launch run again after all of that still sends nothing, and reads the token back as ${inFull(now)}`);
 
   await asItLaunches();
+  await stoppedAndRunAgain();
 
   console.log(failures ? `\n${failures} check(s) FAILED` : "\nall checks passed");
   process.exit(failures ? 1 : 0);
@@ -470,6 +521,79 @@ async function asItLaunches() {
   check(!(await token.rewrite({ ruleSecs: 600, rule: compile([{ group: 1, fact: "luck", op: ">", value: 99 }]), ...example.split })).err, "the agent closes buying");
   refused(await token.buy(bob, 0.05), "and up there its rule still turns a buy away");
   check(!(await token.sell(whale, await token.held(whale.publicKey))).err && (await hooked()), "all of it sells back, as a sale always can");
+}
+
+/**
+ * A third token, launched the way the launch command launches when it dies between two
+ * transactions and is run again. A config and a rulebook are written once, so each time the
+ * launch is run again it is held against what the chain already has: unchanged it goes on,
+ * and asked for anything else it is refused with nothing sent.
+ */
+async function stoppedAndRunAgain() {
+  console.log("a launch that stops and is run again");
+  const example = JSON.parse(readFileSync(new URL("../launch.example.json", import.meta.url), "utf8")) as { feeBps: number; startCapSol: number; limits: Limits; split: Split; names: Name[] };
+  const [mint, config, successor] = Array.from({ length: 3 }, () => Keypair.generate());
+  await fund(successor);
+  const asked: Launch = {
+    dbc, hookProgram: HOOK, payer: partner, mint, config,
+    guardian: guardian.publicKey, agent: agent.publicKey, keeper: keeper.publicKey,
+    limits: example.limits, split: example.split,
+    curve: { startCapSol: example.startCapSol, feeBps: example.feeBps },
+    names: example.names, uri: "https://example.com/veluno.json",
+  };
+  /** A launch that asks for something else is refused with nothing sent, in a sentence that says what differs. */
+  const refusedFor = async (changed: Launch, reached: Refused["reached"], says: string, what: string, guardianCan = false) => {
+    const run = await ranAgain(changed);
+    const ok = run.sent.length === 0 && run.refused?.reached === reached && run.refused.guardianCan === guardianCan && run.refused.difference.includes(says);
+    check(ok, `${what}: refused, nothing sent. "${run.refused?.difference ?? "it was not refused"}"`);
+    return run.refused;
+  };
+
+  check((await earlierRun(asked)) === null, "before its launch nothing of it is on chain");
+  const one = await ranAgain(asked, 1);
+  check(one.died && one.sent.join() === "create the curve's config" && (await earlierRun(asked)) === "config", "the launch dies after its first transaction: the curve's config is on chain and nothing else");
+  await refusedFor({ ...asked, curve: { ...asked.curve, feeBps: 200 } }, "config", "has a trading fee of 3%, and this launch asks for 2%", "run again asking for a fee of 2%");
+  await refusedFor({ ...asked, curve: { ...asked.curve, startCapSol: 40 } }, "config", "starts at 30 SOL of market cap, and this launch asks for 40 SOL of market cap", "run again asking for a start at 40 SOL");
+  await refusedFor({ ...asked, names: [...asked.names, { name: "Other", symbol: "OTHER" }] }, "config", "leaves the right to edit the token's name with nobody, and this launch asks for the pool's creator", "run again with a second name");
+  await refusedFor({ ...asked, hookProgram: METEORA_DBC }, "config", "names as the program of the token's hook", "run again naming another hook program");
+
+  const two = await ranAgain(asked, 1);
+  check(two.died && two.sent.join() === "write the rulebook" && (await earlierRun(asked)) === "rulebook", "run again unchanged it goes on from where it stopped: it writes the rulebook and nothing before it, and dies again");
+  // The agent, the keeper and the app key are the guardian's to replace later, and the refusal says so. The guardian is nobody's.
+  await refusedFor({ ...asked, guardian: successor.publicKey }, "rulebook", `names as its guardian ${guardian.publicKey.toBase58()}, and this launch asks for ${successor.publicKey.toBase58()}`, "run again naming another guardian");
+  await refusedFor({ ...asked, keeper: successor.publicKey }, "rulebook", `names as its keeper ${keeper.publicKey.toBase58()}, and this launch asks for ${successor.publicKey.toBase58()}`, "run again naming another keeper", true);
+  await refusedFor({ ...asked, cosigner: app.publicKey }, "rulebook", `names as its app key none, and this launch asks for ${app.publicKey.toBase58()}`, "run again naming an app key", true);
+  await refusedFor({ ...asked, limits: { ...asked.limits, maxRuleSecs: asked.limits.maxRuleSecs * 2 } }, "rulebook", `sets limits.maxRuleSecs to ${asked.limits.maxRuleSecs}, and this launch asks for ${asked.limits.maxRuleSecs * 2}`, "run again with an edict let stand twice as long");
+  await refusedFor({ ...asked, split: { holdersBps: 2_000, burnBps: 4_000, treasuryBps: 4_000 } }, "rulebook", "opens with the fees split holders 3000, burn 3000, treasury 4000 bps, and this launch asks for holders 2000, burn 4000, treasury 4000 bps", "run again with another opening split");
+  await refusedFor({ ...asked, names: [{ name: "Veluna", symbol: asked.names[0].symbol }] }, "rulebook", "goes by the names Veluno (VELUNO), and this launch asks for Veluna (VELUNO)", "run again under another name");
+  await refusedFor({ ...asked, curve: { ...asked.curve, feeBps: 200 } }, "rulebook", "has a trading fee of 3%, and this launch asks for 2%", "run again asking for a fee of 2%, now that the rulebook is written");
+  // What the old refusal advised, "launch with a new config", after the rulebook: the new config is not even paid for.
+  const fresh = Keypair.generate();
+  const moved = await refusedFor({ ...asked, config: fresh }, "rulebook", "holds as the curve's SOL vault", "run again with a new config key");
+  check((await connection.getAccountInfo(fresh.publicKey)) === null && !!moved?.message.includes("a new config is no way out once the rulebook is written"), "and it says that a new config is no way out once the rulebook is written, without making one");
+
+  const three = await ranAgain(asked);
+  check(!three.died && !three.refused && three.sent.join() === "create the pool" && (await earlierRun(asked)) === "pool", "run again unchanged it goes on once more: it creates the pool and nothing before it");
+  const four = await ranAgain(asked);
+  const back = await readBack(asked);
+  const rulebook = rulebookAddress(HOOK, mint.publicKey);
+  check(four.sent.length === 0 && !four.refused && !four.died, "run again after it has finished, it sends nothing");
+  check(
+    back.graduationSol === GRADUATION_SOL && back.segments === 1 && back.startCapSol === example.startCapSol && back.feeBps === example.feeBps && back.feeFlat && back.feeInSol && back.feeClaimer.equals(rulebook) && back.hook.equals(HOOK) && inFull(back) === inFull(example.names[0]) && back.uri === asked.uri && back.since.length === 0,
+    `read back from the chain: one segment from ${back.startCapSol} SOL of market cap, ${back.graduationSol.toLocaleString("en-US")} SOL to graduate, a flat ${back.feeBps / 100}% taken in SOL and claimed by the rulebook, the hook on the mint, ${inFull(back)}`,
+  );
+  await refusedFor({ ...asked, curve: { ...asked.curve, feeBps: 200 } }, "pool", "has a trading fee of 3%, and this launch asks for 2%", "the launched token's file changed to a fee of 2%");
+  await refusedFor({ ...asked, uri: "https://example.com/other.json" }, "pool", "names its card at https://example.com/veluno.json, and this launch asks for https://example.com/other.json", "the launched token's file changed to another card");
+  await refusedFor({ ...asked, limits: { ...asked.limits, minIntervalSecs: 1 } }, "pool", `sets limits.minIntervalSecs to ${asked.limits.minIntervalSecs}, and this launch asks for 1`, "the launched token's file changed to another limit");
+
+  // After the launch the guardian can replace a key. The launch file then names the old one, which is told and not refused.
+  await mustSend("replace the keeper", tx(setKeeperIx({ program: HOOK, guardian: guardian.publicKey, mint: mint.publicKey, keeper: successor.publicKey })), [guardian]);
+  const five = await ranAgain(asked);
+  const later = await readBack(asked);
+  check(
+    five.sent.length === 0 && !five.refused && later.since.length === 1 && later.since[0].includes(successor.publicKey.toBase58()) && later.since[0].includes(keeper.publicKey.toBase58()),
+    `once the guardian has replaced the keeper, the launch run again still sends nothing and is not refused. It says: "${later.since[0]}"`,
+  );
 }
 
 main().catch((error) => {

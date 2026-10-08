@@ -152,6 +152,12 @@ export type Context = {
 /** An edict's transaction by its figures: its size on the wire, the compute units it asks for, and what it pays the network. */
 export type Figures = { bytes: number; units: number; feeLamports: number };
 
+/**
+ * The agent's own SOL as a look found it, in lamports: what its wallet holds, and what the
+ * wallet has to hold for the agent to be sure of paying for an edict (`lamportsForAnEdict`).
+ */
+export type Funds = { holds: number; needs: number };
+
 export type Outcome =
   | { status: "paused" }
   /** The chain's own interval is still closed, or an edict already sent may still land. */
@@ -159,13 +165,24 @@ export type Outcome =
   | { status: "in-force"; seconds: number }
   /** An edict is due, and the caller asked for the model to be left alone for now (`ask: false`). */
   | { status: "resting" }
-  | { status: "held"; reasoning: string; usage?: Usage }
+  /**
+   * An edict is due, and the agent's wallet holds less than it has to: the model was not
+   * asked, and nothing was sent or written down. It is looked at again at every poll, so the
+   * agent goes on by itself once SOL has arrived. Never the outcome of a dry run.
+   */
+  | { status: "short"; funds: Funds }
+  /**
+   * On this one and the next, `funds` is what the wallet was found to hold before the model
+   * was asked. It is left out when the node could not say, which stops nothing. In a dry run
+   * it can show a wallet that holds too little: the look goes ahead there all the same.
+   */
+  | { status: "held"; reasoning: string; usage?: Usage; funds?: Funds }
   /**
    * `signature` is null in a dry run, and the rest is then what would have been sent. `memo`
    * is the text the transaction carries as its memo: the announcement, or what was left of
    * it when it had to be cut, which ends in an ellipsis, or "" for no memo at all.
    */
-  | { status: "rewritten"; choice: Choice; change: Change; announcement: string; reasoning: string; signature: string | null; memo: string; transaction: Figures; usage?: Usage };
+  | { status: "rewritten"; choice: Choice; change: Change; announcement: string; reasoning: string; signature: string | null; memo: string; transaction: Figures; usage?: Usage; funds?: Funds };
 
 const hasApp = (book: Rulebook) => !book.cosigner.equals(PublicKey.default);
 
@@ -633,6 +650,10 @@ export async function takeSnapshot(ctx: Context, book: Rulebook, now: number, hi
 // commits to the whole announcement, and the record says what the memo is, word for word,
 // whether it was cut or not.
 //
+// A cut can leave signs and no words: an announcement that opens with a row of emoji is cut
+// in the middle of the row. Such a memo tells a reader nothing, so it is not written at all,
+// and the record says that there is none.
+//
 // The agent only ever writes a memo. It reads nobody's, its own included: what it knows of
 // its earlier words comes from its log.
 
@@ -786,11 +807,21 @@ const SIGNATURE_FEE = 5_000;
 
 /**
  * What an edict's transaction bids for each compute unit it asks for, in micro-lamports,
- * when the setting AGENT_PRIORITY_MICROLAMPORTS says nothing. Of the 2,045 transactions in
- * three blocks of mainnet around slot 454,394,880, votes aside, half bid nothing and nine in
- * ten bid this much or less. At this price an edict whose announcement is 150 plain
- * characters pays the network 0.0000091 SOL in all, and the largest edict there can be,
- * with the dearest memo and a change of name, 0.0000259 SOL.
+ * when the setting AGENT_PRIORITY_MICROLAMPORTS says nothing. It is a price for a quiet day.
+ * Of the 885 transactions in two blocks of mainnet around slot 454,410,047, votes aside and
+ * at a quiet hour, a third bid nothing, three in four bid 12,824 or less and 85 in 100 bid
+ * this much or less. Above it the bids climb steeply: the 90th percentile is about 600,000
+ * and the 95th is 1,000,000. So on a busy day, the day of the launch above all, the setting
+ * is there to be raised: 1000000 was as much as nineteen in twenty bid at that quiet hour.
+ *
+ * An earlier count, of three blocks, had nine in ten at this price or under. It read the bid
+ * from the compute-budget instructions alone, and so took every version 1 transaction, which
+ * states its priority fee in its header and carries no such instruction, for one that bids
+ * nothing. Nearly a third of the transactions in those two blocks were version 1.
+ *
+ * At this price an edict whose announcement is 150 plain characters pays the network
+ * 0.0000091 SOL in all, and the largest edict there can be, with the dearest memo and a
+ * change of name, 0.0000259 SOL.
  */
 export const PRIORITY_MICROLAMPORTS = 50_000;
 
@@ -823,7 +854,8 @@ export function priorityFrom(setting: string | undefined): number {
  * and the transaction's figures. In order it holds: the compute units it asks for; the price
  * it bids for each, unless that is 0; the rule; the change of name if there is one, with the
  * top-up it may need in front of it; and the announcement as a memo. `record.memo` is filled
- * in here, always, with the memo's text exactly: "" when no memo is written.
+ * in here, always, with the memo's text exactly: "" when no memo is written, which is when
+ * not one word of the announcement fits.
  */
 export function edictTransaction(p: {
   program: PublicKey;
@@ -865,7 +897,7 @@ export function edictTransaction(p: {
   // whatever they are, and the price is in the measure or out of it as it will be when sent.
   const room = TRANSACTION_MAX - onTheWire(written(0, ""));
   const said = p.record.announcement ?? "";
-  const memo = shortened(
+  const fitted = shortened(
     said,
     (text) => {
       const bytes = Buffer.byteLength(text);
@@ -875,6 +907,9 @@ export function edictTransaction(p: {
     // Every UTF-16 unit of a text is at least one byte of it.
     Math.max(room, 0),
   );
+  // What is left of an announcement that opens with dear signs can be signs and an ellipsis.
+  // A memo that says nothing, by the test an announcement is held to, is no memo.
+  const memo = saysNothing(fitted) ? "" : fitted;
   const record = { ...p.record, memo };
   const note = noteOf(record);
   // Asked for by the same count the memo was just measured with, so the two cannot disagree.
@@ -882,6 +917,51 @@ export function edictTransaction(p: {
   const instructions = written(units, memo || null, note);
   return { tx: paidByAgent(instructions), record, note, memo, bytes: onTheWire(instructions), units, feeLamports: edictFee(units, price) };
 }
+
+// ---------------------------------------------------------------------------------------------
+// The agent's own wallet.
+//
+// An edict is paid for out of the agent's own SOL. With too little of it the node turns the
+// transaction away, and by then the model has been asked, and paid, for an edict that cannot
+// be sent; a few minutes later the agent would ask again, and again after that. So the wallet
+// is read before the model is asked, and with too little in it the look ends there. It is
+// read again at every poll, and the agent goes on by itself once SOL has arrived.
+
+/**
+ * The least a wallet may be left holding once it has paid a fee, in lamports: what an account
+ * with no data needs to be exempt from rent. The network refuses a transaction that would
+ * leave its payer with less than this and more than nothing. The figure is the same on every
+ * Solana network; scripts/e2e-agent.ts asks the validator for it, and has it refuse such a
+ * transaction.
+ */
+export const WALLET_LEAST = 890_880;
+
+/**
+ * What the agent's wallet has to hold for the agent to be sure of paying for an edict at
+ * this price, in lamports: the fee of the largest edict there can be, on top of what the
+ * wallet has to keep. Most edicts cost a fraction of that, so a wallet just under this could
+ * still have paid for one; the agent stops a little early rather than pay the model for an
+ * edict that may turn out to be one it cannot send. (A change of name may also top the mint
+ * up for a longer name. The mint is given room for its longest name at launch, so that is
+ * not counted.)
+ */
+export const lamportsForAnEdict = (microLamports: number) => edictFee(EDICT_UNITS_MOST, microLamports) + WALLET_LEAST;
+
+/**
+ * What the agent's wallet holds and what it has to hold. Null when the node does not say: a
+ * balance that could not be read is not a wallet with nothing in it, and stops nothing.
+ */
+async function fundsOf(ctx: Context): Promise<Funds | null> {
+  try {
+    const holds = await ctx.connection.getBalance(ctx.agent.publicKey, "confirmed");
+    return Number.isSafeInteger(holds) && holds >= 0 ? { holds, needs: lamportsForAnEdict(ctx.priorityMicroLamports ?? PRIORITY_MICROLAMPORTS) } : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A look.
 
 /** The lamports the mint is short of to carry name `index`, which may be longer than the one it has. */
 async function rentForName(ctx: Context, book: Rulebook, index: number): Promise<number> {
@@ -899,6 +979,10 @@ async function rentForName(ctx: Context, book: Rulebook, index: number): Promise
  * `ask: false` everything short of the model is done, the reading of the rulebook and the
  * settling of an edict still on its way, and where the model would be asked the answer is
  * "resting": that is how `watch` keeps its eyes on the chain while it spaces out its looks.
+ *
+ * Just before the model is asked the agent's own wallet is read. With less in it than an
+ * edict can take the answer is "short", and the model is not asked. Not in a dry run, which
+ * goes ahead and reports what the wallet held.
  */
 export async function runOnce(ctx: Context, options: { letRuleRun?: boolean; ask?: boolean } = {}): Promise<Outcome> {
   // The cheap checks come first: this runs on every poll, and most polls end in one of them.
@@ -919,6 +1003,12 @@ export async function runOnce(ctx: Context, options: { letRuleRun?: boolean; ask
   if (wait > 0) return { status: "too-soon", seconds: wait };
   if (options.ask === false) return { status: "resting" };
 
+  // The model is about to be asked, and paid. Not for an edict the agent's wallet could not
+  // pay for: with too little in it the look ends here, having cost nothing. A dry run sends
+  // nothing, so it goes ahead and carries what the wallet held for the caller to speak of.
+  const funds = (await fundsOf(ctx)) ?? undefined;
+  if (funds && funds.holds < funds.needs && !ctx.dryRun) return { status: "short", funds };
+
   // Its memory is its own token's lines, and no other's.
   const snapshot = await takeSnapshot(ctx, book, now, readLog(ctx.logPath, ctx.mint.toBase58()));
   const verdict = await ctx.decide(snapshot, book);
@@ -928,7 +1018,7 @@ export async function runOnce(ctx: Context, options: { letRuleRun?: boolean; ask
     // A dry run leaves no trace: the log is the public record, and it only holds what really happened.
     const record: LogEntry["record"] = { ...base, epoch: Number(book.epoch), action: "hold" };
     if (!ctx.dryRun) appendLine(ctx.logPath, { record, ...entry });
-    return { status: "held", reasoning: verdict.reasoning, usage: verdict.usage };
+    return { status: "held", reasoning: verdict.reasoning, usage: verdict.usage, ...(funds ? { funds } : {}) };
   }
 
   // Checked again here so a decision that did not come from `askClaude` gets the same treatment.
@@ -962,7 +1052,7 @@ export async function runOnce(ctx: Context, options: { letRuleRun?: boolean; ask
     },
     priorityMicroLamports: ctx.priorityMicroLamports,
   });
-  const decided = { choice, change, announcement, reasoning: verdict.reasoning, usage: verdict.usage, memo, transaction: { bytes, units, feeLamports } };
+  const decided = { choice, change, announcement, reasoning: verdict.reasoning, usage: verdict.usage, memo, transaction: { bytes, units, feeLamports }, ...(funds ? { funds } : {}) };
   // It ends here in a dry run: nothing is signed, nothing is sent, nothing is written down.
   if (ctx.dryRun) return { status: "rewritten", ...decided, signature: null };
 
@@ -1013,6 +1103,14 @@ export function memoInWords(announcement: string, memo: string): string {
 /** Lamports as SOL, to the last lamport and with no zeros trailing: "0.000008076". */
 export const inSol = (lamports: number) => (lamports / 1e9).toFixed(9).replace(/\.?0+$/, "");
 
+/**
+ * A wallet that holds less than it has to, in two sentences for a line of a log: what it
+ * holds, what it has to hold and what that is made of, and how much is missing.
+ */
+export function shortInWords(funds: Funds): string {
+  return `it holds ${inSol(funds.holds)} SOL and has to hold ${inSol(funds.needs)} SOL for me to be sure of paying for an edict: ${inSol(funds.needs - WALLET_LEAST)} SOL for the dearest edict there can be at the price I bid, and the ${inSol(WALLET_LEAST)} SOL a wallet has to keep. It is ${inSol(funds.needs - funds.holds)} SOL short`;
+}
+
 /** An edict's transaction in a few words, for the same line: its size, what it asks for and what it pays. */
 export const figuresInWords = (figures: Figures) => `transaction: ${figures.bytes} bytes, ${figures.units.toLocaleString("en-US")} compute units, fee ${inSol(figures.feeLamports)} SOL`;
 
@@ -1046,6 +1144,10 @@ export type WatchOptions = {
  * else. So a pause, its end, a key that is no longer the agent's and an edict that landed
  * unseen are all noticed within one poll. Only the model, which is paid for by the call, is
  * spaced out.
+ *
+ * A wallet with too little in it for an edict costs one call more at each poll at which the
+ * model would have been asked, and no call to the model: the look is "short", nothing is
+ * left to rest, and the first poll after SOL has arrived asks the model as usual.
  */
 export async function watch(ctx: Context, options: WatchOptions): Promise<void> {
   const clock = () => Date.now() / 1000;

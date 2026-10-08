@@ -2,7 +2,9 @@
 // it proves everything around the model's answer. Market in, a pick from the catalogue out,
 // the edict on chain with its words beside it as a memo, a log line whose hash matches the
 // note in the rulebook. It is also where the figures behind the transaction's compute limit
-// are measured: what the rule, a change of name and the memo really spend.
+// are measured: what the rule, a change of name and the memo really spend. And where the node
+// is asked what a wallet has to keep, which is what the agent holds its own wallet to before
+// it asks the model.
 //
 //   npm run validator        (in one terminal; needs WSL)
 //   npm run e2e:agent
@@ -12,11 +14,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DynamicBondingCurveClient, SwapMode } from "@meteora-ag/dynamic-bonding-curve-sdk";
 import { getTokenMetadata, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
-import { ComputeBudgetProgram, Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, sendAndConfirmTransaction, Transaction } from "@solana/web3.js";
+import { ComputeBudgetProgram, Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, sendAndConfirmTransaction, SystemProgram, Transaction } from "@solana/web3.js";
 import BN from "bn.js";
 import { FEE_HOOKS, recogniseRule, recogniseSplit, worded } from "../site/hooks.js";
 import {
-  ANNOUNCEMENT_MAX, buyingLabel, changeOf, edictFee, edictUnits, figuresInWords, MEMO_PROGRAM, MEMO_UNITS, memoIx, memoUnits, NAME_UNITS, noteOf, outsideLimits, PRIORITY_MICROLAMPORTS, readBook, readLog, RULE_UNITS, runOnce, somebodyCanBuy, unfit, watch,
+  ANNOUNCEMENT_MAX, buyingLabel, changeOf, EDICT_UNITS_MOST, edictFee, edictTransaction, edictUnits, figuresInWords, lamportsForAnEdict, MEMO_PROGRAM, MEMO_UNITS, memoIx, memoUnits, NAME_UNITS, noteOf, outsideLimits, PRIORITY_MICROLAMPORTS, readBook, readLog, RULE_UNITS, runOnce, somebodyCanBuy, unfit, WALLET_LEAST, watch,
   type Choice, type Context, type Decide, type Outcome, type Snapshot,
 } from "../src/agent.js";
 import { compile, describe, MAX_CONDITIONS, pauseIx, setRulesIx, type Change, type Clause, type Limits, type Name, type Split } from "../src/hook.js";
@@ -229,6 +231,43 @@ await sleep(LIMITS.minIntervalSecs + 1);
 const stray = await runOnce({ ...ctx, decide: answering({ buying: { hook: "max-sell", setting: 1 }, fees: "even-split", name: null, minutes: 30 }) }).then(() => null, (error: Error) => error.message);
 check(!!stray && stray.includes("cannot be used") && (await readBook(ctx)).epoch === 1n && readLog(logPath).length === 1, "a pick that is not in the catalogue is dropped before it is sent, and leaves no trace");
 
+console.log("the agent's own wallet");
+{
+  // On a day when the owner has raised the price: a lamport for every unit asked for.
+  const price = 1_000_000;
+  const needs = lamportsForAnEdict(price);
+  const move = (from: Keypair, to: Keypair, lamports: number) => sendAndConfirmTransaction(connection, new Transaction().add(SystemProgram.transfer({ fromPubkey: from.publicKey, toPubkey: to.publicKey, lamports })), [from], { commitment: "confirmed" });
+  const holds = () => connection.getBalance(agent.publicKey, "confirmed");
+  check((await connection.getMinimumBalanceForRentExemption(0)) === WALLET_LEAST, `the least a wallet may be left holding is what the node says an account with no data needs to be exempt from rent: ${WALLET_LEAST} lamports, the figure the agent reckons with`);
+
+  // All the agent has goes to another wallet, but for one lamport less than an edict can take. The transfer itself costs its signature.
+  await move(agent, alice, (await holds()) - 5_000 - (needs - 1));
+  const left = await holds();
+  const asked = seen.length;
+  const thin: Context = { ...ctx, priorityMicroLamports: price, decide: answering({ buying: { hook: "max-wallet", setting: 2 }, fees: "holders-payday", name: null, minutes: 30 }) };
+  const short = await runOnce(thin);
+  check(left === needs - 1 && short.status === "short" && short.funds.holds === left && short.funds.needs === needs && seen.length === asked && (await readBook(ctx)).epoch === 1n && readLog(logPath).length === 1, `with ${left} lamports in its wallet, one short of the ${needs} an edict can take at ${price} micro-lamports a unit, a look at which an edict is due ends before the model is asked: nothing is sent and nothing written down`);
+  const rehearsedThin = await runOnce({ ...thin, dryRun: true });
+  check(rehearsedThin.status === "rewritten" && rehearsedThin.signature === null && rehearsedThin.funds?.holds === left && rehearsedThin.funds.needs === needs && seen.length === asked + 1 && (await readBook(ctx)).epoch === 1n, "a dry run with that wallet goes ahead, and carries what the wallet held for its caller to speak of");
+
+  // The node's own word on that last lamport. Nothing is sent: it is asked to run a transaction
+  // that pays exactly what the dearest edict pays, from this wallet.
+  const asDearAsAnEdict = async () => {
+    const tx = new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: EDICT_UNITS_MOST }), ComputeBudgetProgram.setComputeUnitPrice({ microLamports: price }), memoIx(agent.publicKey, "As dear as an edict can be."));
+    tx.feePayer = agent.publicKey;
+    tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+    tx.sign(agent);
+    return (await connection.simulateTransaction(tx)).value.err;
+  };
+  const oneShort = await asDearAsAnEdict();
+  await move(alice, agent, 1);
+  const exact = await asDearAsAnEdict();
+  check((await holds()) === needs && JSON.stringify(oneShort).includes("InsufficientFundsForRent") && exact === null, `the node agrees to the lamport: from that wallet it refuses a transaction that pays the ${edictFee(EDICT_UNITS_MOST, price)} lamports of the dearest edict, because the wallet would be left with less than it has to keep (${JSON.stringify(oneShort)}), and with one lamport more it takes it`);
+
+  // The wallet is filled again for the rest of the run. The next look, further down, goes ahead by itself.
+  await move(alice, agent, 50 * LAMPORTS_PER_SOL);
+}
+
 console.log("what the Memo program charges");
 // The dearest character of each stretch of Unicode, from U+007F up to the last one there is,
 // as running every character through this program found them.
@@ -285,6 +324,26 @@ console.log("what the largest rule would cost");
   check(value.err === null && (value.unitsConsumed ?? 0) - spent === 150 && spent + 300 <= RULE_UNITS / 2, `a rule of ${MAX_CONDITIONS} conditions costs the program ${spent} units, and the instruction that sets the limit ${(value.unitsConsumed ?? 0) - spent}: with the two instructions an edict has in front of its rule that comes to ${spent + 300}, under half of the ${RULE_UNITS} an edict allows for them${value.err ? ` FAILED ${JSON.stringify(value.err)}` : ""}`);
 }
 
+console.log("words that would be cut down to signs");
+{
+  // An announcement that has words and opens with twenty rockets. The Memo program could
+  // afford fifteen of them and an ellipsis, which says nothing, so the edict goes without a
+  // memo: a transaction of the limit, the price and the rule, and nothing after. Run by the
+  // node, not sent.
+  const said = `${"\u{1f680}".repeat(20)} Max Buy · 1% is on for 30 minutes. Selling is never restricted.`;
+  const hooks = { buying: { hook: "max-buy", setting: 3 }, fees: "buyback-burn", name: null };
+  const made = edictTransaction({
+    program: HOOK, agent: agent.publicKey, mint: mint.publicKey, change: changeOf({ ...hooks, minutes: 30 }, LIMITS),
+    record: { mint: mint.publicKey.toBase58(), epoch: 2, at: new Date().toISOString(), action: "rewrite", hooks, announcement: said, reasoning: "scripted", model: "stand-in" },
+  });
+  made.tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+  made.tx.sign(agent);
+  const { value } = await connection.simulateTransaction(made.tx);
+  const logs = value.logs ?? [];
+  check(made.memo === "" && made.record.memo === "" && made.record.announcement === said && made.units === edictUnits("", false) && made.tx.instructions.every((instruction) => !instruction.programId.equals(MEMO_PROGRAM)), `an announcement of ${said.length} characters that opens with twenty rockets has no memo the chain could afford that says anything, so its edict is built without one: ${figuresInWords(made)}`);
+  check(value.err === null && runsOf(HOOK, logs).length === 1 && runsOf(MEMO_PROGRAM, logs).length === 0 && (value.unitsConsumed ?? Infinity) * 11 <= made.units * 10, `the node runs that transaction as it stands: the rule and no memo, using ${value.unitsConsumed} of the ${made.units} compute units it asks for${value.err ? ` FAILED ${JSON.stringify(value.err)}` : ""}`);
+}
+
 console.log("words the chain could not afford whole");
 // The dearest sign there is, and the dearest of two cheaper kinds and of the accented letters.
 const [DEAR, LESS_DEAR, LESSER, ACCENTED] = [0x1faaa, 0xffef, 0x2ffc, 0x7ba].map((code) => String.fromCodePoint(code));
@@ -302,6 +361,7 @@ const cutTx = await transactionOf(cutLine.signature);
 book = await readBook(ctx);
 const memoWords = cutLine.record.memo ?? "";
 check(cut.status === "rewritten" && book.epoch === 2n && memoUnits(dear) > MEMO_UNITS && cut.memo === cutLine.record.memo && cutLine.record.announcement === dear, `an edict whose words would cost too much (reckoned at ${memoUnits(dear)} units) lands all the same, and its record keeps the announcement whole`);
+check(cut.status === "rewritten" && !!cut.funds && cut.funds.needs === lamportsForAnEdict(BUSY) && cut.funds.holds >= cut.funds.needs, `with its wallet filled again the agent went ahead by itself: before asking the model it found ${cut.status === "rewritten" ? cut.funds?.holds : "?"} lamports there, of the ${lamportsForAnEdict(BUSY)} an edict can take at that price`);
 check(rehearsed.status === "rewritten" && cut.status === "rewritten" && rehearsed.memo === cut.memo && JSON.stringify(rehearsed.transaction) === JSON.stringify(cut.transaction) && cutTx?.bytes === rehearsed.transaction.bytes && cutTx.asked === rehearsed.transaction.units && cutTx.fee === rehearsed.transaction.feeLamports, "what the rehearsal said is what was then sent: the same memo, a transaction of the same size asking for the same units, and the fee the network charged");
 check(cutTx?.price === BUSY && cutTx.asked === edictUnits(memoWords, false) && cutTx.fee === 5_000 + cutTx.asked, `with the price set to ${BUSY} micro-lamports it bid that, and paid ${cutTx?.fee} lamports: a lamport for each of the ${cutTx?.asked} units it asked for, on top of the 5,000 of its signature`);
 check(memoWords.endsWith("…") && dear.startsWith(memoWords.slice(0, -1)) && /\s/.test(dear[memoWords.length - 1]) && memoUnits(memoWords) <= MEMO_UNITS, `the record says what the memo was: the first ${memoWords.length - 1} of its ${dear.length} characters, cut after a whole word and closed with an ellipsis`);

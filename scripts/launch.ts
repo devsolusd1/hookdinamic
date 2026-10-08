@@ -9,15 +9,20 @@
 // launch that stopped halfway continues where it stopped. The result goes to token.json in
 // the same folder. Mainnet needs --mainnet as well as --send.
 //
+// What an earlier run left on chain is compared with the file before anything is sent. A
+// config and a rulebook can never be changed, so a file that now asks for something else is
+// refused, with what can still be done. Once the token is there, at the end of a launch and
+// on every later run, its config and its mint are read back from the chain and printed.
+//
 // Whatever it refuses, it says in one sentence and leaves with exit code 1.
 import "../src/quiet.js";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { DynamicBondingCurveClient } from "@meteora-ag/dynamic-bonding-curve-sdk";
-import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, sendAndConfirmTransaction } from "@solana/web3.js";
+import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, sendAndConfirmTransaction, SendTransactionError } from "@solana/web3.js";
 import { curveConfig, METEORA_FEE_SHARE, SOL_IN_EXISTENCE } from "../src/curve.js";
 import { BPS, rulebookAddress, span, type Limits, type Name, type Split } from "../src/hook.js";
-import { launch } from "../src/launch.js";
+import { earlierRun, launch, mustNotGraduate, readBack, Refused, TIMES_ALL_SOL, type Launch, type Launched } from "../src/launch.js";
 
 type LaunchFile = {
   rpc: string;
@@ -59,12 +64,17 @@ const NETWORKS: Record<string, string> = {
 
 /** What a launch takes out of the payer's wallet, in SOL: rent for the accounts it creates and the network's fees. Measured: 0.0295. */
 const COST_SOL = 0.03;
+/** What of that is spent once the curve's config is made, and once the rulebook is written as well. Measured: 0.00875 and 0.01762. */
+const SPENT_SOL = { config: 0.009, rulebook: 0.018 };
 /** The least the payer has to hold before anything is sent. */
 const PAYER_NEEDS_SOL = 0.05;
 
 /** An error as one line that is safe to print: the RPC's address carries its key, so only the host of any address is kept. */
 function plain(error: unknown): string {
-  const text = (error instanceof Error ? error.message : String(error)).split("\n")[0];
+  // For a transaction a node refused, the library's first line is only "Simulation failed.":
+  // the node's own reason is what tells a busy node from a refusal by a program.
+  const said = error instanceof SendTransactionError ? `the node refused the transaction: ${error.transactionError.message}` : error instanceof Error ? error.message : String(error);
+  const text = said.split("\n")[0];
   return text.replace(/\b(?:https?|wss?):\/\/[^\s"'<>]+/g, (address) => {
     try {
       return new URL(address).origin;
@@ -74,8 +84,65 @@ function plain(error: unknown): string {
   });
 }
 
-/** Whether the first transaction of this run has been handed over. Before that, a refusal has changed nothing. */
-let sending = false;
+/**
+ * How far this run has got, which decides how a refusal ends. "checking": the file and the
+ * chain are being looked at, and nothing can have been sent. "launching": transactions are
+ * going out. "reading": the token is launched and is being read back.
+ */
+let stage: "checking" | "launching" | "reading" = "checking";
+/** How many transactions this run has sent. */
+let sentNow = 0;
+/** The launch file's own name, for the sentences that say what to do with it. */
+let fileName = "launch.json";
+
+/**
+ * What can still be done after the chain was found to hold something else than the file
+ * asks for, said in the files of the launch folder. It depends on how far the earlier run
+ * got: a new config is a way out only until the rulebook is written.
+ */
+function wayOut({ reached, guardianCan }: Refused): string {
+  const back = `put this folder back as the earlier run left it (${fileName} as it was, with the same mint.json and curve-config.json) and run the same command again, which goes on from where that run stopped`;
+  if (reached === "config") {
+    return `A config can never be changed. Either ${back}; or, to launch what the file says now, delete curve-config.json and run the command again: it makes a new config, and the about ${SPENT_SOL.config} SOL the old one cost is lost.`;
+  }
+  if (reached === "rulebook") {
+    return (
+      `Neither a config nor a rulebook can ever be changed, and a new curve-config.json is no way out now: the rulebook is written once for this mint, and it holds the vault of the one pool this mint and the old config make. ` +
+      `Either ${back}; or, to launch what the file says now, start again in a new folder, with a copy of ${fileName} and of the payer's key and without this folder's mint.json and curve-config.json: the command makes new ones there, so the token gets another address, and the about ${SPENT_SOL.rulebook} SOL spent on the old one is lost.` +
+      (guardianCan ? " Once the token is launched its guardian can replace the agent, the keeper and the app key (docs/emergencia.md), so the first way need not lose anything." : "")
+    );
+  }
+  return `The token is launched, and it is what the chain holds: nothing in ${fileName} can change it now. Put ${fileName} back as it was, and this command reads the token back. What the file says now would be another token, launched from a new folder.`;
+}
+
+/** The last lines of a run that did not end well. They never say "run the same command again" unless that would go on from here. */
+function ending(error: unknown): string {
+  if (error instanceof Refused) {
+    // Read back right after this run's own transactions, the token can only differ from the file if something else wrote to the chain.
+    if (sentNow > 0) return `  The token is launched, and read back from the chain it is not what ${fileName} describes: ${error.difference}.\n  Do not announce it before whoever programs has looked at this.`;
+    return `  ${stage === "checking" ? "Nothing was sent" : "The launch stopped, and this run sent nothing"}: ${error.difference}.\n  ${wayOut(error)}`;
+  }
+  if (stage === "checking") return `  Nothing was sent: ${plain(error)}`;
+  if (stage === "reading") return `  The token is launched, and it could not be read back just now: ${plain(error)}\n  Run the same command again: it sends nothing more, and reads the token back.`;
+  return `  The launch stopped: ${plain(error)}\n  What was done before that stays done. Run the same command again, with ${fileName} as it is: it goes on from where it stopped.`;
+}
+
+/** What the chain says of the launched token, as lines under the summary. */
+function readBackLines(back: Launched, rulebook: PublicKey): string {
+  const whole = (n: number) => Math.round(n).toLocaleString("en-US");
+  // This line is printed on any later day too, so it does not count the times: there is more SOL every year.
+  const times = back.graduationSol > TIMES_ALL_SOL * SOL_IN_EXISTENCE ? `more than ${TIMES_ALL_SOL} times` : `${TIMES_ALL_SOL} times`;
+  return [
+    "  read back from the chain",
+    `  curve          ${back.segments === 1 ? "one segment" : `${back.segments} segments`}, starting at ${back.startCapSol} SOL of market cap; graduating takes`,
+    `                 ${whole(back.graduationSol)} SOL in the curve, ${times} all the SOL there is`,
+    `  trading fee    ${back.feeBps / 100}% per trade, ${back.feeFlat ? "the same for good" : "changing over time"}, taken in ${back.feeInSol ? "SOL" : "the token as well as SOL"}`,
+    `  fee claimer    ${back.feeClaimer.toBase58()}${back.feeClaimer.equals(rulebook) ? ", the token's rulebook" : ""}`,
+    `  hook           on the mint: ${back.hook.toBase58()}`,
+    `  token          ${back.name} (${back.symbol}), card ${back.uri}`,
+    ...back.since.map((note) => `  since launch   ${note}`),
+  ].join("\n");
+}
 
 /**
  * What the address of the token's card answers today. That address goes into the token for
@@ -99,6 +166,7 @@ async function run() {
   const [file, ...flags] = process.argv.slice(2);
   if (!file || file.startsWith("--")) throw new Error("which launch file? e.g. npm run launch -- .local/devnet/launch.json");
   const dir = dirname(resolve(file));
+  fileName = basename(file);
   let input: LaunchFile;
   try {
     input = JSON.parse(readFileSync(file, "utf8")) as LaunchFile;
@@ -174,8 +242,11 @@ async function run() {
   const program = await connection.getAccountInfo(hookProgram);
   if (!program?.executable) throw new Error(`${input.hookProgram} is not a program on ${network}: deploy the hook first`);
   const curve = { startCapSol: input.startCapSol, feeBps: input.feeBps };
-  // Read from the config the launch would send, so the summary says what goes on chain.
-  const graduationSol = Number(curveConfig(curve).migrationQuoteThreshold.toString()) / LAMPORTS_PER_SOL;
+  // Read from the config the launch would send, so the summary says what goes on chain. The
+  // summary says "cannot graduate" only of a curve that is refused if it could.
+  const wouldSend = curveConfig(curve);
+  mustNotGraduate(wouldSend);
+  const graduationSol = Number(wouldSend.migrationQuoteThreshold.toString()) / LAMPORTS_PER_SOL;
   const balance = (await connection.getBalance(payer.publicKey)) / LAMPORTS_PER_SOL;
   const round = (n: number) => Math.round(n).toLocaleString("en-US");
   /** A line under one of the summary's, when there is something to warn of. */
@@ -206,38 +277,35 @@ async function run() {
   opens with     no rule; fees ${split.holdersBps / 100}% holders, ${split.burnBps / 100}% burn, ${split.treasuryBps / 100}% treasury
 `);
 
+  const launching: Launch = { dbc: DynamicBondingCurveClient.create(connection, "confirmed"), hookProgram, payer, mint, config, guardian, agent, keeper, cosigner, limits, split, curve, names: input.names, uri: input.uri };
+
   // A dry run ends by reaching the end of the file, not through process.exit. On Windows that
   // call cuts across the connections to the RPC and to the card's address while Node is still
   // closing them, and the process dies on its way out with a failed assertion and exit code 127.
-  if (!send) return void console.log(`Nothing was sent. Add --send to launch${network === "mainnet" ? ", and --mainnet with it" : ""}. A launch costs the payer about ${COST_SOL} SOL.`);
+  if (!send) {
+    // It looks at what an earlier run left as well, so that the summary above is never shown for a token the chain would not let this file make.
+    const reached = await earlierRun(launching);
+    if (reached === "pool") {
+      console.log(`${readBackLines(await readBack(launching, 1), rulebook)}\n`);
+      return void console.log("Nothing was sent. This token is already launched, and --send would send nothing either.");
+    }
+    if (reached) return void console.log(`Nothing was sent. An earlier run already ${reached === "config" ? "made the curve's config" : "made the curve's config and wrote the rulebook"}, as this file describes ${reached === "config" ? "it" : "them"}: --send${network === "mainnet" ? " with --mainnet" : ""} goes on from there.`);
+    return void console.log(`Nothing was sent. Add --send to launch${network === "mainnet" ? ", and --mainnet with it" : ""}. A launch costs the payer about ${COST_SOL} SOL.`);
+  }
 
   if (network === "mainnet" && !flags.includes("--mainnet")) throw new Error("this is mainnet: add --mainnet if that is what you mean");
   if (balance < PAYER_NEEDS_SOL) throw new Error(`the payer needs at least ${PAYER_NEEDS_SOL} SOL: a launch costs about ${COST_SOL} SOL`);
 
-  sending = true;
-  const { pool } = await launch(
-    {
-      dbc: DynamicBondingCurveClient.create(connection, "confirmed"),
-      hookProgram,
-      payer,
-      mint,
-      config,
-      guardian,
-      agent,
-      keeper,
-      cosigner,
-      limits,
-      split,
-      curve,
-      names: input.names,
-      uri: input.uri,
-    },
-    async (what, tx, signers) => {
-      const signature = await sendAndConfirmTransaction(connection, tx, signers, { commitment: "confirmed" });
-      console.log(`  ${what}: ${signature}`);
-    },
-  );
+  stage = "launching";
+  const { pool } = await launch(launching, async (what, tx, signers) => {
+    const signature = await sendAndConfirmTransaction(connection, tx, signers, { commitment: "confirmed" });
+    sentNow++;
+    console.log(`  ${what}: ${signature}`);
+  });
 
+  // The addresses are written down before the token is read back, so that a node that is slow to show it costs nothing.
+  stage = "reading";
+  const tokenFile = resolve(dir, "token.json");
   const token = {
     network,
     rpc: input.rpc,
@@ -249,8 +317,19 @@ async function run() {
     feeBps: input.feeBps,
     launchedAt: new Date().toISOString(),
   };
-  writeFileSync(resolve(dir, "token.json"), `${JSON.stringify(token, null, 2)}\n`);
-  console.log(`\n  launched. Addresses are in ${resolve(dir, "token.json")}`);
+  /** Whether the file already there is this token's. A run that sent nothing leaves it as it is, with the day of the launch in it. */
+  const written = () => {
+    try {
+      const kept = JSON.parse(readFileSync(tokenFile, "utf8")) as Partial<typeof token>;
+      return kept.mint === token.mint && kept.pool === token.pool && kept.hookProgram === token.hookProgram;
+    } catch {
+      return false;
+    }
+  };
+  if (sentNow > 0 || !written()) writeFileSync(tokenFile, `${JSON.stringify(token, null, 2)}\n`);
+  console.log(sentNow > 0 ? `\n  launched. Addresses are in ${tokenFile}` : `\n  already launched: this run sent nothing. Addresses are in ${tokenFile}`);
+
+  console.log(`\n${readBackLines(await readBack(launching), rulebook)}\n`);
 }
 
 // A refusal is one sentence, not a stack trace. The command still ends by reaching the end of
@@ -258,8 +337,6 @@ async function run() {
 try {
   await run();
 } catch (error) {
-  console.error(sending
-    ? `\n  The launch stopped: ${plain(error)}\n  What was done before that stays done. Run the same command again: it goes on from where it stopped.\n`
-    : `\n  Nothing was sent: ${plain(error)}\n`);
+  console.error(`\n${ending(error)}\n`);
   process.exitCode = 1;
 }
