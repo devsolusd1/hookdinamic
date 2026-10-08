@@ -27,10 +27,10 @@ import {
   type Books, type Fault, type Head, type Line, type Store,
 } from "../src/keeper/books.js";
 import type { Chain, OwnerAccount, Status, TokenAccount } from "../src/keeper/chain.js";
-import { admitted, count, opensIn, placesOf, room, takeFromPool, type Reading } from "../src/keeper/fees.js";
+import { admitted, buybackTx, claimTx, count, networkFee, opensIn, placesOf, room, takeFromPool, treasuryTx, UNITS, type Reading } from "../src/keeper/fees.js";
 import { base58, creditHolders, due, knownSignatures, lapse, listHolders, minPayment, openRoundOf, payHolders, POOL_AUTHORITY, recover, strangers, type RunOptions, type Snapshot } from "../src/keeper/holders.js";
 import { Retired, turn, type Hooks, type KeeperContext } from "../src/keeper/round.js";
-import { DEFAULTS, plain, settingsFrom, type Settings } from "../src/keeper/settings.js";
+import { DEFAULTS, inSol, MAX_BATCH_SIZE, MAX_MICRO_LAMPORTS_PER_UNIT, plain, settingsFrom, type Settings } from "../src/keeper/settings.js";
 
 const ROOT = join(tmpdir(), `keeper-sim-${process.pid}`);
 const RENT = 650_240n;
@@ -331,8 +331,22 @@ const CURVE = Keypair.generate().publicKey;
 
 /** Who holds what of the token from one slot on. */
 type TokenState = { slot: number; holders: Map<string, bigint>; poolTokens: bigint; burn: bigint; hasBurn: boolean };
-/** A transaction in a block, as a node shows it. */
-type InBlock = { signature: string; slot: number; height: number; err: unknown; keys: PublicKey[]; vaultBefore: bigint; vaultAfter: bigint };
+/**
+ * A transaction in a block, as a node shows it. The last four are what it asked of the network
+ * and paid it: the compute units and the price it set, the fee it was charged, its length in
+ * bytes as it was sent, and how many plain transfers of SOL it carries.
+ */
+type InBlock = { signature: string; slot: number; height: number; err: unknown; keys: PublicKey[]; vaultBefore: bigint; vaultAfter: bigint; units: number; price: number; fee: bigint; bytes: number; transfers: number };
+
+/** The longest a transaction may be, in bytes: what fits in one packet. */
+const PACKET = 1_232;
+
+/**
+ * What the network charges for a transaction with one signature, by the runtime's own sum:
+ * 5,000 lamports for the signature, and the price on every unit asked for, rounded up to the
+ * lamport. Written out here in whole numbers, apart from the keeper's own reckoning of it.
+ */
+const charged = (units: number, price: number) => 5_000n + (BigInt(units) * BigInt(price) + 999_999n) / 1_000_000n;
 
 /**
  * One object that answers every RPC call `turn` makes, as a web3.js Connection would, and
@@ -374,8 +388,12 @@ class Net {
   inBlocks = new Map<string, InBlock>();
   private queue = new Map<string, { tx: Transaction; due: number }>();
   private blockhashes = new Map<string, number>();
+  /** How long each transaction was, in bytes, as it was sent. */
+  private lengths = new Map<string, number>();
   feesCharged = 0n;
   rentPaid = 0n;
+  /** When set, nothing that is sent reaches a block: the network is too busy for what the keeper offers. */
+  deaf = false;
 
   /** Signatures and transactions from blocks before this slot are "never seen". */
   forgotBefore = 0;
@@ -451,7 +469,8 @@ class Net {
   }
   private isFinal = (tx: InBlock) => this.height - tx.height >= FINAL_AFTER;
 
-  private feeOf(tx: Transaction): bigint {
+  /** The compute units a transaction asks for and the price it sets on each, read from its own instructions. */
+  private budgetOf(tx: Transaction): { units: number; price: number } {
     let [units, price] = [200_000 * tx.instructions.length, 0];
     for (const ix of tx.instructions) {
       if (!ix.programId.equals(ComputeBudgetProgram.programId)) continue;
@@ -459,7 +478,12 @@ class Net {
       if (kind === "SetComputeUnitLimit") units = ComputeBudgetInstruction.decodeSetComputeUnitLimit(ix).units;
       if (kind === "SetComputeUnitPrice") price = Number(ComputeBudgetInstruction.decodeSetComputeUnitPrice(ix).microLamports);
     }
-    return 5_000n + BigInt(Math.ceil((units * price) / 1_000_000));
+    return { units, price };
+  }
+
+  private feeOf(tx: Transaction): bigint {
+    const { units, price } = this.budgetOf(tx);
+    return charged(units, price);
   }
 
   /** Runs a transaction's instructions. With `keep` false, or if one fails, everything is put back: that is a rehearsal, or a transaction that failed. */
@@ -544,7 +568,8 @@ class Net {
     this.feesCharged += fee;
     const { err, did, vaultBefore, vaultAfter } = this.run(tx, true);
     const keys = [tx.feePayer!, ...tx.instructions.flatMap((ix) => [...ix.keys.map((key) => key.pubkey), ix.programId])].filter((key, i, all) => all.findIndex((other) => other.equals(key)) === i);
-    this.inBlocks.set(signature, { signature, slot: this.slot, height: this.height, err, keys, vaultBefore, vaultAfter });
+    const transfers = tx.instructions.filter((ix) => ix.programId.equals(SystemProgram.programId)).length;
+    this.inBlocks.set(signature, { signature, slot: this.slot, height: this.height, err, keys, vaultBefore, vaultAfter, ...this.budgetOf(tx), fee, bytes: this.lengths.get(signature) ?? 0, transfers });
     if (err === null) this.onLanded?.(did);
   }
 
@@ -643,7 +668,8 @@ class Net {
     sendRawTransaction: async (raw: Uint8Array) => {
       const tx = Transaction.from(raw);
       const signature = base58(tx.signature!);
-      if (!this.inBlocks.has(signature) && !this.queue.has(signature) && this.blockhashes.has(tx.recentBlockhash!)) this.queue.set(signature, { tx, due: this.height + 1 });
+      this.lengths.set(signature, raw.length);
+      if (!this.deaf && !this.inBlocks.has(signature) && !this.queue.has(signature) && this.blockhashes.has(tx.recentBlockhash!)) this.queue.set(signature, { tx, due: this.height + 1 });
       return signature;
     },
     simulateTransaction: async (given: VersionedTransaction) => {
@@ -909,6 +935,11 @@ async function main() {
     let refused = false;
     try { settingsFrom({ claimAt: 1 }); } catch { refused = true; }
     check(refused, "a setting that does not exist is refused, not ignored");
+    // The priority fee and the batch size go into every transaction: a figure no transaction could be built with, or that nobody can have meant, is refused before the keeper starts.
+    const refuses = (given: Record<string, unknown>) => { try { settingsFrom(given); return false; } catch { return true; } };
+    check(DEFAULTS.microLamportsPerUnit === 10_000 && settingsFrom({ microLamportsPerUnit: 0 }).microLamportsPerUnit === 0 && settingsFrom({ microLamportsPerUnit: 20_000 }).microLamportsPerUnit === 20_000 && settingsFrom({ microLamportsPerUnit: MAX_MICRO_LAMPORTS_PER_UNIT }).microLamportsPerUnit === 10_000_000, "the priority fee is 10,000 micro-lamports a compute unit unless the settings say otherwise, and they may say anything from none to ten lamports a unit");
+    check(refuses({ microLamportsPerUnit: MAX_MICRO_LAMPORTS_PER_UNIT + 1 }) && refuses({ microLamportsPerUnit: 20_000.5 }) && refuses({ microLamportsPerUnit: -1 }) && refuses({ microLamportsPerUnit: "20000" }), "a priority fee above that, one that is not a whole number, one below zero and one written as text are refused");
+    check(DEFAULTS.batchSize === MAX_BATCH_SIZE && settingsFrom({ batchSize: 20 }).batchSize === 20 && settingsFrom({ batchSize: 1 }).batchSize === 1 && refuses({ batchSize: 21 }) && refuses({ batchSize: 0 }) && refuses({ batchSize: 2.5 }), "a payout transaction carries from 1 to 20 transfers, and a batch size outside that is refused");
 
     const store: Store = { dir: join(ROOT, "lock") };
     const lock = join(store.dir, "private", "keeper.lock");
@@ -931,6 +962,51 @@ async function main() {
     holdLock(store);
     check(readFileSync(lock, "utf8") === String(process.pid), "and so is the lock of a keeper that was killed");
     releaseLock(store);
+  }
+
+  console.log("what each transaction asks of the network, and pays it");
+  {
+    const keeper = Keypair.generate();
+    const net = new Net(keeper.publicKey, new Map());
+    const mine = placesOf({ hookProgram: net.hookProgram, mint: net.mint, pool: net.pool, keeper: keeper.publicKey, treasury: Keypair.generate().publicKey });
+    /** The limit and the price a transaction sets. `first`: they are its first two instructions, in that order, and it has no other of the kind. */
+    const asks = (tx: Transaction) => {
+      const kinds = tx.instructions.map((ix) => (ix.programId.equals(ComputeBudgetProgram.programId) ? ComputeBudgetInstruction.decodeInstructionType(ix) : null));
+      const first = kinds[0] === "SetComputeUnitLimit" && kinds[1] === "SetComputeUnitPrice" && kinds.slice(2).every((kind) => kind === null);
+      return { first, units: first ? ComputeBudgetInstruction.decodeSetComputeUnitLimit(tx.instructions[0]).units : -1, price: first ? Number(ComputeBudgetInstruction.decodeSetComputeUnitPrice(tx.instructions[1]).microLamports) : -1 };
+    };
+    /** How long a transaction is once the keeper has signed it, in bytes. */
+    const lengthOf = (tx: Transaction) => {
+      tx.feePayer = keeper.publicKey;
+      tx.recentBlockhash = PublicKey.default.toBase58();
+      tx.sign(keeper);
+      return tx.serialize().length;
+    };
+    const lengths = new Set<string>();
+    for (const price of [DEFAULTS.microLamportsPerUnit, 0, 20_000, 12_345, 1_000_000, MAX_MICRO_LAMPORTS_PER_UNIT]) {
+      const settings = { ...DEFAULTS, microLamportsPerUnit: price };
+      const claim = claimTx(mine, net.config, 123_456_789n, settings);
+      const treasury = treasuryTx(mine, 123_456_789n, settings);
+      const buyback = await buybackTx(net.dbc as unknown as DynamicBondingCurveClient, mine, { lamports: SOL / 10n, atMostTokens: "any", burnFirst: 5n }, settings);
+      const built: [string, { tx: Transaction; fee: bigint } | null, number][] = [["a claim", claim, UNITS.claim], ["a payment to the treasury", treasury, UNITS.transfer], ["a buyback", buyback, UNITS.buyback]];
+      check(
+        built.every(([, one, units]) => !!one && asks(one.tx).first && asks(one.tx).units === units && asks(one.tx).price === price && one.fee === charged(units, price)),
+        `at ${price} micro-lamports a unit a claim asks for ${UNITS.claim} units and pays ${claim.fee} lamports, a payment to the treasury ${UNITS.transfer} and ${treasury.fee}, a buyback ${UNITS.buyback} and ${buyback?.fee}: each sets its limit and that price once, before anything else, and reckons its fee as the network does`,
+      );
+      lengths.add(`${lengthOf(claim.tx)}, ${lengthOf(treasury.tx)}`);
+    }
+    const [claimBytes, treasuryBytes] = [...lengths][0].split(", ").map(Number);
+    check(lengths.size === 1 && claimBytes <= PACKET && treasuryBytes <= PACKET, `whatever the price, a claim is ${claimBytes} bytes long and a payment to the treasury ${treasuryBytes}, of the ${PACKET} a transaction may be`);
+    // Every limit the keeper asks for, at prices that do not divide evenly: where a fee has to be rounded, it is rounded as the network rounds it.
+    const limits = [UNITS.claim, UNITS.buyback, UNITS.transfer, ...Array.from({ length: MAX_BATCH_SIZE }, (_, i) => 200 * (i + 3) + 1_000)];
+    const odd = [1, 7, 999, 4_999, 12_345, 333_333, 9_999_999, MAX_MICRO_LAMPORTS_PER_UNIT];
+    check(odd.every((price) => limits.every((units) => networkFee(units, { microLamportsPerUnit: price }) === charged(units, price))), `the keeper's reckoning of a fee is the network's to the lamport at ${odd.length} prices that do not divide evenly, for every limit it asks for`);
+    // One transfer more than the settings allow, with the two instructions that set the fee: the library refuses to sign what the network would not take.
+    const tooMany = new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 5_600 }), ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 0 }));
+    for (let i = 0; i <= MAX_BATCH_SIZE; i++) tooMany.add(SystemProgram.transfer({ fromPubkey: keeper.publicKey, toPubkey: Keypair.generate().publicKey, lamports: 1 }));
+    let tooLong = "";
+    try { lengthOf(tooMany); } catch (error) { tooLong = error instanceof Error ? error.message : String(error); }
+    check(/too large/.test(tooLong), `a payout of ${MAX_BATCH_SIZE + 1} could not be signed at all (${tooLong}), which is why the settings stop at ${MAX_BATCH_SIZE}`);
   }
 
   console.log("who the holders are");
@@ -1402,6 +1478,135 @@ async function main() {
     check(died && saidU.at(-1)?.startsWith("retired:") === true && readBooks(u.store).totals.claimed === THIRD.toString(), `its own claim, landed before the change, is counted for what it took and not for what the next keeper has taken since (its books say it claimed ${sol(BigInt(readBooks(u.store).totals.claimed))})`);
     check(u.net.balance(u.treasury) - u.treasuryHad === FORTY && u.holders.every((holder) => u.net.balance(holder) > 0n), "and it is paid out like the rest");
     agree(u, "after the replaced keeper settled its last claim", SOL / 10n);
+  });
+
+  await withWorlds("the priority fee, from none to the most the settings take", async () => {
+    /** What a life came to for everybody but the network: who received what, and the ledger with the signatures, the hashes, the times and the network's fees left out. */
+    const cameTo = (w: World) => {
+      const amounts = (line: Line) => {
+        const t = line.totals;
+        const totals = [t.claimed, t.treasury.paid, t.treasury.owed, t.burn.spent, t.burn.tokens, t.burn.owed, t.holders.paid, t.holders.owed];
+        if (line.kind === "claim") return [line.kind, line.lamports, line.holders, line.burn, line.treasury, ...totals];
+        if (line.kind === "buyback") return [line.kind, line.lamports, line.tokens, ...totals];
+        if (line.kind === "credit") return [line.kind, line.lamports, line.holders, line.tokens, ...totals];
+        if (line.kind === "payout") return [line.kind, line.lamports, line.payments, line.transactions.length, line.putOff.payments, ...totals];
+        return [line.kind, line.kind === "note" ? line.text : line.lamports, ...totals];
+      };
+      return JSON.stringify({ treasury: (w.net.balance(w.treasury) - w.treasuryHad).toString(), holders: w.holders.map((holder) => w.net.balance(holder).toString()), burned: (w.supply - w.net.supplyOf(w.net.tokens)).toString(), ledger: ledgerOf(w).map(amounts) });
+    };
+    let usual = "";
+    for (const price of [DEFAULTS.microLamportsPerUnit, 0, 20_000, 12_345, 1_000_000, MAX_MICRO_LAMPORTS_PER_UNIT]) {
+      const at = `at ${price} micro-lamports a unit`;
+      // Forty-five holders: two full payout transactions and a third of five.
+      const w = world(`price ${price}`, { holders: 45, settings: { microLamportsPerUnit: price } });
+      w.net.fees(SOL);
+      await rest(w, at);
+      agree(w, at);
+      const lines = ledgerOf(w);
+      const kindOf = new Map<string, string>(lines.flatMap((line): [string, string][] => (line.kind === "payout" ? line.transactions.map((one): [string, string] => [one.signature, "payout"]) : line.kind === "claim" || line.kind === "treasury" || line.kind === "buyback" ? [[line.signature, line.kind]] : [])));
+      const landed = [...w.net.inBlocks.values()];
+      const limitOf = (tx: InBlock) => ({ claim: UNITS.claim, treasury: UNITS.transfer, buyback: UNITS.buyback, payout: 200 * (tx.transfers + 2) + 1_000 })[kindOf.get(tx.signature) ?? ""];
+      check(
+        landed.length === kindOf.size && landed.every((tx) => tx.err === null && tx.units === limitOf(tx) && tx.price === price && tx.fee === charged(tx.units, price)),
+        `${at}, each of the keeper's ${landed.length} transactions asked for the limit of its kind, set that price, and was charged what the two come to`,
+      );
+      const most = (kind: string) => landed.filter((tx) => kindOf.get(tx.signature) === kind).reduce((fee, tx) => (tx.fee > fee ? tx.fee : fee), 0n);
+      // The keeper's own SOL paid the network and the rent of its one token account. `agree` has just shown the wallet holds everything else.
+      check(
+        w.net.balance(w.keeper.publicKey) - inHand(readBooks(w.store)) === w.own - w.net.feesCharged - w.net.rentPaid && w.net.feesCharged === landed.reduce((sum, tx) => sum + tx.fee, 0n),
+        `${at} the network took ${w.net.feesCharged} lamports, all of it from the keeper's own SOL: a claim ${most("claim")}, a payment to the treasury ${most("treasury")}, a buyback ${most("buyback")}, a payout to twenty ${most("payout")}`,
+      );
+      const longest = landed.filter((tx) => kindOf.get(tx.signature) === "payout").reduce((one, tx) => (tx.bytes > one.bytes ? tx : one));
+      check(
+        longest.transfers === MAX_BATCH_SIZE && longest.bytes <= PACKET && PACKET - longest.bytes < 49,
+        `${at} the longest payout carries ${longest.transfers} transfers in ${longest.bytes} bytes of the ${PACKET} a transaction may be: it fits, and one transfer more, 49 bytes, would not`,
+      );
+      if (price === DEFAULTS.microLamportsPerUnit) usual = cameTo(w);
+      else check(cameTo(w) === usual, `${at} the treasury, the burn and each of the 45 holders get what they get at the usual price, to the lamport, and the ledger reads the same line for line: the price changes what the network is paid and nothing else`);
+    }
+  });
+
+  await withWorlds("a keeper short of SOL of its own, at a hundred times the usual priority fee", async () => {
+    const price = 1_000_000;
+    const w = world("short at a price", { settings: { microLamportsPerUnit: price } });
+    const heard: string[] = [];
+    w.ctx.report = (line) => heard.push(line);
+    const address = w.keeper.publicKey.toBase58();
+    /** The owner sends the keeper's wallet some SOL. */
+    const topUp = (lamports: bigint) => { w.own += lamports; w.net.lamports.set(address, w.net.balance(address) + lamports); };
+    // What each step takes at this price, by the network's own sum. The first claim also opens the keeper's token account. Twelve holders are one payout transaction.
+    const takes = { claim: charged(UNITS.claim, price) + TOKEN_RENT, treasury: charged(UNITS.transfer, price), buyback: charged(UNITS.buyback, price), round: charged(200 * (12 + 2) + 1_000, price) };
+    // It starts with one lamport less than the claim takes, on top of the least a wallet may hold.
+    w.own = takes.claim + WALLET_RENT - 1n;
+    w.net.lamports.set(address, w.own);
+    w.net.fees(THIRD);
+    const short = await once(w);
+    check(
+      short.startsWith(`waiting: I cannot afford to claim the fees: it takes ${inSol(takes.claim)} of my own`) && short.includes(`My wallet ${address} needs topping up`) && w.net.inBlocks.size === 0 && w.net.waiting === THIRD,
+      `one lamport short of what a claim takes at this price, the keeper claims nothing and names the sum: ${inSol(takes.claim)}, where at the usual price it would be ${inSol(charged(UNITS.claim, DEFAULTS.microLamportsPerUnit) + TOKEN_RENT)}`,
+    );
+    topUp(1n);
+    const claimed = await once(w);
+    const waits = [`I cannot afford to send the treasury its share: it takes ${inSol(takes.treasury)} of my own`, `I cannot afford to buy back: it takes ${inSol(takes.buyback)} of my own`, `I cannot afford to pay round 1: it takes ${inSol(takes.round)} of my own`];
+    check(claimed.startsWith("settled: claimed 0.3 SOL") && w.net.balance(address) === THIRD + WALLET_RENT, "given that lamport it claims, and is left holding the fees it claimed and the least a wallet may hold");
+    check(
+      waits.every((wait) => heard.some((line) => line.startsWith(wait))) && w.net.balance(w.treasury) === w.treasuryHad && sentToHolders(w) === 0n && w.net.supplyOf(w.net.tokens) === w.supply && w.net.inBlocks.size === 1,
+      "with 0.3 SOL of fees in its wallet and nothing of its own to spare it sends nothing more: the treasury's payment, the buyback and the payout each wait, and each names what it takes at this price",
+    );
+    const still = await once(w);
+    check(still.startsWith("waiting: I cannot afford") && waits.every((wait) => still.includes(wait)) && still.includes("needs topping up") && w.net.inBlocks.size === 1, "the next round says the same, in the words the service's /health takes for a wallet that needs topping up");
+    // Exactly what the three take, and not a lamport more.
+    topUp(takes.treasury + takes.buyback + takes.round);
+    await rest(w, "topped up at a price");
+    agree(w, "topped up at a price");
+    check(
+      w.net.balance(address) - inHand(readBooks(w.store)) === WALLET_RENT && w.net.balance(w.treasury) - w.treasuryHad === FORTY && w.holders.every((holder) => w.net.balance(holder) > 0n) && w.supply > w.net.supplyOf(w.net.tokens),
+      `topped up with exactly the ${takes.treasury + takes.buyback + takes.round} lamports those three take at this price, it does all three: its own SOL is down to the least a wallet may hold, and every lamport of the fees went where the books say`,
+    );
+  });
+
+  await withWorlds("a network too busy to take what the keeper offers", async () => {
+    // Nothing the keeper sends reaches a block. Its claim is sent again every time it looks, until its blockhash has run out.
+    const w = world("deaf to a claim");
+    const heard: string[] = [];
+    w.ctx.report = (line) => heard.push(line);
+    w.net.fees(THIRD);
+    w.net.deaf = true;
+    const said = await rounds(w, 2);
+    // These are the words to look for in the service's log, and for a moment in "saying" on its /health, when the priority fee is too low.
+    const dead = heard.filter((line) => /^my claim \S+ never landed and no longer can: nothing moved, and I start it again$/.test(line));
+    check(dead.length === 2 && new Set(dead).size === 2, `a claim the network never took is said to have never landed, and is signed afresh the next round (the keeper said: ${heard.map((line) => line.slice(0, 60)).join(" / ")})`);
+    check(
+      said.every((line) => line.startsWith("waiting: nothing is due: 0.3 SOL of fees wait in the pool (I claim at 0.05 SOL)")),
+      `each of those rounds ends by saying nothing is due, with more waiting in the pool than the keeper claims at: that is all its last word shows (${said[0].slice(0, 90)})`,
+    );
+    check(
+      w.net.inBlocks.size === 0 && w.net.feesCharged === 0n && w.net.balance(w.keeper.publicKey) === w.own && w.net.waiting === THIRD && ledgerOf(w).length === 0 && readBooks(w.store).pending === null,
+      "nothing moved, nothing is out and the network charged nothing: a transaction that never lands costs nothing",
+    );
+    w.net.deaf = false;
+    await rest(w, "a network that listens again");
+    agree(w, "after the network took the claim");
+    check(w.net.balance(w.treasury) - w.treasuryHad === FORTY && w.holders.every((holder) => w.net.balance(holder) > 0n), "once the network takes its transactions the keeper claims and pays as if nothing had happened");
+
+    // The same when the claim lands and the payout round that follows does not.
+    const v = world("deaf to a payout");
+    const heardV: string[] = [];
+    v.ctx.report = (line) => heardV.push(line);
+    v.net.fees(THIRD);
+    v.hooks.fault = (point) => { if (point === "plan written") v.net.deaf = true; };
+    const first = await once(v);
+    const expired = heardV.filter((line) => /^transaction \S+ expired$/.test(line));
+    check(
+      expired.length === 3 && new Set(expired).size === 3 && first.includes("paid 0 holders 0 SOL in 0 transactions (round 1); 12 put off to the next round") && sentToHolders(v) === 0n,
+      `a payout the network never took is signed three times, each said to have expired, and then the round closes with everybody put off (${first.slice(first.lastIndexOf("paid 0"))})`,
+    );
+    v.net.deaf = false;
+    v.hooks.fault = undefined;
+    await rest(v, "a network that listens again, with holders put off");
+    agree(v, "after the network took the payout");
+    const paid = ledgerOf(v).filter((line) => line.kind === "payout");
+    check(paid.length === 2 && paid[1].kind === "payout" && paid[1].payments === 12 && v.holders.every((holder) => v.net.balance(holder) > 0n), "the next round pays all twelve, once");
   });
 
   console.log("what an error is printed as");

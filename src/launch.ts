@@ -48,8 +48,10 @@ export type Launch = {
 export type Send = (what: string, tx: Transaction, signers: Keypair[]) => Promise<unknown>;
 
 const bytes = (name: Name) => Buffer.byteLength(name.name) + Buffer.byteLength(name.symbol);
+/** Lamports as whole SOL, for a sentence. */
+const inSol = (lamports: { toString(): string }) => Math.round(Number(lamports.toString()) / 1e9).toLocaleString("en-US");
 
-export async function launch(p: Launch, send: Send): Promise<{ pool: PublicKey; solToGraduate: number }> {
+export async function launch(p: Launch, send: Send): Promise<{ pool: PublicKey }> {
   const renamable = p.names.length > 1;
   const params = curveConfig({ ...p.curve, renamable });
   const pool = deriveDbcPoolAddress(NATIVE_MINT, p.mint.publicKey, p.config.publicKey);
@@ -62,8 +64,8 @@ export async function launch(p: Launch, send: Send): Promise<{ pool: PublicKey; 
       ...params,
       config: p.config.publicKey,
       // The fees can be claimed only by the rulebook's address, which is to say only by the
-      // hook program, for the keeper. Tokens left over if the curve ever filled would go to
-      // the same address; the curve is built to leave none.
+      // hook program, for the keeper. Tokens left over at a graduation would go to the same
+      // address; the curve cannot graduate, and is built to leave none.
       feeClaimer: book,
       leftoverReceiver: book,
       quoteMint: NATIVE_MINT,
@@ -72,9 +74,12 @@ export async function launch(p: Launch, send: Send): Promise<{ pool: PublicKey; 
     });
     await send("create the curve's config", config, [p.payer, p.config]);
   } else {
-    // A config left by an earlier run is reused, and who claims its fees can never change.
+    // A config left by an earlier run is reused, and nothing in it can ever change: not who
+    // claims its fees, and not where its curve graduates. A config made before the curve was
+    // set never to graduate would be a curve that can.
     const made = await p.dbc.state.getPoolConfig(p.config.publicKey);
     if (!made?.feeClaimer.equals(book)) throw new Error(`the curve config ${p.config.publicKey.toBase58()} gives its fees to ${made?.feeClaimer.toBase58() ?? "nobody"}, not to this token's rulebook, and that cannot be changed: launch with a new config`);
+    if (!made.migrationQuoteThreshold.eq(params.migrationQuoteThreshold)) throw new Error(`the curve config ${p.config.publicKey.toBase58()} would graduate with ${inSol(made.migrationQuoteThreshold)} SOL in it, not the ${inSol(params.migrationQuoteThreshold)} this launch sets, and that cannot be changed: launch with a new config`);
   }
 
   // The rulebook goes in before the pool: the mint's own key signs it, and without it no
@@ -142,5 +147,5 @@ export async function launch(p: Launch, send: Send): Promise<{ pool: PublicKey; 
     }
   }
 
-  return { pool, solToGraduate: Number(params.migrationQuoteThreshold.toString()) / 1e9 };
+  return { pool };
 }

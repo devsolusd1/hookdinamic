@@ -13,6 +13,7 @@
 //
 //   npm run validator     (in one terminal; needs WSL)
 //   npm run e2e:keeper    (about twenty minutes)
+//   npm run e2e:keeper -- --price=12345    the same, with the keeper's priority fee at that many micro-lamports a compute unit
 //
 // It is slow for three reasons. Every transaction of the keeper waits for a finalized block,
 // a quarter of a minute here. One of them is left to expire, a minute and a half. And the
@@ -32,13 +33,14 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deriveDbcPoolAddress, deriveDbcTokenVaultAddress, DynamicBondingCurveClient, SwapMode } from "@meteora-ag/dynamic-bonding-curve-sdk";
 import { createAssociatedTokenAccountIdempotentInstruction, createTransferCheckedWithTransferHookInstruction, getAssociatedTokenAddressSync, NATIVE_MINT, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
-import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemInstruction, SystemProgram, Transaction, type TransactionInstruction } from "@solana/web3.js";
+import { ComputeBudgetProgram, Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemInstruction, SystemProgram, Transaction, type TransactionInstruction } from "@solana/web3.js";
 import BN from "bn.js";
 import { FEE_HOOKS, ruleOf } from "../site/hooks.js";
 import { TOKEN_DECIMALS } from "../src/curve.js";
 import { METEORA_DBC, rulebookAddress, setKeeperIx, setRulesIx, type Limits, type Split } from "../src/hook.js";
 import type { Books, Fault, Head, Line } from "../src/keeper/books.js";
-import { settingsFrom } from "../src/keeper/index.js";
+import { UNITS } from "../src/keeper/fees.js";
+import { DEFAULTS, settingsFrom } from "../src/keeper/index.js";
 import { turn, type KeeperContext } from "../src/keeper/round.js";
 import { launch } from "../src/launch.js";
 
@@ -184,7 +186,20 @@ function run(command: string[], env: NodeJS.ProcessEnv, until?: () => boolean, a
   });
 }
 
-const FAST = { pollMs: 500 };
+/**
+ * The priority fee the keeper is run at, in micro-lamports per compute unit: the one it ships
+ * with, or the one given as --price=, to see on a real node that the network charges what the
+ * keeper reckons at another price too.
+ */
+const PRICE = Number(process.argv.find((arg) => arg.startsWith("--price="))?.slice("--price=".length) ?? DEFAULTS.microLamportsPerUnit);
+/**
+ * What the network charges for a transaction with one signature, by the runtime's own sum:
+ * 5,000 lamports for the signature, and the price on every unit asked for, rounded up to the
+ * lamport. Written out here in whole numbers, apart from the keeper's own reckoning of it.
+ */
+const chargedFor = (units: number, price: number) => 5_000n + (BigInt(units) * BigInt(price) + 999_999n) / 1_000_000n;
+
+const FAST = { pollMs: 500, ...(PRICE === DEFAULTS.microLamportsPerUnit ? {} : { microLamportsPerUnit: PRICE }) };
 const HUGE = "1000000000000000";
 /** Every number as the keeper ships, except that no payout round starts: the test opens the first one itself, to kill it. */
 const NO_PAYOUT = { ...FAST, payWhenLamports: HUGE };
@@ -378,9 +393,10 @@ async function follow(): Promise<Line[]> {
 /**
  * One transaction the keeper's key paid for, as the chain shows it: what the network charged,
  * whether it went through, the programs it calls, whether Meteora was called from inside one
- * of them, and its plain transfers of SOL.
+ * of them, and its plain transfers of SOL. Then the compute units it asked for, the price it
+ * set on each, and the units it used in the end.
  */
-type Seen = { fee: bigint; landed: boolean; programs: string[]; meteoraInside: boolean; transfers: { to: string; lamports: bigint }[] };
+type Seen = { fee: bigint; landed: boolean; programs: string[]; meteoraInside: boolean; transfers: { to: string; lamports: bigint }[]; asked: number; price: number; used: number };
 
 /**
  * This validator keeps little history: about every 550 slots it drops every block but the
@@ -405,12 +421,23 @@ async function watchKeeper(): Promise<void> {
       // Somebody sending the keeper SOL or tokens shows up here too. Only what its key paid for is its own doing.
       if (!keys[0].equals(keeper.publicKey)) continue;
       const transfers: Seen["transfers"] = [];
+      // Nought for a limit or a price the transaction does not set.
+      let [asked, price] = [0, 0];
       for (const ix of seen.transaction.message.compiledInstructions) {
+        if (keys[ix.programIdIndex].equals(ComputeBudgetProgram.programId)) {
+          // The compute-budget program's instructions start with their number: 2 sets the limit, a u32, and 3 the price, a u64.
+          const data = Buffer.from(ix.data);
+          if (data[0] === 2 && data.length >= 5) asked = data.readUInt32LE(1);
+          if (data[0] === 3 && data.length >= 9) price = Number(data.readBigUInt64LE(1));
+        }
         if (!keys[ix.programIdIndex].equals(SystemProgram.programId)) continue;
         const { toPubkey, lamports } = SystemInstruction.decodeTransfer({ programId: SystemProgram.programId, keys: ix.accountKeyIndexes.map((index) => ({ pubkey: keys[index], isSigner: false, isWritable: true })), data: Buffer.from(ix.data) });
         transfers.push({ to: toPubkey.toBase58(), lamports });
       }
       witnessed.set(signature, {
+        asked,
+        price,
+        used: seen.meta.computeUnitsConsumed ?? 0,
         fee: BigInt(seen.meta.fee),
         landed: seen.meta.err === null,
         programs: seen.transaction.message.compiledInstructions.map((ix) => keys[ix.programIdIndex].toBase58()),
@@ -498,7 +525,7 @@ async function main() {
     dbc, hookProgram: HOOK, payer: partner, mint, config,
     guardian: guardian.publicKey, agent: agent.publicKey, keeper: keeper.publicKey,
     limits: LIMITS, split: EVEN,
-    curve: { startCapSol: 30, graduationCapSol: 1_000_000_000 / 150, feeBps: 300 },
+    curve: { startCapSol: 30, feeBps: 300 },
     names: [{ name: "Veluno", symbol: "VELUNO" }], uri: "https://example.com/veluno.json",
   }, send);
   const solVault = deriveDbcTokenVaultAddress(pool, NATIVE_MINT);
@@ -900,6 +927,23 @@ async function main() {
     `the keeper's key paid for ${witnessed.size} transactions, ${went.length} of which went through: those are the ${inLedger.size} the ledger lists, and no other`,
   );
   check(charged === BigInt(kept.totals.fees) && kept.totals.fees === totals.fees, `the network charged the keeper ${charged} lamports in fees, which is what its books count`);
+  // One by one as well: each set a limit and the price the keeper was run at, and was charged what the two come to by the network's own sum.
+  check(
+    [...witnessed.values()].every((seen) => seen.asked > 0 && seen.price === PRICE && seen.fee === chargedFor(seen.asked, seen.price) && seen.used <= seen.asked),
+    `each of them asked for a limit, set ${PRICE} micro-lamports a unit, and was charged 5,000 lamports and that price on every unit it asked for`,
+  );
+  // What they really used, kind by kind: the one that used the most of what it asked for.
+  const closest = (signatures: string[]) => signatures.map((signature) => witnessed.get(signature)).filter((seen): seen is Seen => !!seen && seen.asked > 0).sort((a, b) => b.used / b.asked - a.used / a.asked)[0];
+  const usedMost = [
+    ["a claim", closest(only(all, "claim").map((line) => line.signature))],
+    ["a payment to the treasury", closest(only(all, "treasury").map((line) => line.signature))],
+    ["a buyback", closest(only(all, "buyback").map((line) => line.signature))],
+    ["a payout", closest(only(all, "payout").flatMap((line) => line.transactions.map((one) => one.signature)))],
+  ] as const;
+  check(
+    usedMost.every(([, seen]) => !!seen && seen.used > 0),
+    `the compute units they used, at the most, of those they asked for: ${usedMost.map(([kind, seen]) => `${kind}${seen && seen.transfers.length > 1 ? ` to ${seen.transfers.length} holders` : ""} ${seen?.used} of ${seen?.asked}`).join(", ")}`,
+  );
   const tokenAccountRent = BigInt((await connection.getAccountInfo(ata(keeper.publicKey)))?.lamports ?? 0);
   const keeperNow = await lamportsOf(keeper.publicKey);
   const shouldHold = keeperStart + BigInt(totals.claimed) - BigInt(totals.treasury.paid) - BigInt(totals.burn.spent) - BigInt(totals.holders.paid) - charged - tokenAccountRent;
@@ -951,7 +995,7 @@ async function main() {
     `the treasury was sent the ${inSol(held.totals.treasury.owed)} SOL it was owed, without waiting for the sum it is usually sent at`,
   );
   check(
-    only(lines, "buyback").length >= 1 && BigInt(end.totals.burn.owed) < 7_500n && startSupply - (await supply()) === BigInt(end.totals.burn.tokens),
+    only(lines, "buyback").length >= 1 && BigInt(end.totals.burn.owed) < chargedFor(UNITS.buyback, PRICE) && startSupply - (await supply()) === BigInt(end.totals.burn.tokens),
     `the burn share bought the token back in ${only(lines, "buyback").length} buys, until the ${end.totals.burn.owed} lamports left would not pay a buyback's own fee`,
   );
   const paidInTheEnd = await paidOnChain(ledger());

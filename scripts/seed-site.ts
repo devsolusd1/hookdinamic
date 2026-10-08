@@ -55,7 +55,7 @@ const { pool } = await launch(
     dbc, hookProgram: HOOK, payer, mint, config,
     guardian: guardian.publicKey, agent: agent.publicKey, keeper: keeper.publicKey,
     limits: LIMITS, split: SPLIT,
-    curve: { startCapSol: 30, graduationCapSol: 8_000_000, feeBps: FEE_BPS },
+    curve: { startCapSol: 30, feeBps: FEE_BPS },
     names: NAMES, uri: "https://www.veluno.li/metadata.json",
   },
   (_what, tx, signers) => sendAndConfirmTransaction(connection, tx, signers, { commitment: "confirmed" }),

@@ -20,9 +20,11 @@
 //   ALLOW_ORIGINS                       the pages that may read the records (default https://veluno.li,https://www.veluno.li; * for any)
 //   AGENT_OFF=1, KEEPER_OFF=1           keep serving the records, leave that loop off
 //   DRY_RUN=1                           both loops work out and print; nothing is sent, nothing is written.
-//                                       The agent asks the model as often as it would for real, not more.
+//                                       The agent asks the model as often as it would for real, not more, and builds
+//                                       the edict's transaction without signing it: its line says what the memo would be.
 //   RESTORE_FROM                        a web address holding copies of log.jsonl and ledger.jsonl, read once if the disk comes up without them
 //   AGENT_MODEL, AGENT_EFFORT, AGENT_POLL_SECS, AGENT_THINK_EVERY_SECS                as in scripts/agent.ts
+//   AGENT_PRIORITY_MICROLAMPORTS        what an edict bids for each compute unit, as in scripts/agent.ts (default 50000, 0 for nothing)
 //   KEEPER_EVERY_SECS, KEEPER_OWN_WALLETS, KEEPER_SETTINGS                            as in scripts/keeper.ts
 // At home AGENT_KEYPAIR and KEEPER_KEYPAIR may name a keypair file instead, as the other two scripts take them.
 //
@@ -45,7 +47,7 @@ import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 import { DynamicBondingCurveClient } from "@meteora-ag/dynamic-bonding-curve-sdk";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
-import { askClaude, mendLog, NotTheAgent, readBook, readLog, watch, type Context, type Decide, type LogCheck, type Outcome } from "../src/agent.js";
+import { askClaude, EDICT_UNITS_MOST, edictFee, figuresInWords, inSol, memoInWords, mendLog, NotTheAgent, priorityFrom, readBook, readLog, watch, type Context, type Decide, type LogCheck, type Outcome } from "../src/agent.js";
 import { AlreadyRunning, Retired, round, settingsFrom, type KeeperContext, type KeeperOutcome } from "../src/keeper/index.js";
 import { solPriceUsd } from "../src/price.js";
 
@@ -455,6 +457,8 @@ export async function serve(options: Options = {}): Promise<Service> {
   }
 
   function agentContext(connection: Connection, dbc: DynamicBondingCurveClient): Context {
+    // A price that cannot be read stops the agent here, before its key is taken out of the settings.
+    const priorityMicroLamports = priorityFrom(env.AGENT_PRIORITY_MICROLAMPORTS);
     let model = options.decide;
     if (!model) {
       // The SDK would only fail at the first look, with a stack trace.
@@ -478,6 +482,7 @@ export async function serve(options: Options = {}): Promise<Service> {
       logPath,
       solPriceUsd,
       dryRun,
+      priorityMicroLamports,
       // Before the model is asked: the log is checked against the rulebook this look has just
       // read, and no edict is asked for without room on the disk to keep its text.
       decide: async (snapshot, book) => {
@@ -497,6 +502,9 @@ export async function serve(options: Options = {}): Promise<Service> {
     const thinkEverySecs = seconds("AGENT_THINK_EVERY_SECS", "300");
     const pollSecs = seconds("AGENT_POLL_SECS", "20");
     say(`agent ${health.agent.address} on token ${ctx.mint.toBase58()}${dryRun ? " (dry run)" : ""}`);
+    // What its edicts bid to get into a block, said once: it is the setting somebody may want to raise on a busy day.
+    const price = priorityFrom(env.AGENT_PRIORITY_MICROLAMPORTS);
+    say(`agent: an edict bids ${price ? `${price.toLocaleString("en-US")} micro-lamports for each compute unit it asks for` : "nothing for priority"} (AGENT_PRIORITY_MICROLAMPORTS), and pays the network at most ${inSol(edictFee(EDICT_UNITS_MOST, price))} SOL`);
 
     // At the start the log is checked against the chain once, whatever the loop does next: an
     // edict that landed while the last copy was dying gets its text here.
@@ -538,7 +546,12 @@ export async function serve(options: Options = {}): Promise<Service> {
         else beat(health.agent, event);
         if (event.status === "rewritten" && event.signature) health.agent.lastEdictAt = Date.now();
         const line =
-          event.status === "rewritten" ? `${event.signature ? `issued an edict (${event.signature})` : "would issue an edict (dry run, nothing sent)"}: ${event.announcement}`
+          // An edict that was sent says so of its memo only when it had to be cut. A rehearsal
+          // says what the memo would be either way, and what the transaction it built comes to.
+          event.status === "rewritten" ? (
+            event.signature ? `issued an edict (${event.signature}): ${event.announcement}${event.memo === event.announcement ? "" : ` [${memoInWords(event.announcement, event.memo)}]`}`
+            : `would issue an edict (dry run, nothing sent): ${event.announcement} [${memoInWords(event.announcement, event.memo)}; ${figuresInWords(event.transaction)}]`
+          )
           : event.status === "held" ? `issued nothing: ${event.reasoning}`
           : event.status === "in-force" ? `the edict in force has ${Math.ceil(event.seconds / 60)} min left`
           : event.status === "too-soon" ? `the last edict is too recent; ${event.seconds}s to go`

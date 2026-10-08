@@ -23,9 +23,10 @@ Projeto independente: programa, chaves e carteiras próprios. O programa não fo
    que o programa de memo pode gastar (letras simples custam pouco; aspas curvas, travessões e
    emojis custam caro), o memo é cortado numa palavra, com reticências; o diário guarda o
    anúncio inteiro e diz o que foi gravado como memo.
-4. O token é negociado numa curva da Meteora (Dynamic Bonding Curve) que, na prática, nunca
-   gradua. A taxa é de 3% por trade: a Meteora fica com um quinto, e o resto é dividido como o
-   édito em vigor mandar. A tesouraria recebe sempre entre 40% e 50% desse resto.
+4. O token é negociado numa curva da Meteora (Dynamic Bonding Curve) que não gradua: ela só
+   encheria com 9 bilhões de SOL, 14 vezes todo o SOL que existe, e é ao encher que a Meteora
+   tiraria o hook do token. A taxa é de 3% por trade: a Meteora fica com um quinto, e o resto é
+   dividido como o édito em vigor mandar. A tesouraria recebe sempre entre 40% e 50% desse resto.
 5. O **keeper** tira as taxas da pool e paga: a parte da tesouraria vai para a tesouraria (uma
    carteira do projeto, cujo endereço o keeper recebe; ela não está no livro de regras), a
    parte da queima recompra o token e queima, e a parte dos holders é paga a eles em SOL. As

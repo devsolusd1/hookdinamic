@@ -13,15 +13,19 @@
 //   AGENT_MODEL, AGENT_EFFORT           default claude-opus-5-5, medium
 //   AGENT_POLL_SECS                     how often it reads the rulebook to see whether it is time to write again (default 20)
 //   AGENT_THINK_EVERY_SECS              how long it leaves the model alone after a look that issued nothing (default 300)
+//   AGENT_PRIORITY_MICROLAMPORTS        what an edict's transaction bids for each compute unit it asks for, to get into a
+//                                       block on a busy day (default 50000, which comes to about 0.00001 SOL an edict;
+//                                       0 bids nothing; at most 5000000)
 //   DRY_RUN=1                           decide and print; send and record nothing. The model is asked as often
 //                                       as it would be for real: once, and again when that edict's time would be up.
+//                                       The edict's transaction is built all the same, and its memo, size and fee are printed.
 import "../src/quiet.js";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { DynamicBondingCurveClient } from "@meteora-ag/dynamic-bonding-curve-sdk";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
-import { askClaude, inWords, readBook, runOnce, watch, type Context, type Outcome } from "../src/agent.js";
+import { askClaude, figuresInWords, inWords, memoInWords, priorityFrom, readBook, runOnce, watch, type Context, type Outcome } from "../src/agent.js";
 import { solPriceUsd } from "../src/price.js";
 import { plain } from "./serve.js";
 
@@ -71,6 +75,7 @@ async function run() {
     }),
     solPriceUsd,
     dryRun: process.env.DRY_RUN === "1",
+    priorityMicroLamports: priorityFrom(process.env.AGENT_PRIORITY_MICROLAMPORTS),
   };
 
   // The token's names are written at launch and never added to, so they are read once.
@@ -96,8 +101,10 @@ async function run() {
       for (const line of inWords(event.choice, event.change, names)) console.log(`    ${line}`);
       console.log(`    why: ${event.reasoning}`);
       if (event.signature) console.log(`    transaction ${event.signature}`);
-      // The transaction carries the announcement as its memo. Only a memo that had to be cut is worth a line.
-      if (event.memo !== undefined) console.log(`    on chain, as the memo: ${event.memo || "nothing"}`);
+      // The transaction carries the announcement as its memo. For one that was sent, only a
+      // memo that had to be cut is worth a line; a rehearsal says what it would have been.
+      if (!event.signature || event.memo !== event.announcement) console.log(`    ${memoInWords(event.announcement, event.memo)}`);
+      console.log(`    ${figuresInWords(event.transaction)}${event.signature ? "" : " (built, not signed)"}`);
     }
     if ((event.status === "rewritten" || event.status === "held") && event.usage) {
       console.log(`    tokens: ${event.usage.inputTokens} in, ${event.usage.outputTokens} out`);

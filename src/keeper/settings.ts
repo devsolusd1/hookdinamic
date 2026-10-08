@@ -33,7 +33,13 @@ export type Settings = {
   batchSize: number;
   /** Payout transactions sent and watched at the same time. */
   inFlight: number;
-  /** The priority fee every transaction of mine sets, in micro-lamports per compute unit. */
+  /**
+   * The priority fee every transaction of mine sets, in micro-lamports per compute unit. It is
+   * paid on the units a transaction asks for, out of my own SOL like the rest of the network
+   * fee: at 10,000 a claim pays 1,500 lamports on top of the 5,000 for its signature, a buyback
+   * 2,500 and a payout to twenty holders 54. It is the number to raise when my transactions
+   * stop landing. At 0 they still set their limit, and pay only for the signature.
+   */
   microLamportsPerUnit: number;
   /** How long between two looks at a transaction that is out. */
   pollMs: number;
@@ -68,8 +74,20 @@ export const DEFAULTS: Settings = {
 };
 
 /**
+ * The most a priority fee may be set to: ten lamports a compute unit, at which a claim pays
+ * the network 0.0015 SOL and a buyback 0.0025 SOL. A figure above it is taken for a slip of
+ * the hand, a few zeros too many, and not for a price anybody meant to pay on every transaction.
+ */
+export const MAX_MICRO_LAMPORTS_PER_UNIT = 10_000_000;
+
+/** The most transfers a payout transaction has room for beside the two instructions that set the fee: with one more it is too long for the network to take. */
+export const MAX_BATCH_SIZE = 20;
+
+/**
  * Settings as a person writes them in JSON: any of the names above, amounts in lamports as a
  * number or as text. Throws on a name it does not know, so a typo is not taken for a default.
+ * Throws too on a batch size no payout could be signed with, and on a priority fee that is
+ * not a whole number or is more than anybody can have meant.
  */
 export function settingsFrom(given: Record<string, unknown>): Partial<Settings> {
   const settings: Record<string, unknown> = {};
@@ -82,6 +100,10 @@ export function settingsFrom(given: Record<string, unknown>): Partial<Settings> 
       if ((settings[name] as bigint) < 0n) throw new Error(`"${name}" cannot be negative`);
     } else if (typeof usual === "number") {
       if (typeof value !== "number" || !Number.isFinite(value) || value < 0) throw new Error(`"${name}" is a number`);
+      // The fee goes into every transaction as a whole number. A dry run builds none, so a fraction would only show once the keeper is live.
+      if (name === "microLamportsPerUnit" && (!Number.isInteger(value) || value > MAX_MICRO_LAMPORTS_PER_UNIT)) throw new Error(`"${name}" is a whole number of micro-lamports per compute unit, ${MAX_MICRO_LAMPORTS_PER_UNIT} at most`);
+      // A round is planned in batches of this size, and a plan whose batches cannot be signed stays open for good.
+      if (name === "batchSize" && (!Number.isInteger(value) || value < 1 || value > MAX_BATCH_SIZE)) throw new Error(`"${name}" is a whole number of transfers, from 1 to ${MAX_BATCH_SIZE}`);
       settings[name] = value;
     } else {
       if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) throw new Error(`"${name}" is a list of addresses`);

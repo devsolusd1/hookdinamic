@@ -1,5 +1,6 @@
-// Checks of the service (scripts/serve.ts), of what keeps an edict's words and of how often the
-// model is asked (src/agent.ts), and of the guardian's command when its node does not answer.
+// Checks of the service (scripts/serve.ts); of what keeps an edict's words, of the transaction
+// that carries them and what it asks of the network, of what the model is told and of how often
+// it is asked (src/agent.ts); and of the guardian's command when its node does not answer.
 //
 //   npm run test:serve                  offline: no chain, no model, no key. About half a minute.
 //   npm run test:serve -- --validator   the same service as a process of its own, with both loops, and the
@@ -22,12 +23,15 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DynamicBondingCurveClient, SwapMode } from "@meteora-ag/dynamic-bonding-curve-sdk";
 import { getAssociatedTokenAddressSync, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
-import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SendTransactionError, Transaction } from "@solana/web3.js";
+import { ComputeBudgetInstruction, ComputeBudgetProgram, Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SendTransactionError, SystemProgram, Transaction } from "@solana/web3.js";
 import BN from "bn.js";
 import { base58, decodeRulebook as pageRulebook, hashOf, readLog as pageReadLog } from "../site/chain.js";
-import { BUYING_HOOKS, ruleOf } from "../site/hooks.js";
+import { BUYING_HOOKS, FEE_HOOKS, ruleOf } from "../site/hooks.js";
 import { readLedger } from "../site/ledger.js";
-import { ANNOUNCEMENT_MAX, announced, edictTransaction, MEMO_PROGRAM, MEMO_UNITS, memoUnits, mendLog, noteOf, readLog, runOnce, TRANSACTION_MAX, waitingPath, watch, type Context, type Decide, type LogEntry } from "../src/agent.js";
+import {
+  ANNOUNCEMENT_MAX, announced, askClaude, buyingLabel, EDICT_UNITS_MOST, edictFee, edictTransaction, edictUnits, figuresInWords, MEMO_PROGRAM, MEMO_UNITS, memoInWords, memoUnits, mendLog, NAME_UNITS, noteOf,
+  PRIORITY_MICROLAMPORTS, PRIORITY_MICROLAMPORTS_MOST, priorityFrom, readLog, RULE_UNITS, runOnce, saysNothing, takeSnapshot, TRANSACTION_MAX, TRANSACTION_UNITS_MAX, waitingPath, watch, type Context, type Decide, type LogEntry,
+} from "../src/agent.js";
 import { decodeRulebook, MAX_CONDITIONS, RULEBOOK_LEN, rulebookAddress, type Condition, type Limits, type Split } from "../src/hook.js";
 import { AlreadyRunning, type KeeperContext, type KeeperOutcome } from "../src/keeper/index.js";
 import { launch } from "../src/launch.js";
@@ -177,6 +181,17 @@ const guardianCommand = (cwd: string, ...args: string[]) =>
     child.on("exit", (code) => done({ code, out }));
   });
 
+/** What a transaction asks of the network: the compute units, and the price it bids for each in micro-lamports. Null: no instruction says. */
+function budgetOf(tx: Transaction): { units: number | null; price: number | null } {
+  const found = { units: null as number | null, price: null as number | null };
+  for (const instruction of tx.instructions.filter((one) => one.programId.equals(ComputeBudgetProgram.programId))) {
+    const kind = ComputeBudgetInstruction.decodeInstructionType(instruction);
+    if (kind === "SetComputeUnitLimit") found.units = ComputeBudgetInstruction.decodeSetComputeUnitLimit(instruction).units;
+    if (kind === "SetComputeUnitPrice") found.price = Number(ComputeBudgetInstruction.decodeSetComputeUnitPrice(instruction).microLamports);
+  }
+  return found;
+}
+
 // ---------------------------------------------------------------------------------------------
 // A chain in memory: one rulebook, laid out as src/hook.ts decodes it, a clock and a block height.
 // ---------------------------------------------------------------------------------------------
@@ -217,6 +232,12 @@ function madeUpChain() {
     sent: [] as string[],
     /** What each of them carried as its memo, by signature: the text, and the keys the memo made sign. */
     memos: new Map<string, { text: string; signers: string[] }>(),
+    /**
+     * What each of them asked of the network, by signature: the compute units, the price bid
+     * for each in micro-lamports (null: no instruction named one), its size on the wire, and
+     * the program each of its instructions goes to, in order.
+     */
+    asked: new Map<string, { units: number | null; price: number | null; bytes: number; to: string[] }>(),
     /** Called as a transaction arrives, before anything is done with it. */
     onSend: undefined as (() => void) | undefined,
     note: () => book.subarray(248, 280).toString("hex"),
@@ -263,8 +284,9 @@ function madeUpChain() {
       chain.sent.push(base58(tx.signature!));
       const memo = tx.instructions.find((instruction) => instruction.programId.equals(MEMO_PROGRAM));
       if (memo) chain.memos.set(chain.sent.at(-1)!, { text: memo.data.toString("utf8"), signers: memo.keys.filter((key) => key.isSigner).map((key) => key.pubkey.toBase58()) });
-      // The edict comes first in its transaction, whatever follows it.
-      if (chain.next !== "lost") chain.land(tx.instructions[0].data);
+      chain.asked.set(chain.sent.at(-1)!, { ...budgetOf(tx), bytes: raw.length, to: tx.instructions.map((instruction) => instruction.programId.toBase58()) });
+      // The edict is the first thing in its transaction that goes to the hook program, whatever stands before and after it.
+      if (chain.next !== "lost") chain.land(tx.instructions.find((instruction) => instruction.programId.equals(hookProgram))!.data);
       return chain.sent.at(-1)!;
     },
     confirmTransaction: async () => {
@@ -397,7 +419,12 @@ async function offline() {
   check(outcome.status === "rewritten" && outcome.signature === chain.sent[0] && log[0].signature === chain.sent[0], "with the signature of the transaction that carried it, known before it was sent");
   check(kept !== "" && JSON.stringify(JSON.parse(kept).line) === JSON.stringify(log[0]) && !waits(), "the very line was on disk before the transaction left, and nothing waits once the log has it");
   const carried = chain.memos.get(chain.sent[0]);
-  check(carried?.text === log[0].record.announcement && carried?.signers.join() === chain.agent.publicKey.toBase58() && !("memo" in log[0].record), "its transaction carries the announcement as a memo the agent signed, word for word, so the record has nothing to add about it");
+  check(carried?.text === log[0].record.announcement && carried?.signers.join() === chain.agent.publicKey.toBase58() && log[0].record.memo === carried.text, "its transaction carries the announcement as a memo the agent signed, word for word, and the record says so: its memo is that text");
+  const firstAsked = chain.asked.get(chain.sent[0]);
+  const inOrder = (...programs: PublicKey[]) => programs.map((program) => program.toBase58()).join();
+  check(firstAsked?.to.join() === inOrder(ComputeBudgetProgram.programId, ComputeBudgetProgram.programId, chain.hookProgram, MEMO_PROGRAM), "in front of the rule the transaction says how many compute units it asks for and what it bids for each, and the words come last");
+  check(firstAsked?.units === edictUnits(carried?.text ?? "", false) && firstAsked.price === PRIORITY_MICROLAMPORTS, `it asks for what its own parts are reckoned at and a tenth more (${firstAsked?.units} units, not the 400,000 it would be given unasked), and with no setting it bids ${PRIORITY_MICROLAMPORTS} micro-lamports for each`);
+  check(outcome.status === "rewritten" && outcome.memo === carried?.text && outcome.transaction.bytes === firstAsked?.bytes && outcome.transaction.units === firstAsked.units && outcome.transaction.feeLamports === edictFee(firstAsked.units ?? 0, PRIORITY_MICROLAMPORTS), `and what the look reports of it is what was sent: ${outcome.status === "rewritten" ? figuresInWords(outcome.transaction) : ""}`);
 
   chain.clock += 1_900;
   chain.next = "unseen";
@@ -466,7 +493,8 @@ async function offline() {
   const began = Date.now();
   await watch({ ...ctx, decide: async (snapshot, book) => { setTimeout(() => halt.abort(), 50); await sleep(400); return rote(snapshot, book); } }, { pollSecs: 30, thinkEverySecs: 30, signal: halt.signal });
   check(Date.now() - began < 5_000 && chain.epoch() === 9 && readLog(logPath).length === 8 && readLog(logPath)[7].note === chain.note(), "the agent's loop, asked to stop in the middle of a look, finishes the look and leaves without waiting for its next poll");
-  check(readLog(logPath).every((entry) => chain.memos.get(entry.signature ?? "")?.text === entry.record.announcement), "every edict in the log went out with its announcement as its memo, the ones whose text had to be put back among them");
+  check(readLog(logPath).every((entry) => chain.memos.get(entry.signature ?? "")?.text === entry.record.announcement && entry.record.memo === entry.record.announcement), "every edict in the log went out with its announcement as its memo and says so in its record, the ones whose text had to be put back among them");
+  check(readLog(logPath).every((entry) => { const asked = chain.asked.get(entry.signature ?? ""); return asked?.units === edictUnits(entry.record.memo ?? "", false) && asked.price === PRIORITY_MICROLAMPORTS; }), "and each asked for the units its own memo is reckoned at, at the same price");
 
   check(plain(new Error("failed: https://rpc.example/v2/SECRET?api-key=SECRET\nmore")) === "failed: https://rpc.example" && inPublic(new TypeError("fetch failed at https://rpc.example/SECRET")) === "TypeError" && inPublic(new Error("refused: x-api-key: SECRET")) === "Error" && inPublic(new Error("my books say I hold 5 lamports")) === "my books say I hold 5 lamports", "an error is printed with any address cut to its host, and shown to the public only if it has neither an address nor a key in it");
 
@@ -478,26 +506,34 @@ async function offline() {
   // The largest transaction the agent writes: the catalogue's longest rule, and a change of
   // name that has to top the mint up first.
   const longest = BUYING_HOOKS.flatMap((hook) => hook.settings.map((_, i) => ruleOf(hook.id, i + 1))).reduce((a, b) => (b.length > a.length ? b : a));
-  /** An edict's transaction for these words, as the node would be sent it, and what is found in those bytes. */
-  function carrying(announcement: string, rule: Condition[] = longest) {
+  /**
+   * An edict's transaction for these words, as the node would be sent it, and what is found in
+   * those bytes. `price` is the setting for priority, left out as the agent's own code may
+   * leave it out; `plainly` leaves the change of name out too.
+   */
+  function carrying(announcement: string, rule: Condition[] = longest, price?: number, plainly = false) {
     const change = { ruleSecs: 3_600, rule, holdersBps: 3_000, burnBps: 3_000, treasuryBps: 4_000 };
     const record: LogEntry["record"] = {
-      mint: aMint.toBase58(), epoch: 1, at: "2026-10-08T12:00:00.000Z", action: "rewrite", hooks: { buying: null, fees: "even-split", name: 1 },
+      mint: aMint.toBase58(), epoch: 1, at: "2026-10-08T12:00:00.000Z", action: "rewrite", hooks: { buying: null, fees: "even-split", name: plainly ? null : 1 },
       change: { ...change, rule: rule.map((condition) => ({ ...condition, value: condition.value.toString() })) }, announcement, reasoning: "Scripted.", model: "stand-in",
     };
-    const made = edictTransaction({ program: aProgram, agent: scribe.publicKey, mint: aMint, change, rename: { index: 1, lamports: 1_000_000 }, record });
+    const made = edictTransaction({ program: aProgram, agent: scribe.publicKey, mint: aMint, change, rename: plainly ? undefined : { index: 1, lamports: 1_000_000 }, record, priorityMicroLamports: price });
     made.tx.recentBlockhash = Keypair.generate().publicKey.toBase58();
     made.tx.sign(scribe);
     const wire = made.tx.serialize();
     const sent = Transaction.from(wire);
     const memo = sent.instructions.find((instruction) => instruction.programId.equals(MEMO_PROGRAM));
+    const edict = sent.instructions.find((instruction) => instruction.programId.equals(aProgram));
     return {
       record: made.record,
       bytes: wire.length,
       to: sent.instructions.map((instruction) => instruction.programId.toBase58()),
-      noted: sent.instructions[0].data.subarray(-32).equals(made.note) && made.note.equals(noteOf(made.record)),
+      noted: !!edict?.data.subarray(-32).equals(made.note) && made.note.equals(noteOf(made.record)),
       memo: memo ? memo.data.toString("utf8") : null,
       signedByAgent: memo?.keys.length === 1 && memo.keys[0].isSigner && memo.keys[0].pubkey.equals(scribe.publicKey),
+      /** What the bytes ask of the network, and what the agent's own code said the transaction comes to. */
+      asked: budgetOf(sent),
+      said: { memo: made.memo, bytes: made.bytes, units: made.units, feeLamports: made.feeLamports },
     };
   }
   /** Whether `memo` is `text` cut after a whole word and closed with an ellipsis, with no room for the word after. */
@@ -511,23 +547,25 @@ async function offline() {
 
   const plainWords = "Plain words, and nothing else. ".repeat(8).slice(0, ANNOUNCEMENT_MAX);
   const inPlain = carrying(plainWords);
-  check(inPlain.memo === plainWords && inPlain.signedByAgent && !("memo" in inPlain.record) && inPlain.noted, `an announcement in plain letters, all ${ANNOUNCEMENT_MAX} characters of it, is the memo byte for byte, the agent signs it, and the note is the hash of a record that has nothing to add`);
-  check(inPlain.to.join() === [aProgram, PublicKey.default, aProgram, MEMO_PROGRAM].map((program) => program.toBase58()).join(), "the edict comes first, then the top-up and the change of name, and the words last");
+  check(inPlain.memo === plainWords && inPlain.signedByAgent && inPlain.record.memo === plainWords && inPlain.noted, `an announcement in plain letters, all ${ANNOUNCEMENT_MAX} characters of it, is the memo byte for byte, the agent signs it, and the note is the hash of a record that says so: its memo is those words`);
+  const programs = (...to: PublicKey[]) => to.map((program) => program.toBase58()).join();
+  const BUDGET = ComputeBudgetProgram.programId;
+  check(inPlain.to.join() === programs(BUDGET, BUDGET, aProgram, SystemProgram.programId, aProgram, MEMO_PROGRAM), "in order: the compute units it asks for, the price it bids for each, the rule, the top-up and the change of name, and the words last");
   const withoutWords = inPlain.bytes - bytesOf(plainWords);
   const room = TRANSACTION_MAX - withoutWords;
-  check(room >= 3 * ANNOUNCEMENT_MAX, `the largest transaction the agent writes (a rule of ${longest.length} conditions, the catalogue's longest, and a change of name that tops the mint up) is ${withoutWords} bytes before the memo's text, which leaves the text ${room}: more than the ${3 * ANNOUNCEMENT_MAX} that ${ANNOUNCEMENT_MAX} characters can come to`);
+  check(room >= 3 * ANNOUNCEMENT_MAX, `the largest transaction the agent writes (the limit and the price, a rule of ${longest.length} conditions, the catalogue's longest, and a change of name that tops the mint up) is ${withoutWords} bytes before the memo's text, which leaves the text ${room}: more than the ${3 * ANNOUNCEMENT_MAX} that ${ANNOUNCEMENT_MAX} characters can come to`);
 
   // Signs that are not plain letters, of the kinds a sentence in English might have.
   const typeset = "Slow Opening is on — for the first 10 minutes no wallet can buy above 2% of supply — then “the cap” lifts. Fees: Holders’ Payday · holders 42% · burn 18% · treasury 40%. It’s on for 30 min → selling isn’t restricted … ‘ever’ – é ü ✓ So far.";
   const inType = carrying(typeset);
-  check(typeset.length === ANNOUNCEMENT_MAX && inType.memo === typeset && !("memo" in inType.record) && inType.bytes <= TRANSACTION_MAX, `${ANNOUNCEMENT_MAX} characters with curly quotes, long dashes and accents among them go whole too (${bytesOf(typeset)} bytes of text, reckoned at ${memoUnits(typeset)} units of the ${MEMO_UNITS} a memo may cost, a transaction of ${inType.bytes} bytes)`);
+  check(typeset.length === ANNOUNCEMENT_MAX && inType.memo === typeset && inType.record.memo === typeset && inType.bytes <= TRANSACTION_MAX, `${ANNOUNCEMENT_MAX} characters with curly quotes, long dashes and accents among them go whole too (${bytesOf(typeset)} bytes of text, reckoned at ${memoUnits(typeset)} units of the ${MEMO_UNITS} a memo may cost, a transaction of ${inType.bytes} bytes)`);
   // The rarer Chinese characters take four bytes each and are cheap to the Memo program: nothing that goes whole weighs more.
   const heavy = "\u{20000}".repeat(ANNOUNCEMENT_MAX / 2);
   const inHeavy = carrying(heavy);
-  check(heavy.length === ANNOUNCEMENT_MAX && inHeavy.memo === heavy && !("memo" in inHeavy.record) && inHeavy.bytes <= TRANSACTION_MAX && inHeavy.bytes > inType.bytes, `and so do the heaviest ${ANNOUNCEMENT_MAX} characters that the Memo program can afford (${bytesOf(heavy)} bytes of text, a transaction of ${inHeavy.bytes} bytes, under the ${TRANSACTION_MAX} a transaction may be)`);
+  check(heavy.length === ANNOUNCEMENT_MAX && inHeavy.memo === heavy && inHeavy.record.memo === heavy && inHeavy.bytes <= TRANSACTION_MAX && inHeavy.bytes > inType.bytes, `and so do the heaviest ${ANNOUNCEMENT_MAX} characters that the Memo program can afford (${bytesOf(heavy)} bytes of text, a transaction of ${inHeavy.bytes} bytes, under the ${TRANSACTION_MAX} a transaction may be)`);
 
   const affordable = (text: string) => memoUnits(text) <= MEMO_UNITS;
-  const tooDear = "“Slow” — “steady” — “small” … ".repeat(8).slice(0, ANNOUNCEMENT_MAX);
+  const tooDear = "“Slow” — “steady” — “small” … ".repeat(8).slice(0, ANNOUNCEMENT_MAX).trim();
   const inDear = carrying(tooDear);
   check(memoUnits(tooDear) > MEMO_UNITS && inDear.memo !== null && affordable(inDear.memo) && cutAtAWord(inDear.memo, tooDear, affordable), `words the Memo program could not afford (reckoned at ${memoUnits(tooDear)} units) are cut after a whole word and closed with an ellipsis: ${inDear.memo?.length} of ${tooDear.length} characters, reckoned at ${memoUnits(inDear.memo ?? "")}`);
   check(inDear.record.memo === inDear.memo && inDear.record.announcement === tooDear && inDear.noted && inDear.signedByAgent, "the record then says what the memo was, next to the announcement whole, and the note is the hash of both");
@@ -536,8 +574,12 @@ async function offline() {
   check(/^€+…$/u.test(allSigns.memo ?? "") && affordable(allSigns.memo!) && !affordable(`€${allSigns.memo}`), `words with no space to cut at are cut where they have to be (${allSigns.memo?.length} characters of ${ANNOUNCEMENT_MAX})`);
   check(/^\u{1f642}+…$/u.test(allFaces.memo ?? "") && affordable(allFaces.memo!) && !affordable(`\u{1f642}${allFaces.memo}`), `and never through the middle of a character that takes two units (${[...(allFaces.memo ?? "")].length - 1} emoji of ${ANNOUNCEMENT_MAX / 2})`);
 
-  // What the model is told about it: twenty curly quotes and dashes, or a dozen emoji, in an announcement of full length.
-  const among = (sign: string, count: number) => `${`${sign} `.repeat(count)}${"Plain words, and nothing else. ".repeat(8)}`.slice(0, ANNOUNCEMENT_MAX);
+  // Words of which nothing can be kept: every one of them is a sign that closes a word.
+  const allDashes = carrying("— ".repeat(60).trim());
+  check(allDashes.memo === null && allDashes.record.memo === "" && allDashes.noted && allDashes.to.join() === programs(BUDGET, BUDGET, aProgram, SystemProgram.programId, aProgram), "where not one word can be kept the transaction has no memo at all, and the record says that too: its memo is the empty text, which is not the same as a record that does not speak of a memo");
+
+  // What the model is told about the allowance: twenty curly quotes and dashes, or a dozen emoji, in an announcement of full length.
+  const among =(sign: string, count: number) => `${`${sign} `.repeat(count)}${"Plain words, and nothing else. ".repeat(8)}`.slice(0, ANNOUNCEMENT_MAX);
   check(affordable(among("—", 20)) && !affordable(among("—", 30)) && affordable(among("\u{1f642}", 12)) && !affordable(among("\u{1f642}", 13)) && carrying(among("\u{1f642}", 12)).memo === among("\u{1f642}", 12), `which is what the model is told: among plain words to the full ${ANNOUNCEMENT_MAX} characters, twenty long dashes go whole (${memoUnits(among("—", 20))} units) and so do a dozen emoji (${memoUnits(among("\u{1f642}", 12))}), and a thirteenth is one too many`);
 
   // A decision that did not pass through the limit on an announcement could be longer than a transaction has room for.
@@ -547,6 +589,37 @@ async function offline() {
   check(affordable(tooLong) && bytesOf(tooLong) > room && inLong.bytes <= TRANSACTION_MAX && inLong.bytes > TRANSACTION_MAX - 12 && cutAtAWord(inLong.memo, tooLong, hasRoom) && inLong.record.memo === inLong.memo, `words too long for the transaction (${bytesOf(tooLong)} bytes) are cut the same way, to a transaction of ${inLong.bytes} bytes`);
   const fullRule = carrying(plainWords, Array.from({ length: MAX_CONDITIONS }, () => ({ group: 0, fact: 0, op: 0, value: 1n })));
   check(fullRule.memo === plainWords && fullRule.bytes - bytesOf(plainWords) > withoutWords, `a rule of ${MAX_CONDITIONS} conditions, the most the program takes, still leaves the text ${TRANSACTION_MAX - (fullRule.bytes - bytesOf(plainWords))} bytes`);
+  // The names the model has to use carry a curly apostrophe and a middle dot. Every pair of them, in an announcement filled to the limit.
+  const named = BUYING_HOOKS.flatMap((hook) => hook.settings.map((_, i) => buyingLabel({ hook: hook.id, setting: i + 1 }))).flatMap((buying) => FEE_HOOKS.map((fees) => `For the next 30 minutes: ${buying}, and ${fees.name} for the fees. `.padEnd(ANNOUNCEMENT_MAX, "Plain words, and nothing else. ")));
+  const dearestNamed = named.reduce((a, b) => (memoUnits(b) > memoUnits(a) ? b : a));
+  check(named.some((text) => text.includes("’") && text.includes("·")) && named.every((text) => text.length === ANNOUNCEMENT_MAX && carrying(text).memo === text), `the hooks' names always fit, as the model is told: ${named.length} announcements of full length, one for every buying hook at every setting with every fee hook, written as the catalogue writes them, all go whole (the dearest is reckoned at ${memoUnits(dearestNamed)} units of the ${MEMO_UNITS})`);
+
+  // -------------------------------------------------------------------------------------------
+  console.log("what an edict asks of the network, and what it bids (the same transactions, and a few more)");
+
+  const made = { inPlain, inType, inHeavy, inDear, allSigns, allFaces, allDashes, inLong, fullRule };
+  const asWritten = (one: ReturnType<typeof carrying>, price: number, renames = true) =>
+    one.asked.units === edictUnits(one.memo ?? "", renames) && one.asked.price === (price > 0 ? price : null) && one.said.units === one.asked.units && one.said.bytes === one.bytes && one.said.memo === (one.memo ?? "") && one.said.feeLamports === edictFee(one.said.units, price);
+  check(Object.values(made).every((one) => asWritten(one, PRIORITY_MICROLAMPORTS)), `every transaction above asks for exactly what its own memo is reckoned at, ${RULE_UNITS} for the rule, ${NAME_UNITS} for the change of name and a tenth on top, and bids ${PRIORITY_MICROLAMPORTS} micro-lamports for each unit; what the agent's code says of each (its memo, its bytes, its units, its fee) is what the signed bytes hold`);
+  const dearestMade = Object.values(made).reduce((a, b) => (memoUnits(b.memo ?? "") > memoUnits(a.memo ?? "") ? b : a));
+  check(Object.values(made).every((one) => memoUnits(one.memo ?? "") <= MEMO_UNITS && (one.asked.units ?? 0) >= (one.memo ? memoUnits(one.memo) : 0) + RULE_UNITS + NAME_UNITS && (one.asked.units ?? Infinity) <= EDICT_UNITS_MOST), `the memo is measured against its allowance and the limit is then worked out from that same memo by the same count, so no transaction asks for less than its memo is reckoned at: the dearest here is reckoned at ${memoUnits(dearestMade.memo ?? "")} of the ${MEMO_UNITS} and its transaction asks for ${dearestMade.asked.units}`);
+  check(EDICT_UNITS_MOST === 418_000 && EDICT_UNITS_MOST < TRANSACTION_UNITS_MAX / 3,`the most an edict can ask for, with a memo at the ceiling and a change of name, is ${EDICT_UNITS_MOST} units: under a third of the ${TRANSACTION_UNITS_MAX} a transaction may ask for`);
+
+  const onlyRule = carrying(plainWords, longest, undefined, true);
+  check(onlyRule.to.join() === programs(BUDGET, BUDGET, aProgram, MEMO_PROGRAM) && asWritten(onlyRule, PRIORITY_MICROLAMPORTS, false) && onlyRule.asked.units === 118_140 && onlyRule.said.feeLamports === 10_907, `an edict with no change of name, which is every edict of a token with one name: ${ANNOUNCEMENT_MAX} plain characters ask for ${onlyRule.asked.units} units, where the transaction used to be given 400,000 unasked, and pay the network ${onlyRule.said.feeLamports} lamports in all`);
+  const ordinary = carrying("Plain words, and nothing else. ".repeat(5).slice(0, 150), ruleOf("max-buy", 3), undefined, true);
+  check(ordinary.asked.units === 82_500 && ordinary.said.feeLamports === 9_125 && edictFee(EDICT_UNITS_MOST, PRIORITY_MICROLAMPORTS) === 25_900 && edictFee(EDICT_UNITS_MOST, PRIORITY_MICROLAMPORTS_MOST) === 2_095_000, `at the price it bids when no setting says otherwise an edict of 150 plain characters pays ${ordinary.said.feeLamports} lamports (0.000009125 SOL) and the largest edict there can be 25,900 (0.0000259 SOL); at the most the setting may say, the largest pays 2,095,000 (0.002095 SOL)`);
+  check(edictFee(82_500, 1_000_000) === 87_500 && edictFee(EDICT_UNITS_MOST, 1_000_000) === 423_000 && edictFee(edictUnits("", false), 0) === 5_000, "and the other figures the owner's guide gives: with the setting at 1000000 the same two pay 87,500 lamports (near 0.0001 SOL) and 423,000 (0.00043 SOL), and at 0 an edict pays 5,000 (0.000005 SOL)");
+  const unbid = carrying(plainWords, longest, 0);
+  check(unbid.to.join() === programs(BUDGET, aProgram, SystemProgram.programId, aProgram, MEMO_PROGRAM) && asWritten(unbid, 0) && unbid.asked.price === null && unbid.said.feeLamports === 5_000 && unbid.bytes < inPlain.bytes && unbid.memo === plainWords, "a price of 0 means no instruction that names a price: the transaction still says how many units it asks for, and pays the 5,000 lamports of its signature and nothing more");
+  const bidHigh = carrying(plainWords, longest, 1_000_000);
+  check(asWritten(bidHigh, 1_000_000) && bidHigh.asked.price === 1_000_000 && bidHigh.bytes === inPlain.bytes && bidHigh.said.feeLamports === 5_000 + (bidHigh.asked.units ?? 0), "a higher price changes what is bid and what is paid, and nothing else: the transaction is the same size, so the memo has the same room");
+  const refusedPrice = (() => { try { carrying(plainWords, longest, 0.5); return null; } catch (error) { return (error as Error).message; } })();
+  check(refusedPrice === "the priority price is a whole number of micro-lamports, 0 or more", "a price that is not a whole number never gets into a transaction");
+  const settingSays = (text: string | undefined) => { try { return priorityFrom(text); } catch (error) { return (error as Error).message; } };
+  const badSetting = `AGENT_PRIORITY_MICROLAMPORTS has to be a whole number from 0 to ${PRIORITY_MICROLAMPORTS_MOST}, in digits only (0 pays nothing for priority; left out, it is ${PRIORITY_MICROLAMPORTS})`;
+  check(settingSays(undefined) === PRIORITY_MICROLAMPORTS && settingSays("") === PRIORITY_MICROLAMPORTS && settingSays(" 250000 ") === 250_000 && settingSays("0") === 0 && settingSays(String(PRIORITY_MICROLAMPORTS_MOST)) === PRIORITY_MICROLAMPORTS_MOST, `the setting AGENT_PRIORITY_MICROLAMPORTS: left out or empty it is ${PRIORITY_MICROLAMPORTS}, 0 is taken as 0, and a whole number up to ${PRIORITY_MICROLAMPORTS_MOST} as itself`);
+  check(["50.000", "50,000", "-1", "1e5", "0x10", "fast", String(PRIORITY_MICROLAMPORTS_MOST + 1)].every((text) => settingSays(text) === badSetting), "anything else is turned down in a sentence that names the variable, \"50.000\" among them, which would otherwise be read as fifty");
 
   const withinLimit = (text: string) => text.length <= ANNOUNCEMENT_MAX;
   const wordy = "Slow Opening is on. For the first 10 minutes no wallet can buy above 2% of supply, then the cap lifts. ".repeat(4);
@@ -556,21 +629,103 @@ async function offline() {
   const halved = announced("half \ud83d of a pair");
   const astride = announced(`${"x".repeat(ANNOUNCEMENT_MAX - 1)}\u{1f642}`);
   check(halved === `half ${String.fromCodePoint(0xfffd)} of a pair` && astride === `${"x".repeat(ANNOUNCEMENT_MAX - 1)}…` && [halved, astride].every((text) => Buffer.from(text, "utf8").toString("utf8") === text), "half a surrogate pair, which UTF-8 cannot carry, never gets into the record: the memo could not be the record's words otherwise");
+  check(announced(`\n  ${plainWords} \n`) === plainWords && announced("  \n ") === "", "the space around an announcement is not part of it");
+
+  // An answer that ran away: two million characters, in the shapes that take a cut longest. The
+  // service answers /health from the thread this runs on.
+  const RUNAWAY = 2_000_000;
+  const runaways: [string, string][] = [
+    ["short words", "words ".repeat(RUNAWAY / 6)],
+    ["one long word", "x".repeat(RUNAWAY)],
+    ["hyphens and then a letter", `${"-".repeat(RUNAWAY)}a`],
+    ["a letter and a run of spaces, over and over", `a${" ".repeat(49)}`.repeat(RUNAWAY / 50)],
+    ["emoji", "\u{1f642}".repeat(RUNAWAY / 2)],
+    ["nothing but spaces", " ".repeat(RUNAWAY)],
+  ];
+  const timed = <T>(work: () => T) => { const began = performance.now(); const result = work(); return { result, ms: performance.now() - began }; };
+  const cuts = runaways.map(([what, text]) => ({ what, text, ...timed(() => announced(text)) }));
+  const slowestCut = cuts.reduce((a, b) => (b.ms > a.ms ? b : a));
+  check(cuts.every((cut) => cut.ms < 1_000 && cut.result.length <= ANNOUNCEMENT_MAX) && cuts[0].result === `${"words ".repeat(39)}words…` && cuts[1].result === `${"x".repeat(ANNOUNCEMENT_MAX - 1)}…` && cuts[2].result === "" && cuts[5].result === "", `an answer of ${RUNAWAY.toLocaleString("en-US")} characters is cut to an announcement without being read to its end: the slowest of ${cuts.length} shapes took ${slowestCut.ms.toFixed(0)} ms (${slowestCut.what})`);
+  // The same for the memo, should such words ever reach a transaction without passing through the limit on an announcement.
+  const memoCuts = runaways.map(([what, text]) => ({ what, text, ...timed(() => carrying(text)) }));
+  const slowestMemo = memoCuts.reduce((a, b) => (b.ms > a.ms ? b : a));
+  check(memoCuts.every((cut) => cut.ms < 2_000 && cut.result.bytes <= TRANSACTION_MAX && (cut.result.memo === null || (cut.result.memo.endsWith("…") && cut.text.startsWith(cut.result.memo.slice(0, -1)) && cut.result.record.memo === cut.result.memo))) && memoCuts[0].result.bytes > TRANSACTION_MAX - 12, `and a transaction for words that long is built, signed and within ${TRANSACTION_MAX} bytes in at most ${slowestMemo.ms.toFixed(0)} ms, its memo cut to what fits`);
+
+  // An announcement that says nothing.
+  check(["", "   ", "\n\t", "…", "— – -", "!?.,;:", "\u{1f642}\u{1f680}", "→ ✓ ·"].every(saysNothing) && ["a", "7", "é", "Max Buy · 1%", "… ok", "你好"].every((text) => !saysNothing(text)), "an announcement says nothing when it has no letter and no digit in it: empty, or only spaces, punctuation and signs");
 
   // The same through a whole look, on a chain in memory.
   const inked = madeUpChain();
   const inkedLog = join(folder(), "agent-log.jsonl");
-  const scripted = byRote({ minutes: 30, keepName: true });
-  const saying = (announcement: string): Context => ({ connection: inked.connection, dbc: inked.dbc, hookProgram: inked.hookProgram, mint: inked.mint, pool: Keypair.generate().publicKey, agent: inked.agent, logPath: inkedLog, decide: async (snapshot, book) => ({ ...(await scripted(snapshot, book)), announcement }) });
+  // The same pick every time, so that two looks differ in nothing but their words.
+  const saying = (announcement: string): Context => ({
+    connection: inked.connection, dbc: inked.dbc, hookProgram: inked.hookProgram, mint: inked.mint, pool: Keypair.generate().publicKey, agent: inked.agent, logPath: inkedLog,
+    decide: async () => ({ action: "rewrite", choice: { buying: { hook: "max-buy", setting: 3 }, fees: "holders-payday", name: null, minutes: 30 }, announcement, reasoning: "Scripted.", model: "stand-in" }),
+  });
+
+  // A rehearsal first: the same look as a dry run, which builds the transaction and stops there.
+  const rehearsed = await runOnce({ ...saying(tooDear), dryRun: true });
+  check(rehearsed.status === "rewritten" && rehearsed.signature === null && rehearsed.memo === inDear.memo && rehearsed.announcement === tooDear && rehearsed.transaction.units === edictUnits(inDear.memo ?? "", false) && rehearsed.transaction.feeLamports === edictFee(rehearsed.transaction.units, PRIORITY_MICROLAMPORTS), `a dry run builds the edict's transaction and says what its memo would be, cut or not: ${rehearsed.status === "rewritten" ? memoInWords(rehearsed.announcement, rehearsed.memo).slice(0, 60) : ""}...`);
+  check(inked.sent.length === 0 && inked.epoch() === 0 && !existsSync(inkedLog) && !existsSync(waitingPath(inkedLog)), "and still sends nothing and writes nothing down");
+  const rehearsedWhole = await runOnce({ ...saying(plainWords), dryRun: true, priorityMicroLamports: 0 });
+  check(rehearsedWhole.status === "rewritten" && rehearsedWhole.memo === plainWords && rehearsedWhole.transaction.feeLamports === 5_000 && memoInWords(plainWords, rehearsedWhole.memo) === "memo: the announcement, whole" && memoInWords(plainWords, "") === "memo: none, not one word of the announcement fits", "of words that fit it says that the memo would be the announcement whole, and with a price of 0 that the transaction would pay its signature and no more");
+
   outcome = await runOnce(saying(tooDear));
   let penned = readLog(inkedLog)[0];
   check(outcome.status === "rewritten" && outcome.memo === inDear.memo && penned.record.memo === inDear.memo && penned.record.announcement === tooDear && inked.memos.get(penned.signature!)?.text === inDear.memo, "a look whose words are too dear sends the cut memo, and its line in the log says what the memo was");
   check(penned.note === inked.note() && (await hashOf(penned.record)) === inked.note(), "the note on chain is the hash of that record, and the page's own code finds it sound");
+  const pennedAsked = inked.asked.get(penned.signature!);
+  check(rehearsed.status === "rewritten" && outcome.status === "rewritten" && JSON.stringify(rehearsed.transaction) === JSON.stringify(outcome.transaction) && pennedAsked?.bytes === rehearsed.transaction.bytes && pennedAsked.units === rehearsed.transaction.units && pennedAsked.price === PRIORITY_MICROLAMPORTS, `what the rehearsal said of the transaction is what the real look then sent, to the byte: ${rehearsed.status === "rewritten" ? figuresInWords(rehearsed.transaction) : ""}`);
   inked.clock += 1_900;
   const overLimit = `${plainWords} And more words than an announcement may have.`;
   outcome = await runOnce(saying(overLimit));
   penned = readLog(inkedLog)[1];
-  check(outcome.status === "rewritten" && outcome.memo === undefined && outcome.announcement === penned.record.announcement && cutAtAWord(penned.record.announcement ?? null, overLimit, withinLimit) && inked.memos.get(penned.signature!)?.text === penned.record.announcement && !("memo" in penned.record), "a look whose words ran over the limit has them cut in the record itself, and the memo is the record's words again");
+  check(outcome.status === "rewritten" && outcome.memo === outcome.announcement && outcome.announcement === penned.record.announcement && cutAtAWord(penned.record.announcement ?? null, overLimit, withinLimit) && inked.memos.get(penned.signature!)?.text === penned.record.announcement && penned.record.memo === penned.record.announcement, "a look whose words ran over the limit has them cut in the record itself, and the memo is the record's words again");
+
+  // A decision that did not come from askClaude gets the same treatment as one that did.
+  inked.clock += 1_900;
+  const wordless: string[] = [];
+  for (const nothing of ["", "  \n ", "… — !?", "\u{1f642}\u{1f680}"]) wordless.push(await failure(runOnce(saying(nothing))).then((error) => error?.message ?? "it went through"));
+  check(wordless.every((message) => message === "the decision cannot be used: the announcement has no words in it, and it has to tell holders which hooks are on and for how long") && inked.epoch() === 2 && inked.sent.length === 2 && readLog(inkedLog).length === 2 && !existsSync(waitingPath(inkedLog)), "a look whose announcement says nothing (empty, only spaces, only punctuation, only emoji) is dropped before anything is built, and leaves no trace");
+
+  // -------------------------------------------------------------------------------------------
+  console.log("what the model is told, and an answer that says nothing (the agent's own askClaude, with a scripted model in Claude's place)");
+
+  type Asked = { system: string; messages: { role: string; content: unknown }[] };
+  const requests: Asked[] = [];
+  const answers: string[] = [];
+  // The model's API as askClaude uses it: every request is kept, and each answer picks the same hooks with the next of the announcements above.
+  const scriptedModel = {
+    beta: {
+      messages: {
+        parse: async (request: Asked) => {
+          // The list of messages is added to between calls, so what was asked is copied as it stood.
+          requests.push({ system: request.system, messages: [...request.messages] });
+          return {
+            usage: { input_tokens: 100, output_tokens: 20 }, stop_reason: "end_turn", model: "scripted", content: [{ type: "text", text: "(an answer)" }],
+            parsed_output: { buying: "max-buy", setting: 3, minutes: 30, fees: "holders-payday", name: 0, announcement: answers.shift() ?? "", reasoning: "Scripted." },
+          };
+        },
+      },
+    },
+  } as unknown as NonNullable<Parameters<typeof askClaude>[0]["client"]>;
+  const mind = askClaude({ persona: "You are a check.", client: scriptedModel });
+  const shownBook = decodeRulebook(inked.book);
+  const shownMarket = await takeSnapshot(saying(""), shownBook, inked.clock, []);
+  const goodWords = "Max Buy · 1% is on for 30 minutes: no single buy above 1% of supply. Fees: Holders’ Payday.";
+  answers.push("  \n ", `  ${goodWords}\n`);
+  let verdict = await mind(shownMarket, shownBook);
+  const toldOff = "That cannot be used: the announcement has no words in it, and it has to tell holders which hooks are on and for how long. Choose again.";
+  check(requests.length === 2 && requests[1].messages.length === 3 && requests[1].messages[2].role === "user" && requests[1].messages[2].content === toldOff, "an answer whose announcement is only spaces is told off like any other answer that cannot be used, and the model is asked once more");
+  check(verdict.action === "rewrite" && verdict.announcement === goodWords && verdict.usage?.inputTokens === 200 && verdict.usage.outputTokens === 40, "the second answer is taken, with the space around its words gone, and both calls are counted");
+  answers.push("…", "— !!! —");
+  verdict = await mind(shownMarket, shownBook);
+  check(requests.length === 4 && verdict.action === "hold" && verdict.reasoning === "two answers in a row could not be used; nothing changes", "two announcements in a row that say nothing end the look with nothing changed");
+  const told = requests[0].system;
+  const names = [...BUYING_HOOKS.filter((hook) => !hook.needsApp).map((hook) => hook.name), ...FEE_HOOKS.map((hook) => hook.name)];
+  check(names.some((name) => name.includes("’")) && names.every((name) => told.includes(name)) && told.includes("Write the hooks' names as they are written here and in the message, with the apostrophe and the middle dot that some of them carry") && !/straight quotes|hyphen for a dash/.test(told), "the model is told to write the hooks' names as the catalogue has them, curly apostrophe and all, and is no longer told to keep to straight quotes in the same breath");
+  check(told.includes("An accented letter or a middle dot costs under twice what a plain letter does. A curly quote or a long dash costs about twenty-five times as much as a plain letter, and an emoji about fifty times.") && told.includes("By that reckoning an announcement of full length has room for about twenty curly quotes and long dashes, or a dozen emoji.") && !/five plain letters|more than fifty/.test(told), "and the prices it is quoted are the chain's own, with the agent's cautious count named as what it is (npm run e2e:agent measures both on the Memo program)");
+  check(carrying(goodWords).memo === goodWords && told.includes(`at most ${ANNOUNCEMENT_MAX} characters`) && told.includes("an announcement with no words in it cannot be used"), "it is told the limit and that an announcement has to say something, and words with a middle dot and a curly apostrophe in them go on chain whole");
 
   // -------------------------------------------------------------------------------------------
   console.log("a disk that comes up empty");
@@ -615,6 +770,12 @@ async function offline() {
   await until("a keeper that finds another one on its folder stays off and says so", async () => (await healthOf(taken.port)).body.problems.some((problem) => problem.startsWith("the keeper is not running: a keeper is already running")), 5);
   await taken.stop();
 
+  const badPrice: Record<string, string> = { DATA_DIR: folder(), PORT: "0", ...where, KEEPER_OFF: "1", AGENT_KEYPAIR_JSON: keyJson(Keypair.generate()), AGENT_PRIORITY_MICROLAMPORTS: "50.000" };
+  const mispriced = await serve({ env: badPrice, decide: rote, print });
+  await until("a priority price that cannot be read keeps the agent off, in a sentence that names the variable", async () => (await healthOf(mispriced.port)).body.problems.includes(`the agent is not running: ${badSetting}`), 5);
+  check("AGENT_KEYPAIR_JSON" in badPrice, "and it is found before the agent's key is taken out of the settings");
+  await mispriced.stop();
+
   // -------------------------------------------------------------------------------------------
   console.log("both loops, on a chain in memory");
 
@@ -627,12 +788,15 @@ async function offline() {
     HOOK_PROGRAM: world.hookProgram.toBase58(), MINT: world.mint.toBase58(), POOL: address(), TREASURY: treasury,
     AGENT_KEYPAIR_JSON: keyJson(world.agent), KEEPER_KEYPAIR_JSON: keyJson(keeperKey),
     AGENT_POLL_SECS: "0.1", AGENT_THINK_EVERY_SECS: "0.3", KEEPER_EVERY_SECS: "0.1", KEEPER_OWN_WALLETS: `${address()}, ${address()}`, KEEPER_SETTINGS: `{"payWhenLamports":"5"}`,
+    AGENT_PRIORITY_MICROLAMPORTS: "250000",
   };
   const idle: KeeperOutcome = { status: "waiting", reason: "nothing is due: 0 SOL of fees wait in the pool" };
   let keeperDoes: (ctx: KeeperContext) => Promise<KeeperOutcome> = async () => idle;
   let keeperGot: KeeperContext | undefined;
   let modelTakes = 0;
   let looking = false;
+  /** While this is on, the model says what it would say in words the chain cannot afford whole. */
+  let dearWords = false;
   const logD = join(dirD, "agent-log.jsonl");
   const d = await serve({
     env: envD,
@@ -642,13 +806,18 @@ async function offline() {
       looking = true;
       if (modelTakes) await sleep(modelTakes);
       looking = false;
-      return rote(snapshot, book);
+      const verdict = await rote(snapshot, book);
+      return dearWords && verdict.action === "rewrite" ? { ...verdict, announcement: tooDear } : verdict;
     },
     round: (keeper) => (keeperGot = keeper, keeperDoes(keeper)),
     print,
   });
   const dAt = (path: string) => `http://127.0.0.1:${d.port}${path}`;
   await until("the agent issues an edict by itself", () => readLog(logD).length === 1 && readLog(logD)[0].note === world.note(), 10);
+  const firstD = readLog(logD)[0];
+  const askedD = world.asked.get(firstD.signature ?? "");
+  check(askedD?.price === 250_000 && askedD.units === edictUnits(firstD.record.memo ?? "", false) && said.some((line) => line.endsWith("agent: an edict bids 250,000 micro-lamports for each compute unit it asks for (AGENT_PRIORITY_MICROLAMPORTS), and pays the network at most 0.0001095 SOL")), "its transaction bids the price set in AGENT_PRIORITY_MICROLAMPORTS, and the service says at the start what that can come to");
+  await until("its line in the service's log gives the transaction and the announcement, with nothing to add about a memo that is the announcement whole", () => said.some((line) => line.endsWith(`agent: issued an edict (${firstD.signature}): ${firstD.record.announcement}`)), 5);
   check(!("AGENT_KEYPAIR_JSON" in envD) && !("KEEPER_KEYPAIR_JSON" in envD) && keeperGot !== undefined, "the two keys are taken out of the environment once they have been read");
   check((await pageReadLog(dAt("/log.jsonl")))?.length === 1, "and the page can read it from the service");
   health = await healthOf(d.port);
@@ -661,6 +830,7 @@ async function offline() {
   await until("through the service too, an edict that lands unseen gets its text at the next poll, not at the next look", () => world.epoch() === 2 && readLog(logD).length === 2 && readLog(logD)[1].note === world.note(), 10);
   check(said.some((line) => line.includes("agent: error: Transaction was not confirmed") && line.includes("https://rpc.example") && !line.includes("SECRET")), "the error is printed with the node's address cut to its host");
 
+  dearWords = true;
   world.landForeign();
   world.clock += 1_900;
   await until("an edict written elsewhere turns /health to 503, by name", async () => {
@@ -668,6 +838,10 @@ async function offline() {
     return now.status === 503 && now.body.agent.withoutText.includes(3) && now.body.problems.includes("edict 3 is on chain and its text is not in the log");
   }, 10);
   await until("and the agent goes on", () => world.epoch() === 4 && readLog(logD).length === 3, 10);
+  dearWords = false;
+  const cutD = readLog(logD)[2];
+  const cutLine = `agent: issued an edict (${cutD.signature}): ${tooDear} [memo, cut to the first ${(inDear.memo?.length ?? 0) - 1} of ${tooDear.length} characters: ${inDear.memo}]`;
+  await until("an edict whose memo had to be cut says so on its line in the service's log, with the memo as it went", () => cutD.record.memo === inDear.memo && world.memos.get(cutD.signature ?? "")?.text === inDear.memo && said.some((line) => line.endsWith(cutLine)), 5);
 
   keeperDoes = async () => { throw new Error("failed to get info about account: 429 Too Many Requests https://rpc.example/?api-key=SECRET"); };
   await until("a keeper that keeps failing turns up on /health", async () => (await healthOf(d.port)).body.problems.includes("the keeper keeps failing: Error"), 10);
@@ -722,6 +896,34 @@ async function offline() {
   check(Date.now() - askedAt >= 1_000 && steps.finished === before.started && steps.started === before.started, "the keeper's round is let finish the step it was on, and no other is started");
   check(world.epoch() === before.epoch + 1 && readLog(logD).length === before.log + 1 && readLog(logD).at(-1)?.note === world.note() && !existsSync(waitingPath(logD)), "and the agent's look ends as an edict on chain with its text in the log");
   check(!existsSync(join(dirD, "service.lock")) && (await fetch(dAt("/health")).then(() => false, () => true)), "then it lets go of its lock and of the port");
+
+  // -------------------------------------------------------------------------------------------
+  console.log("a rehearsal (the service in a dry run, on a chain in memory)");
+
+  const stage = madeUpChain();
+  const dirR = folder();
+  const staged: string[] = [];
+  // Each edict it would issue would stand for a second, and every other one says more than the chain can afford.
+  const brief = byRote({ minutes: 1 / 60, keepName: true });
+  let turns = 0;
+  const rehearsal = await serve({
+    env: { DATA_DIR: dirR, PORT: "0", RPC_URL: "http://127.0.0.1:9", HOOK_PROGRAM: stage.hookProgram.toBase58(), MINT: stage.mint.toBase58(), POOL: address(), AGENT_KEYPAIR_JSON: keyJson(stage.agent), KEEPER_OFF: "1", DRY_RUN: "1", AGENT_POLL_SECS: "0.1", AGENT_THINK_EVERY_SECS: "0.2" },
+    connection: stage.connection,
+    dbc: stage.dbc,
+    decide: async (snapshot, book) => ({ ...(await brief(snapshot, book)), announcement: turns++ % 2 ? tooDear : plainWords }),
+    print: (line) => void staged.push(line),
+  });
+  // Its lines without the time in front, and with the size of the transaction, which depends on the rule, set apart.
+  const would = () => staged.filter((line) => line.includes("agent: would issue an edict")).map((line) => line.slice(line.indexOf("agent: ")));
+  await until("in a dry run the service says what it would issue, look after look", () => would().length >= 2, 15);
+  const [wholeLine, cutLineDry] = [would()[0] ?? "", would()[1] ?? ""];
+  const sized = (line: string) => Number(line.match(/transaction: (\d+) bytes/)?.[1] ?? 0);
+  const unsized = (line: string) => line.replace(/transaction: \d+ bytes/, "transaction: N bytes");
+  check(unsized(wholeLine) === `agent: would issue an edict (dry run, nothing sent): ${plainWords} [memo: the announcement, whole; transaction: N bytes, 118,140 compute units, fee 0.000010907 SOL]` && sized(wholeLine) > bytesOf(plainWords) + 200 && sized(wholeLine) <= TRANSACTION_MAX, `its line says that the memo would be the announcement whole, and what the transaction it built comes to: ${wholeLine.replace(plainWords, "(the announcement)")}`);
+  check(unsized(cutLineDry) === `agent: would issue an edict (dry run, nothing sent): ${tooDear} [memo, cut to the first ${(inDear.memo?.length ?? 0) - 1} of ${tooDear.length} characters: ${inDear.memo}; transaction: N bytes, 388,806 compute units, fee 0.000024441 SOL]` && sized(cutLineDry) > 0 && sized(cutLineDry) <= TRANSACTION_MAX, `and of words the chain could not afford whole, that the memo would be cut and to what: ${cutLineDry.replace(tooDear, "(the announcement)").replace(inDear.memo ?? "", "(the memo)")}`);
+  health = await healthOf(rehearsal.port);
+  check(health.body.dryRun && health.body.agent.on && stage.sent.length === 0 && stage.epoch() === 0 && !existsSync(join(dirR, "agent-log.jsonl")) && staged.some((line) => line.endsWith("agent: an edict bids 50,000 micro-lamports for each compute unit it asks for (AGENT_PRIORITY_MICROLAMPORTS), and pays the network at most 0.0000259 SOL")), "nothing was sent and nothing was written, and with no setting the service says it would bid 50,000 micro-lamports a unit");
+  await rehearsal.stop();
 
   // -------------------------------------------------------------------------------------------
   console.log("how often the model is asked (the agent's own loop, on a chain in memory)");
@@ -1021,7 +1223,7 @@ async function onValidator() {
     dbc, hookProgram: HOOK, payer, mint, config,
     guardian: guardian.publicKey, agent: agent.publicKey, keeper: keeper.publicKey,
     limits: LIMITS, split: SPLIT,
-    curve: { startCapSol: 30, graduationCapSol: 8_000_000, feeBps: 300 },
+    curve: { startCapSol: 30, feeBps: 300 },
     names: [{ name: "Veluno", symbol: "VELUNO" }], uri: "https://example.com/veluno.json",
   }, (_what, tx, signers) => send(tx, signers));
   const swap = async (who: Keypair, buy: boolean, amount: bigint) =>
@@ -1045,7 +1247,7 @@ async function onValidator() {
     AGENT_POLL_SECS: "1", AGENT_THINK_EVERY_SECS: "2", KEEPER_EVERY_SECS: "2", KEEPER_OWN_WALLETS: payer.publicKey.toBase58(),
     // The keeper's thresholds in SOL are the shipped ones, except that a credit and a payout round do not wait for a whole SOL or a day.
     KEEPER_SETTINGS: JSON.stringify({ pollMs: 500, creditWhenLamports: "10000000", payWhenLamports: "10000000" }),
-    CHECK_EDICT_MINUTES: "0.25", DRY_RUN: "", AGENT_OFF: "", KEEPER_OFF: "", RESTORE_FROM: "", ALLOW_ORIGINS: "",
+    CHECK_EDICT_MINUTES: "0.25", DRY_RUN: "", AGENT_OFF: "", KEEPER_OFF: "", RESTORE_FROM: "", ALLOW_ORIGINS: "", AGENT_PRIORITY_MICROLAMPORTS: "",
   };
   const at = (path: string) => `http://127.0.0.1:${port}${path}`;
   const logPath = join(dir, "agent-log.jsonl");
@@ -1079,13 +1281,19 @@ async function onValidator() {
   const edicts = pageLog?.filter((entry) => entry.record.action === "rewrite") ?? [];
   const notes = await Promise.all(edicts.map((entry) => hashOf(entry.record)));
   check(edicts.length >= 1 && notes.every((note, i) => note === edicts[i].note) && notes.includes(await chainNote()), "the page reads the log from the service: every text hashes to its note, and the edict in force is among them");
-  // The words are in the transaction too. This is the read an explorer makes, and all a page needs to say so: the signature and the announcement from the log's line.
+  // The words are in the transaction too. This is the read an explorer makes, and all a page needs to say so: the signature and the memo from the log's line.
   const newest = edicts.at(-1);
-  await until("the newest edict's transaction, read as an explorer reads it, shows its announcement as a memo the agent signed", async () => {
-    const shown = newest ? await connection.getParsedTransaction(String(newest.signature), { commitment: "confirmed", maxSupportedTransactionVersion: 0 }) : null;
+  const explorerSees = async () => (newest ? connection.getParsedTransaction(String(newest.signature), { commitment: "confirmed", maxSupportedTransactionVersion: 0 }) : null);
+  await until("the newest edict's transaction, read as an explorer reads it, shows as a memo the agent signed exactly what its line in the log says the memo is: here the announcement, whole", async () => {
+    const shown = await explorerSees();
     const memos = shown?.transaction.message.instructions.filter((instruction) => instruction.programId.equals(MEMO_PROGRAM)) ?? [];
-    return memos.length === 1 && "parsed" in memos[0] && memos[0].parsed === (newest.record.memo ?? newest.record.announcement) && shown?.meta?.logMessages?.includes(`Program log: Signed by ${agent.publicKey.toBase58()}`);
+    return memos.length === 1 && "parsed" in memos[0] && typeof newest.record.memo === "string" && memos[0].parsed === newest.record.memo && newest.record.memo === newest.record.announcement && shown?.meta?.logMessages?.includes(`Program log: Signed by ${agent.publicKey.toBase58()}`);
   }, 20);
+  check(edicts.every((entry) => typeof entry.record.memo === "string"), "every edict in the log the service wrote says what its memo is");
+  // What the service's edict asked of the network: read from the chain, and worked out again from its memo.
+  const newestMeta = (await explorerSees())?.meta;
+  const newestUnits = edictUnits(String(newest?.record.memo ?? ""), false);
+  check(newestMeta?.fee === edictFee(newestUnits, PRIORITY_MICROLAMPORTS) && (newestMeta.computeUnitsConsumed ?? Infinity) * 11 <= newestUnits * 10, `with no setting it bid ${PRIORITY_MICROLAMPORTS} micro-lamports for each of the ${newestUnits} units it asked for: the network charged it ${newestMeta?.fee} lamports, and it used ${newestMeta?.computeUnitsConsumed} units`);
   const pageHead = await readLedger(at("/ledger-head.json"));
   check(pageHead && pageHead.mint === mint.publicKey.toBase58() && pageHead.seq >= 2 && BigInt(pageHead.totals.claimed) >= 288_000_000n && pageHead.recent.some((line: { kind: string }) => line.kind === "claim"), `the page reads the keeper's head from the service: ${pageHead ? `${pageHead.seq} lines, ${Number(pageHead.totals.claimed) / 1e9} SOL claimed` : "nothing"}`);
   const ledger = await ledgerNow();

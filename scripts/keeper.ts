@@ -16,7 +16,8 @@
 //   KEEPER_DIR                          its folder: public/ is the ledger the site shows, private/ its books (default keeper)
 //   KEEPER_EVERY_SECS                   how often it takes a round (default 20)
 //   KEEPER_OWN_WALLETS                  the project's own wallets, separated by commas: they are never paid as holders
-//   KEEPER_SETTINGS                     any of the numbers in src/keeper/settings.ts, as JSON, to replace its defaults
+//   KEEPER_SETTINGS                     any of the numbers in src/keeper/settings.ts, as JSON, to replace its defaults.
+//                                       {"microLamportsPerUnit":50000} raises the priority fee of every transaction to five times the usual
 //   DRY_RUN=1                           work out and print; send and write nothing
 import "../src/quiet.js";
 import { existsSync, readFileSync } from "node:fs";

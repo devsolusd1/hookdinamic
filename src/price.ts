@@ -1,4 +1,4 @@
-// SOL's price, to turn a market cap in dollars into one in SOL.
+// SOL's price in dollars, so that the agent can be shown the token's market cap in dollars too.
 const SOL = "So11111111111111111111111111111111111111112";
 
 export async function solPriceUsd(): Promise<number> {

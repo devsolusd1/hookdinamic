@@ -126,7 +126,8 @@ export function chainOf(connection: Connection): Chain {
       return found.map((entry) => ({ signature: entry.signature, failed: entry.err !== null }));
     },
     async feePayer(signature) {
-      const found = await connection.getTransaction(signature, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
+      // Anybody's transaction can name my address, in any format the network carries: mainnet has version 1 as well as 0, and a node refuses to show one to a caller that asks for less.
+      const found = await connection.getTransaction(signature, { commitment: "confirmed", maxSupportedTransactionVersion: 1 });
       return found ? found.transaction.message.staticAccountKeys[0].toBase58() : null;
     },
   };

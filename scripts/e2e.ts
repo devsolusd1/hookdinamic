@@ -1,8 +1,9 @@
 // End to end against the real Meteora DBC bytecode on a local validator (scripts/validator.sh):
-// launch on a curve that never graduates, trade under rules built from every fact the hook
+// launch on a curve that cannot graduate, trade under rules built from every fact the hook
 // can see, change the token's name, claim the fees. Then the same for a second token with the
 // shape the real one launches with, and there the whole of how the fees leave the curve: only
-// through the program, only for the keeper, and with a keeper the guardian can replace.
+// through the program, only for the keeper, and with a keeper the guardian can replace. Last,
+// one buy of nearly the whole supply, which leaves the curve open and the hook on the token.
 //
 //   npm run validator     (in one terminal; needs WSL)
 //   npm run e2e
@@ -14,17 +15,17 @@ import {
   deriveDbcPoolAuthority,
   deriveDbcTokenVaultAddress,
   DynamicBondingCurveClient,
+  getPriceFromSqrtPrice,
   SwapMode,
 } from "@meteora-ag/dynamic-bonding-curve-sdk";
-import { createAssociatedTokenAccountIdempotentInstruction, getAssociatedTokenAddressSync, getMint, getTokenMetadata, NATIVE_MINT, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
+import { createAssociatedTokenAccountIdempotentInstruction, getAssociatedTokenAddressSync, getMint, getTokenMetadata, getTransferHook, NATIVE_MINT, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
 import { createUpdateFieldInstruction } from "@solana/spl-token-metadata";
 import BN from "bn.js";
 import { FEE_HOOKS, recogniseSplit, ruleOf } from "../site/hooks.js";
-import { METEORA_FEE_SHARE, TOKEN_DECIMALS, TOTAL_SUPPLY } from "../src/curve.js";
+import { GRADUATION_SOL, METEORA_FEE_SHARE, SOL_IN_EXISTENCE, TOKEN_DECIMALS, TOTAL_SUPPLY } from "../src/curve.js";
 import { claimFeesTx, EVERYTHING } from "../src/fees.js";
 import { BPS, claimFeesIx, compile, decodeRulebook, describe, METEORA_DBC, pauseIx, REFUSAL, rulebookAddress, setKeeperIx, setNameIx, setRulesIx, type Change, type Clause, type Limits, type Name, type Split } from "../src/hook.js";
 import { launch } from "../src/launch.js";
-import { solPriceUsd } from "../src/price.js";
 
 const local = JSON.parse(readFileSync(new URL("../.local/validator.json", import.meta.url), "utf8")) as { rpc: string; hookProgram: string };
 const connection = new Connection(local.rpc, "confirmed");
@@ -33,7 +34,6 @@ const dbc = DynamicBondingCurveClient.create(connection, "confirmed");
 
 const FEE_BPS = 300;
 const START_CAP_SOL = 30;
-const GRADUATION_CAP_USD = 1_000_000_000;
 // The fee and the treasury's floor and cap are the ones the token launches with.
 const LIMITS: Limits = { minIntervalSecs: 2, maxRuleSecs: 6 * 3600, minTreasuryBps: 4_000, maxTreasuryBps: 5_000, minRenameSecs: 20 };
 const SPLIT: Split = { holdersBps: 3_000, burnBps: 3_000, treasuryBps: 4_000 };
@@ -95,11 +95,13 @@ async function mustSend(what: string, tx: Transaction, signers: Keypair[]): Prom
 
 const tx = (...ixs: TransactionInstruction[]) => new Transaction().add(...ixs);
 
+async function airdrop(wallet: Keypair, solAmount: number) {
+  const signature = await connection.requestAirdrop(wallet.publicKey, solAmount * LAMPORTS_PER_SOL);
+  await connection.confirmTransaction({ signature, ...(await connection.getLatestBlockhash()) }, "confirmed");
+}
+
 async function fund(...wallets: Keypair[]) {
-  for (const wallet of wallets) {
-    const signature = await connection.requestAirdrop(wallet.publicKey, 100 * LAMPORTS_PER_SOL);
-    await connection.confirmTransaction({ signature, ...(await connection.getLatestBlockhash()) }, "confirmed");
-  }
+  for (const wallet of wallets) await airdrop(wallet, 100);
 }
 
 const partner = Keypair.generate(); // pays for the launches
@@ -197,18 +199,25 @@ const inSol = (lamports: bigint) => (Number(lamports) / LAMPORTS_PER_SOL).toFixe
 
 async function main() {
   await fund(partner, guardian, agent, keeper, app, alice, bob, carol);
-  const price = await solPriceUsd().catch(() => 150);
-  const graduationCapSol = GRADUATION_CAP_USD / price;
 
   console.log("launch");
-  const { solToGraduate } = await launch({
+  await launch({
     dbc, hookProgram: HOOK, payer: partner, mint, config,
     guardian: guardian.publicKey, agent: agent.publicKey, keeper: keeper.publicKey, cosigner: app.publicKey,
     limits: LIMITS, split: SPLIT,
-    curve: { startCapSol: START_CAP_SOL, graduationCapSol, feeBps: FEE_BPS },
+    curve: { startCapSol: START_CAP_SOL, feeBps: FEE_BPS },
     names: NAMES, uri: "https://example.com/aht.json",
   }, mustSend);
-  check(true, `launched on a curve from ${START_CAP_SOL} SOL to ${Math.round(graduationCapSol).toLocaleString("en-US")} SOL of market cap (US$ 1B at US$ ${price.toFixed(0)}/SOL); it would take ${Math.round(solToGraduate).toLocaleString("en-US")} SOL of buys to graduate`);
+  // What the program itself wrote in the config, not what the launch meant to send.
+  const made = (await dbc.state.getPoolConfig(config.publicKey))!;
+  const segments = made.curve.filter((point) => !point.sqrtPrice.isZero());
+  const opening = (await dbc.state.getPool(pool))!.poolState;
+  const startsAt = getPriceFromSqrtPrice(opening.sqrtPrice, TOKEN_DECIMALS, 9).toNumber() * TOTAL_SUPPLY;
+  check(
+    made.migrationQuoteThreshold.eq(new BN(GRADUATION_SOL).mul(new BN(LAMPORTS_PER_SOL))) && GRADUATION_SOL > 10 * SOL_IN_EXISTENCE && segments.length === 1 && made.migrationSqrtPrice.eq(segments[0].sqrtPrice),
+    `launched on a single curve that cannot graduate: its config asks for ${GRADUATION_SOL.toLocaleString("en-US")} SOL in the curve, ${Math.floor(GRADUATION_SOL / SOL_IN_EXISTENCE)} times all the SOL there is`,
+  );
+  check(Math.abs(startsAt - START_CAP_SOL) < 1e-6 && opening.quoteReserve.isZero() && opening.baseReserve.eq(new BN(TOTAL_SUPPLY).mul(new BN(10 ** TOKEN_DECIMALS))), `it opens at ${startsAt.toFixed(6)} SOL of market cap, holding the whole supply and no SOL`);
   const vault = await connection.getParsedAccountInfo(deriveDbcTokenVaultAddress(pool, mint.publicKey));
   const vaultOwner = (vault.value?.data as { parsed?: { info?: { owner?: string } } })?.parsed?.info?.owner;
   check(vaultOwner === deriveDbcPoolAuthority().toBase58() && vaultOwner === "FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM", "the curve's token vault is owned by the pool authority the hook knows");
@@ -315,7 +324,7 @@ async function main() {
   const last = await book();
   check(last.epoch === 12n && last.paused && last.holdersBps === 6_000 && last.treasuryBps === 4_000 && last.rule.length === 1 && last.name === 1, `the rulebook reads back as the agent and the guardian left it, after ${last.epoch} edicts`);
 
-  await asItLaunches(price);
+  await asItLaunches();
 
   console.log(failures ? `\n${failures} check(s) FAILED` : "\nall checks passed");
   process.exit(failures ? 1 : 0);
@@ -323,15 +332,15 @@ async function main() {
 
 /**
  * A second token, with the shape the real one launches with: the numbers of
- * launch.example.json, one name and no app key. Then how its fees leave the curve.
+ * launch.example.json, one name and no app key. Then how its fees leave the curve, and a buy
+ * of nearly the whole supply, which does not fill it.
  */
-async function asItLaunches(price: number) {
+async function asItLaunches() {
   console.log("the token as it launches");
   const example = JSON.parse(readFileSync(new URL("../launch.example.json", import.meta.url), "utf8")) as {
     cosigner?: string;
     feeBps: number;
     startCapSol: number;
-    graduationCapUsd: number;
     limits: Limits;
     split: Split;
     names: Name[];
@@ -350,7 +359,7 @@ async function asItLaunches(price: number) {
     dbc, hookProgram: HOOK, payer: partner, mint, config,
     guardian: guardian.publicKey, agent: agent.publicKey, keeper: keeper.publicKey,
     limits, split: example.split,
-    curve: { startCapSol: example.startCapSol, graduationCapSol: example.graduationCapUsd / price, feeBps: example.feeBps },
+    curve: { startCapSol: example.startCapSol, feeBps: example.feeBps },
     names: example.names, uri: "https://example.com/veluno.json",
   }, mustSend);
   const opened = await token.book();
@@ -443,6 +452,24 @@ async function asItLaunches(price: number) {
   check(!rest.sent.err && rest.reached === due.waiting - half && end.waiting === 0n, `and the new one claims the rest, ${inSol(rest.reached)} SOL${rest.sent.err ? ` got ${JSON.stringify(rest.sent.err)}` : ""}`);
   check(first.reached + rest.reached === end.ever, `between them the two keepers were paid every lamport of fees the pool ever counted for the token: ${inSol(end.ever)} SOL`);
   check(!(await token.buy(bob, 0.05)).err && (await token.fees()).waiting > 0n, "the curve trades on, and fees start to gather again");
+
+  // Meteora takes the hook off a token in the buy that fills its curve. One buy of 20,000
+  // SOL takes nearly all the supply there is to buy, and leaves this curve nowhere near full.
+  console.log("it cannot graduate");
+  const whale = Keypair.generate();
+  const size = 20_000;
+  for (let given = 0; given < size; given += 5_000) await airdrop(whale, 5_000);
+  await airdrop(whale, 10);
+  const hooked = async () => getTransferHook(await getMint(connection, mint.publicKey, "confirmed", TOKEN_2022_PROGRAM_ID))?.programId.equals(HOOK) === true;
+  const large = await token.buy(whale, size);
+  const full = (await dbc.state.getPool(token.pool))!.poolState;
+  check(
+    !large.err && full.isMigrated === 0 && full.migrationProgress === 0 && (await hooked()),
+    `one buy of ${size.toLocaleString("en-US")} SOL takes ${pct(await token.held(whale.publicKey))} of supply and leaves ${inSol(BigInt(full.quoteReserve.toString()))} SOL in the curve: the curve is not full, and the hook is still on the token${large.err ? ` got ${JSON.stringify(large.err)}` : ""}`,
+  );
+  check(!(await token.rewrite({ ruleSecs: 600, rule: compile([{ group: 1, fact: "luck", op: ">", value: 99 }]), ...example.split })).err, "the agent closes buying");
+  refused(await token.buy(bob, 0.05), "and up there its rule still turns a buy away");
+  check(!(await token.sell(whale, await token.held(whale.publicKey))).err && (await hooked()), "all of it sells back, as a sale always can");
 }
 
 main().catch((error) => {

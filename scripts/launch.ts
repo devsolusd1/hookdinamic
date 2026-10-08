@@ -15,10 +15,9 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DynamicBondingCurveClient } from "@meteora-ag/dynamic-bonding-curve-sdk";
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, sendAndConfirmTransaction } from "@solana/web3.js";
-import { curveConfig, METEORA_FEE_SHARE } from "../src/curve.js";
+import { curveConfig, METEORA_FEE_SHARE, SOL_IN_EXISTENCE } from "../src/curve.js";
 import { BPS, rulebookAddress, span, type Limits, type Name, type Split } from "../src/hook.js";
 import { launch } from "../src/launch.js";
-import { solPriceUsd } from "../src/price.js";
 
 type LaunchFile = {
   rpc: string;
@@ -38,8 +37,11 @@ type LaunchFile = {
    */
   cosigner?: string;
   feeBps: number;
+  /**
+   * The market cap the curve starts at, in SOL. Where the curve would graduate is not asked
+   * for: it cannot, and that is set in src/curve.ts, not by a number here.
+   */
   startCapSol: number;
-  graduationCapUsd: number;
   limits: Limits;
   /** The fee split the token opens with. */
   split: Split;
@@ -107,6 +109,10 @@ async function run() {
 
   // Meteora never lets a curve's fee claimer change, so it is not a wallet and not a choice.
   if ("feeClaimer" in input) throw new Error("the launch file cannot name a feeClaimer: the fees are claimed by the token's rulebook, for the keeper. Remove that line and name the keeper");
+  // A file from before the curve was set never to graduate still names where it would. Left
+  // in, the line would read as if it decided something.
+  const graduation = Object.keys(input).find((key) => /^graduat/i.test(key));
+  if (graduation) throw new Error(`the launch file cannot name a ${graduation}: the curve is built never to graduate, and no number in the file changes that. Remove that line`);
   /** An address the launch file has to give. A placeholder left in from the example is caught here, before anything is paid for. */
   function address(name: "guardian" | "agent" | "keeper" | "hookProgram" | "cosigner"): PublicKey {
     try {
@@ -129,7 +135,7 @@ async function run() {
   if (split.holdersBps + split.burnBps + split.treasuryBps !== BPS) throw new Error(`the opening split has to add up to ${BPS} bps`);
   if (split.treasuryBps < limits.minTreasuryBps || split.treasuryBps > limits.maxTreasuryBps) throw new Error(`the opening split has to give the treasury between ${limits.minTreasuryBps} and ${limits.maxTreasuryBps} bps`);
   // The rest of what is written into the token or the curve for good.
-  for (const name of ["feeBps", "startCapSol", "graduationCapUsd"] as const) {
+  for (const name of ["feeBps", "startCapSol"] as const) {
     if (!(typeof input[name] === "number" && input[name] > 0)) throw new Error(`the launch file needs ${name}, a number above zero`);
   }
   if (!Array.isArray(input.names) || input.names.length === 0 || !input.names.every((name) => typeof name?.name === "string" && name.name && typeof name?.symbol === "string" && name.symbol)) {
@@ -167,9 +173,9 @@ async function run() {
 
   const program = await connection.getAccountInfo(hookProgram);
   if (!program?.executable) throw new Error(`${input.hookProgram} is not a program on ${network}: deploy the hook first`);
-  const price = await solPriceUsd();
-  const curve = { startCapSol: input.startCapSol, graduationCapSol: input.graduationCapUsd / price, feeBps: input.feeBps };
-  const solToGraduate = Number(curveConfig(curve).migrationQuoteThreshold.toString()) / LAMPORTS_PER_SOL;
+  const curve = { startCapSol: input.startCapSol, feeBps: input.feeBps };
+  // Read from the config the launch would send, so the summary says what goes on chain.
+  const graduationSol = Number(curveConfig(curve).migrationQuoteThreshold.toString()) / LAMPORTS_PER_SOL;
   const balance = (await connection.getBalance(payer.publicKey)) / LAMPORTS_PER_SOL;
   const round = (n: number) => Math.round(n).toLocaleString("en-US");
   /** A line under one of the summary's, when there is something to warn of. */
@@ -190,8 +196,8 @@ async function run() {
 
   fixed for good
   trading fee    ${input.feeBps / 100}% per trade, of which Meteora keeps ${METEORA_FEE_SHARE * 100}%
-  curve          starts at ${input.startCapSol} SOL of market cap, graduates at ${round(curve.graduationCapSol)} SOL
-                 (US$ ${round(input.graduationCapUsd)} at US$ ${price.toFixed(0)}/SOL), which takes ${round(solToGraduate)} SOL of buys
+  curve          starts at ${input.startCapSol} SOL of market cap and cannot graduate: graduating takes
+                 ${round(graduationSol)} SOL in the curve, ${Math.floor(graduationSol / SOL_IN_EXISTENCE)} times all the SOL there is (about ${round(SOL_IN_EXISTENCE / 1e6)} million)
   limits         one edict every ${span(limits.minIntervalSecs)} at most, an edict stands ${span(limits.maxRuleSecs)} at most,
                  treasury never below ${limits.minTreasuryBps / 100}% and never above ${limits.maxTreasuryBps / 100}% of the fees
   names          ${input.names.length > 1 ? `${input.names.map((name) => `${name.name} (${name.symbol})`).join(", ")}; one change every ${span(limits.minRenameSecs)} at most` : "one, for good"}
@@ -201,8 +207,8 @@ async function run() {
 `);
 
   // A dry run ends by reaching the end of the file, not through process.exit. On Windows that
-  // call cuts across the connections to the RPC and the price feed while Node is still closing
-  // them, and the process dies on its way out with a failed assertion and exit code 127.
+  // call cuts across the connections to the RPC and to the card's address while Node is still
+  // closing them, and the process dies on its way out with a failed assertion and exit code 127.
   if (!send) return void console.log(`Nothing was sent. Add --send to launch${network === "mainnet" ? ", and --mainnet with it" : ""}. A launch costs the payer about ${COST_SOL} SOL.`);
 
   if (network === "mainnet" && !flags.includes("--mainnet")) throw new Error("this is mainnet: add --mainnet if that is what you mean");

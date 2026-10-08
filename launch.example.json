@@ -7,7 +7,6 @@
   "keeper": "<carteira do keeper, que retira as taxas e paga; o guardião pode trocar>",
   "feeBps": 300,
   "startCapSol": 30,
-  "graduationCapUsd": 1000000000,
   "limits": {
     "minIntervalSecs": 600,
     "maxRuleSecs": 7200,

@@ -11,7 +11,7 @@ import { closeSync, existsSync, fstatSync, fsyncSync, openSync, readFileSync, re
 import Anthropic from "@anthropic-ai/sdk";
 import { betaZodOutputFormat } from "@anthropic-ai/sdk/helpers/beta/zod";
 import { getPriceFromSqrtPrice, type DynamicBondingCurveClient } from "@meteora-ag/dynamic-bonding-curve-sdk";
-import { type Connection, type Keypair, PublicKey, SendTransactionError, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
+import { ComputeBudgetProgram, type Connection, type Keypair, PublicKey, SendTransactionError, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
 import { z } from "zod";
 import { BUYING_HOOKS, buyingHooksFor, FEE_HOOKS, IDENTITY_HOOK, recogniseRule, recogniseSplit, ruleOf, worded } from "../site/hooks.js";
 import { TOKEN_DECIMALS, TOTAL_SUPPLY } from "./curve.js";
@@ -29,7 +29,7 @@ const Decision = z.object({
   minutes: z.number().describe("How long this edict stands, in whole minutes. The next one is written when it is up."),
   fees: z.enum(ids(FEE_HOOKS)).describe("The fee hook to switch on."),
   name: z.number().describe("0 to keep the token's name. Otherwise the number of the name to take, from the list in the message."),
-  announcement: z.string().describe(`What holders read, and what goes on chain with the edict. Names the hooks now on, what they mean for a buyer and how long the edict stands. At most ${ANNOUNCEMENT_MAX} characters, in plain letters, digits and everyday punctuation.`),
+  announcement: z.string().describe(`What holders read, and what goes on chain with the edict. Names the hooks now on, what they mean for a buyer and how long the edict stands. At most ${ANNOUNCEMENT_MAX} characters: the hooks' names as they are written, and otherwise plain letters, digits and everyday punctuation.`),
   reasoning: z.string().describe("Two or three sentences on why these, given the market and your earlier edicts. Public as well."),
 });
 type Decision = z.infer<typeof Decision>;
@@ -109,8 +109,10 @@ export type LogEntry = {
     reasoning: string;
     model: string;
     /**
-     * What the edict's transaction carries as its memo, when that is not the announcement
-     * whole: the announcement cut short, or nothing. Left out when the two are the same.
+     * The text the edict's transaction carries as its memo, exactly: the announcement, or
+     * as much of it as the chain could take, or "" when no memo was written. Every edict
+     * the agent writes has it. A line without it is taken for an edict whose words are not
+     * on chain: the agent wrote it before it wrote memos, or something else did.
      */
     memo?: string;
   };
@@ -135,9 +137,20 @@ export type Context = {
   logPath: string;
   decide: Decide;
   solPriceUsd?: () => Promise<number>;
-  /** Decide and report, but send nothing and record nothing. */
+  /**
+   * Decide and report, but send nothing and record nothing. The edict's transaction is
+   * still built, down to its memo, its size and what it asks for; it is not signed.
+   */
   dryRun?: boolean;
+  /**
+   * What an edict's transaction bids for each compute unit it asks for, in micro-lamports.
+   * 0: nothing, and the transaction does not name a price. Left out: `PRIORITY_MICROLAMPORTS`.
+   */
+  priorityMicroLamports?: number;
 };
+
+/** An edict's transaction by its figures: its size on the wire, the compute units it asks for, and what it pays the network. */
+export type Figures = { bytes: number; units: number; feeLamports: number };
 
 export type Outcome =
   | { status: "paused" }
@@ -147,8 +160,12 @@ export type Outcome =
   /** An edict is due, and the caller asked for the model to be left alone for now (`ask: false`). */
   | { status: "resting" }
   | { status: "held"; reasoning: string; usage?: Usage }
-  /** `memo` is what the transaction carries as its memo, when that is not the announcement whole. */
-  | { status: "rewritten"; choice: Choice; change: Change; announcement: string; reasoning: string; signature: string | null; memo?: string; usage?: Usage };
+  /**
+   * `signature` is null in a dry run, and the rest is then what would have been sent. `memo`
+   * is the text the transaction carries as its memo: the announcement, or what was left of
+   * it when it had to be cut, which ends in an ellipsis, or "" for no memo at all.
+   */
+  | { status: "rewritten"; choice: Choice; change: Change; announcement: string; reasoning: string; signature: string | null; memo: string; transaction: Figures; usage?: Usage };
 
 const hasApp = (book: Rulebook) => !book.cosigner.equals(PublicKey.default);
 
@@ -302,7 +319,9 @@ How to choose. The choice is yours, and there is no right answer to find. Look a
 
 Everything you write is public. The announcement is what holders read: name the hooks that are now on, say in plain words what they mean for a buyer and how long the edict stands, and say nothing about where the price will go. The page next to it shows the same edict as the chain stores it, so the two must agree.
 
-The announcement also goes on chain: it is written into the edict's own transaction as a memo, where it stays for good and anybody who opens the transaction reads it. It can be at most ${ANNOUNCEMENT_MAX} characters, and a longer one is cut at a word. Write it in plain letters, digits and everyday punctuation, with straight quotes and a hyphen for a dash. The chain charges for a memo by the character, and every other sign is dear there: an accented letter costs what five plain letters do, a curly quote or a long dash thirty, an emoji more than fifty. An announcement of full length can afford about twenty curly quotes and dashes, or a dozen emoji; past that, the copy on chain is cut short at a word.`;
+The announcement also goes on chain: it is written into the edict's own transaction as a memo, where it stays for good and anybody who opens the transaction reads it. It can be at most ${ANNOUNCEMENT_MAX} characters, and a longer one is cut at a word. It has to say something: an announcement with no words in it cannot be used.
+
+Write the hooks' names as they are written here and in the message, with the apostrophe and the middle dot that some of them carry: there is always room for those. The rest is best said in plain letters, digits and everyday punctuation, because the chain charges for a memo by the character and its prices are far apart. An accented letter or a middle dot costs under twice what a plain letter does. A curly quote or a long dash costs about twenty-five times as much as a plain letter, and an emoji about fifty times. A memo has a fixed allowance, and what it will cost is reckoned on the safe side before it is sent. By that reckoning an announcement of full length has room for about twenty curly quotes and long dashes, or a dozen emoji. One that would run over is cut short at a word in the copy on chain.`;
 
 function toChoice(decision: Decision): Choice {
   return {
@@ -313,10 +332,13 @@ function toChoice(decision: Decision): Choice {
   };
 }
 
-/** Asks Claude. `persona` is how the token talks; it comes before the mechanics. */
-export function askClaude(options: { persona: string; model?: string; effort?: "low" | "medium" | "high" | "xhigh" | "max" }): Decide {
+/**
+ * Asks Claude. `persona` is how the token talks; it comes before the mechanics. `client` is
+ * for a check to put a scripted model in Claude's place; left out, it is the real one.
+ */
+export function askClaude(options: { persona: string; model?: string; effort?: "low" | "medium" | "high" | "xhigh" | "max"; client?: Pick<Anthropic, "beta"> }): Decide {
   const model = options.model ?? "claude-opus-5-5";
-  const client = new Anthropic();
+  const client = options.client ?? new Anthropic();
   return async (snapshot, book) => {
     const usage: Usage = { inputTokens: 0, outputTokens: 0 };
     const hold = (reasoning: string): Verdict => ({ action: "hold", reasoning, model, usage });
@@ -350,8 +372,9 @@ export function askClaude(options: { persona: string; model?: string; effort?: "
       if (!decision) return hold(`the model's answer could not be read (${response.stop_reason}); nothing changes`);
 
       const choice = toChoice(decision);
-      const problem = unfit(choice, book, facts);
-      if (!problem) return { action: "rewrite", choice, announcement: announced(decision.announcement), reasoning: decision.reasoning, model: response.model, usage };
+      const announcement = announced(decision.announcement);
+      const problem = unfit(choice, book, facts) ?? (saysNothing(announcement) ? WORDLESS : null);
+      if (!problem) return { action: "rewrite", choice, announcement, reasoning: decision.reasoning, model: response.model, usage };
       messages.push({ role: "assistant", content: response.content }, { role: "user", content: `That cannot be used: ${problem}. Choose again.` });
     }
     return hold("two answers in a row could not be used; nothing changes");
@@ -607,7 +630,8 @@ export async function takeSnapshot(ctx: Context, book: Rulebook, now: number, hi
 // compute units for a plain letter and between nine and twenty thousand for a sign from
 // further up, a curly quote, a long dash or an emoji. So the memo is measured against both
 // before anything is signed, and one that would not fit is cut at a word. The note still
-// commits to the whole announcement, and the record says what the memo was.
+// commits to the whole announcement, and the record says what the memo is, word for word,
+// whether it was cut or not.
 //
 // The agent only ever writes a memo. It reads nobody's, its own included: what it knows of
 // its earlier words comes from its log.
@@ -618,12 +642,15 @@ export const MEMO_PROGRAM = new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDL
 /** The most a transaction may be on the wire, signatures included, in bytes. */
 export const TRANSACTION_MAX = 1232;
 
+/** The most compute units a transaction may ask for. */
+export const TRANSACTION_UNITS_MAX = 1_400_000;
+
 /**
- * The most compute units a memo may be reckoned to cost. A transaction that asks for nothing
- * else is given 200,000 units for each of its instructions to a program like the hook or the
- * Memo program. An edict has two of those, and three with a change of name; the hook spends
- * under a thousand units on the rule and some thirteen thousand on a name, so this leaves it
- * many times what it needs.
+ * The most compute units a memo may be reckoned to cost. An announcement of full length in
+ * plain letters is reckoned at 102,400, so this leaves it room for some twenty curly quotes
+ * or a dozen emoji besides. The transaction asks for what its own memo is reckoned at, by
+ * the same count (`edictUnits`), so the two cannot disagree; with a memo at this ceiling it
+ * asks for under a third of what a transaction may.
  */
 export const MEMO_UNITS = 350_000;
 
@@ -650,35 +677,52 @@ export function memoUnits(text: string): number {
   return units;
 }
 
+/** What may close a word, and what an ellipsis takes the place of. */
+const CLOSES = /[\s.,;:…–—-]/u;
+
 /**
  * `text` if it `fits`; otherwise as much of it as does, ended after a whole word and closed
  * with an ellipsis. A first word that is too much by itself is cut where it has to be, and
  * where not even one character fits the answer is empty.
+ *
+ * `most` is a length, in UTF-16 units, that nothing longer could fit. Past it the text is
+ * not looked at, so the work done is bounded by `most` and not by how long an answer the
+ * model gave: this runs on the thread that also answers /health.
  */
-function shortened(text: string, fits: (text: string) => boolean): string {
-  if (fits(text)) return text;
+function shortened(text: string, fits: (text: string) => boolean, most: number): string {
+  if (text.length <= most && fits(text)) return text;
   const [words, characters]: number[][] = [[], []];
   let end = 0;
   // Character by character and not by UTF-16 unit, so that no surrogate pair is cut in two.
   for (const character of text) {
     end += character.length;
+    if (end > most) break;
     characters.push(end);
     if (/\S/u.test(character) && /\s/u.test(text[end] ?? "")) words.push(end);
   }
   for (const at of [...words.reverse(), ...characters.reverse()]) {
-    // The ellipsis takes the place of whatever closed the last word.
-    const kept = text.slice(0, at).replace(/[\s.,;:…–—-]+$/u, "");
+    // The ellipsis takes the place of whatever closed the last word. Walked back by hand: a
+    // pattern anchored at the end would try every start in a long run of spaces.
+    let stop = at;
+    while (stop > 0 && CLOSES.test(text[stop - 1])) stop--;
+    const kept = text.slice(0, stop);
     if (kept && fits(`${kept}…`)) return `${kept}…`;
   }
   return "";
 }
 
 /**
- * An announcement as it goes into the record: within its limit, cut at a word if it ran over,
- * and holding nothing UTF-8 cannot carry (half of a surrogate pair becomes the replacement
- * character), so that the memo is the record's own words byte for byte.
+ * An announcement as it goes into the record: with no space around it, within its limit, cut
+ * at a word if it ran over, and holding nothing UTF-8 cannot carry (half of a surrogate pair
+ * becomes the replacement character), so that the memo is the record's own words byte for byte.
  */
-export const announced = (text: string) => shortened(Buffer.from(text, "utf8").toString("utf8"), (cut) => cut.length <= ANNOUNCEMENT_MAX);
+export const announced = (text: string) => shortened(Buffer.from(text, "utf8").toString("utf8").trim(), (cut) => cut.length <= ANNOUNCEMENT_MAX, ANNOUNCEMENT_MAX);
+
+/** Whether a text says nothing: it is empty, or holds only spaces, punctuation and signs, with no letter or digit among them. */
+export const saysNothing = (text: string) => !/[\p{L}\p{N}]/u.test(text);
+
+/** Why an announcement that says nothing cannot be used, as the model is told and as an error says. */
+const WORDLESS = "the announcement has no words in it, and it has to tell holders which hooks are on and for how long";
 
 /** `text` as a memo that `signer` signs. Its data is the text and nothing else. */
 export function memoIx(signer: PublicKey, text: string): TransactionInstruction {
@@ -689,10 +733,97 @@ export function memoIx(signer: PublicKey, text: string): TransactionInstruction 
   });
 }
 
+// ---------------------------------------------------------------------------------------------
+// Getting an edict into a block.
+//
+// A transaction that says nothing about compute is given 200,000 units for each of its
+// instructions and pays nothing for priority. On a busy day both count against it: a block's
+// room is handed out by what transactions ask for, not by what they use, and among those that
+// want the same account the ones that bid more for each unit go first. An edict writes to the
+// rulebook that every buy of the token reads, so it queues with those buys, and on launch day
+// the first edict is what stands between the token and the bots. So an edict's transaction
+// asks for what its own parts are reckoned at and a tenth more, and bids a price for each unit.
+
 /**
- * The transaction that writes an edict, not yet signed, and the record its note is the hash
- * of. It holds the rule, then the change of name if there is one, then the announcement as a
- * memo. `record.memo` is filled in here, when the memo is not the announcement whole.
+ * What an edict's transaction is allowed for the rule and for the two compute-budget
+ * instructions in front of it. On the validator the rule takes some 700 units with no
+ * condition and 1,368 with sixteen, the most the program accepts, and each of the other two
+ * takes 150: 1,668 at the most, a third of this. scripts/e2e-agent.ts measures them again.
+ */
+export const RULE_UNITS = 5_000;
+
+/**
+ * What it is allowed for a change of name: the hook program has Token-2022 write the name
+ * and then the ticker, and the top-up before it is a transfer. On the validator a change of
+ * name took between 12,009 and 14,433 units, across names from one byte to the longest the
+ * program takes and in every kind of character, and the transfer 150: under six tenths of
+ * this.
+ */
+export const NAME_UNITS = 25_000;
+
+/**
+ * What is asked for when the parts of a transaction are reckoned at so much: a tenth more.
+ * Every allowance is already more than its part was ever seen to take, so the tenth is
+ * spare. It is there for a network that charges a little more than the validator these
+ * figures were measured on: the memo comes last in the transaction, and an edict that ran
+ * short there would fail whole.
+ */
+const withSpare = (reckoned: number) => reckoned + Math.ceil(reckoned / 10);
+
+/**
+ * The compute units an edict's transaction asks for: the allowances of its parts, with the
+ * memo at what it is reckoned (`memoUnits`), and the spare tenth.
+ */
+export function edictUnits(memo: string, renames: boolean): number {
+  return withSpare(RULE_UNITS + (renames ? NAME_UNITS : 0) + (memo ? memoUnits(memo) : 0));
+}
+
+/** The most an edict's transaction can ask for: a memo at its ceiling, and a change of name. */
+export const EDICT_UNITS_MOST = withSpare(RULE_UNITS + NAME_UNITS + MEMO_UNITS);
+
+/** What every transaction pays the network for its one signature, in lamports. */
+const SIGNATURE_FEE = 5_000;
+
+/**
+ * What an edict's transaction bids for each compute unit it asks for, in micro-lamports,
+ * when the setting AGENT_PRIORITY_MICROLAMPORTS says nothing. Of the 2,045 transactions in
+ * three blocks of mainnet around slot 454,394,880, votes aside, half bid nothing and nine in
+ * ten bid this much or less. At this price an edict whose announcement is 150 plain
+ * characters pays the network 0.0000091 SOL in all, and the largest edict there can be,
+ * with the dearest memo and a change of name, 0.0000259 SOL.
+ */
+export const PRIORITY_MICROLAMPORTS = 50_000;
+
+/**
+ * The most the setting may say. At this price the largest edict costs 0.0021 SOL, and a
+ * slip of the hand that asked for more would empty the agent's wallet within a day.
+ */
+export const PRIORITY_MICROLAMPORTS_MOST = 5_000_000;
+
+/** What a transaction that asks for `units` at `microLamports` each pays the network in all, in lamports. */
+export const edictFee = (units: number, microLamports: number) => SIGNATURE_FEE + Math.ceil((units * microLamports) / 1_000_000);
+
+/**
+ * The priority price out of its setting. Left out or empty, it is `PRIORITY_MICROLAMPORTS`;
+ * 0 is a price too, and means none. Anything but a whole number written in digits is turned
+ * down in a sentence: "50.000" would otherwise be read as fifty.
+ */
+export function priorityFrom(setting: string | undefined): number {
+  const text = (setting ?? "").trim();
+  if (text === "") return PRIORITY_MICROLAMPORTS;
+  const price = Number(text);
+  if (!/^\d+$/.test(text) || price > PRIORITY_MICROLAMPORTS_MOST) {
+    throw new Error(`AGENT_PRIORITY_MICROLAMPORTS has to be a whole number from 0 to ${PRIORITY_MICROLAMPORTS_MOST}, in digits only (0 pays nothing for priority; left out, it is ${PRIORITY_MICROLAMPORTS})`);
+  }
+  return price;
+}
+
+/**
+ * The transaction that writes an edict, not yet signed, the record its note is the hash of,
+ * and the transaction's figures. In order it holds: the compute units it asks for; the price
+ * it bids for each, unless that is 0; the rule; the change of name if there is one, with the
+ * top-up it may need in front of it; and the announcement as a memo. `record.memo` is filled
+ * in here, always, with the memo's text exactly: "" when no memo is written.
  */
 export function edictTransaction(p: {
   program: PublicKey;
@@ -702,33 +833,54 @@ export function edictTransaction(p: {
   /** The name to take, counted from 0, and the lamports the mint is short of to carry it. */
   rename?: { index: number; lamports: number };
   record: LogEntry["record"];
-}): { tx: Transaction; record: LogEntry["record"]; note: Buffer } {
-  const edict = (note?: Buffer) => [
+  /** What it bids for each compute unit, in micro-lamports. 0: nothing, and no instruction saying so. Left out: `PRIORITY_MICROLAMPORTS`. */
+  priorityMicroLamports?: number;
+}): { tx: Transaction; record: LogEntry["record"]; note: Buffer; memo: string } & Figures {
+  const price = p.priorityMicroLamports ?? PRIORITY_MICROLAMPORTS;
+  if (!Number.isInteger(price) || price < 0) throw new Error("the priority price is a whole number of micro-lamports, 0 or more");
+  /** The whole transaction in order, asking for `units`, with `text` as its memo. Null: no memo. */
+  const written = (units: number, text: string | null, note?: Buffer) => [
+    ComputeBudgetProgram.setComputeUnitLimit({ units }),
+    ...(price > 0 ? [ComputeBudgetProgram.setComputeUnitPrice({ microLamports: price })] : []),
     setRulesIx({ program: p.program, agent: p.agent, mint: p.mint, change: p.change, note }),
     // A name changes in the same transaction as its edict, right after it. The mint was given
     // room for its longest name at launch; the transfer covers a mint that was not.
     ...(p.rename && p.rename.lamports > 0 ? [SystemProgram.transfer({ fromPubkey: p.agent, toPubkey: p.mint, lamports: p.rename.lamports })] : []),
     ...(p.rename ? [setNameIx({ program: p.program, agent: p.agent, mint: p.mint, index: p.rename.index })] : []),
+    ...(text === null ? [] : [memoIx(p.agent, text)]),
   ];
   const paidByAgent = (instructions: TransactionInstruction[]) => {
     const tx = new Transaction().add(...instructions);
     tx.feePayer = p.agent;
     return tx;
   };
+  /** What a transaction of these instructions comes to on the wire, with its one signature. Any blockhash weighs the same. */
+  const onTheWire = (instructions: TransactionInstruction[]) => {
+    const tx = paidByAgent(instructions);
+    tx.recentBlockhash = PublicKey.default.toBase58();
+    return tx.serialize({ requireAllSignatures: false, verifySignatures: false }).length;
+  };
   // The bytes left for the memo's text: the most a transaction may be, less what this one
-  // comes to with an empty memo in it. The note and the blockhash weigh the same whatever they are.
-  const empty = paidByAgent([...edict(), memoIx(p.agent, "")]);
-  empty.recentBlockhash = PublicKey.default.toBase58();
-  const room = TRANSACTION_MAX - empty.serialize({ requireAllSignatures: false, verifySignatures: false }).length;
+  // comes to with an empty memo in it. The units asked for and the note weigh the same
+  // whatever they are, and the price is in the measure or out of it as it will be when sent.
+  const room = TRANSACTION_MAX - onTheWire(written(0, ""));
   const said = p.record.announcement ?? "";
-  const memo = shortened(said, (text) => {
-    const bytes = Buffer.byteLength(text);
-    // A text of 128 bytes or more takes a second byte to say how long it is.
-    return bytes + (bytes < 128 ? 0 : 1) <= room && memoUnits(text) <= MEMO_UNITS;
-  });
-  const record = memo === said ? p.record : { ...p.record, memo };
+  const memo = shortened(
+    said,
+    (text) => {
+      const bytes = Buffer.byteLength(text);
+      // A text of 128 bytes or more takes a second byte to say how long it is.
+      return bytes + (bytes < 128 ? 0 : 1) <= room && memoUnits(text) <= MEMO_UNITS;
+    },
+    // Every UTF-16 unit of a text is at least one byte of it.
+    Math.max(room, 0),
+  );
+  const record = { ...p.record, memo };
   const note = noteOf(record);
-  return { tx: paidByAgent([...edict(note), ...(memo ? [memoIx(p.agent, memo)] : [])]), record, note };
+  // Asked for by the same count the memo was just measured with, so the two cannot disagree.
+  const units = edictUnits(memo, p.rename !== undefined);
+  const instructions = written(units, memo || null, note);
+  return { tx: paidByAgent(instructions), record, note, memo, bytes: onTheWire(instructions), units, feeLamports: edictFee(units, price) };
 }
 
 /** The lamports the mint is short of to carry name `index`, which may be longer than the one it has. */
@@ -787,10 +939,11 @@ export async function runOnce(ctx: Context, options: { letRuleRun?: boolean; ask
   const { minutes: _minutes, ...hooks } = choice;
   // The same goes for what it says: the record, the page and the memo all hold these words.
   const announcement = announced(verdict.announcement);
-  const decided = { choice, change, announcement, reasoning: verdict.reasoning, usage: verdict.usage };
-  if (ctx.dryRun) return { status: "rewritten", ...decided, signature: null };
+  if (saysNothing(announcement)) throw new Error(`the decision cannot be used: ${WORDLESS}`);
 
-  const { tx, record, note } = edictTransaction({
+  // A dry run builds the transaction too. It is the only way to learn, before the first edict
+  // that counts, what its memo would be, whether it would be cut and what it would cost.
+  const { tx, record, note, memo, bytes, units, feeLamports } = edictTransaction({
     program: ctx.hookProgram,
     agent: ctx.agent.publicKey,
     mint: ctx.mint,
@@ -807,7 +960,12 @@ export async function runOnce(ctx: Context, options: { letRuleRun?: boolean; ask
       reasoning: base.reasoning,
       model: base.model,
     },
+    priorityMicroLamports: ctx.priorityMicroLamports,
   });
+  const decided = { choice, change, announcement, reasoning: verdict.reasoning, usage: verdict.usage, memo, transaction: { bytes, units, feeLamports } };
+  // It ends here in a dry run: nothing is signed, nothing is sent, nothing is written down.
+  if (ctx.dryRun) return { status: "rewritten", ...decided, signature: null };
+
   // Signed here, so that the signature is known before anything is sent.
   const recent = await ctx.connection.getLatestBlockhash("confirmed");
   tx.recentBlockhash = recent.blockhash;
@@ -838,8 +996,25 @@ export async function runOnce(ctx: Context, options: { letRuleRun?: boolean; ask
   }
   appendLine(ctx.logPath, line);
   rmSync(waitingPath(ctx.logPath), { force: true });
-  return { status: "rewritten", ...decided, signature, ...(record.memo === undefined ? {} : { memo: record.memo }) };
+  return { status: "rewritten", ...decided, signature };
 }
+
+/**
+ * How an edict's memo stands to its announcement, in a few words for a line of a log: the
+ * same words, the first of them, or none.
+ */
+export function memoInWords(announcement: string, memo: string): string {
+  if (memo === announcement) return "memo: the announcement, whole";
+  if (!memo) return "memo: none, not one word of the announcement fits";
+  // A memo that was cut is the start of the announcement and an ellipsis.
+  return `memo, cut to the first ${memo.length - 1} of ${announcement.length} characters: ${memo}`;
+}
+
+/** Lamports as SOL, to the last lamport and with no zeros trailing: "0.000008076". */
+export const inSol = (lamports: number) => (lamports / 1e9).toFixed(9).replace(/\.?0+$/, "");
+
+/** An edict's transaction in a few words, for the same line: its size, what it asks for and what it pays. */
+export const figuresInWords = (figures: Figures) => `transaction: ${figures.bytes} bytes, ${figures.units.toLocaleString("en-US")} compute units, fee ${inSol(figures.feeLamports)} SOL`;
 
 /** An edict in a few plain lines, for a terminal. `names` are the token's, to say which one it took. */
 export function inWords(choice: Choice, change: Change, names: Name[] = []): string[] {

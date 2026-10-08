@@ -208,11 +208,15 @@ só que de ninguém.
 Depois do lançamento, **ninguém** muda isto, nem você, nem o guardião:
 
 - A **taxa** de 3% por trade, e o quinto dela que fica com a Meteora.
-- A **curva**: onde começa (30 SOL de valor de mercado) e onde graduaria (US$ 1 bilhão). Na
-  prática ela nunca gradua: o resumo da parte 6 mostra quantos SOL de compras isso exigiria
-  (num teste de 7 de outubro de 2026, cerca de 16.000 SOL). *Decisão sua:* se você acha esse
-  número alcançável, aumente `graduationCapUsd` antes de lançar. Se a curva graduasse, a
-  Meteora tiraria o hook do token e as regras do agente deixariam de valer.
+- A **curva**: começa em 30 SOL de valor de mercado e **não gradua**. "Graduar" é o que a
+  Meteora faz quando uma curva enche: ela tira o hook do token, e as regras do agente deixam
+  de valer. Esta curva só encheria com **9 bilhões de SOL** dentro dela, e todo o SOL que
+  existe soma cerca de 635 milhões: 14 vezes menos. (Você confere esse total em qualquer
+  explorador da Solana, procurando por "supply". Ele cresce menos de 4% ao ano; nesse ritmo
+  levaria uns 175 anos para existirem 9 bilhões de SOL, e todos teriam de estar nesta curva ao
+  mesmo tempo.) O número é em SOL e está fixo no código: não depende do preço do SOL no dia do
+  lançamento, e não existe linha no `launch.json` para mudá-lo. O resumo da parte 6 mostra
+  esse número.
 - Os **limites do agente**: um édito a cada 10 minutos no máximo; um édito vale no máximo
   2 horas; a tesouraria recebe no mínimo 40% e no máximo 50% das taxas.
 - O **nome** e o **ticker**: Veluno, VELUNO. Com um nome só, ele nunca muda.
@@ -299,8 +303,7 @@ Preencha assim. O que está em **negrito** você troca; o resto já vem certo e 
 | `"agent"` | **O endereço do agente.** |
 | `"keeper"` | **O endereço do keeper.** |
 | `"feeBps": 300` | A taxa: 3%. Travada para sempre. |
-| `"startCapSol": 30` | Onde a curva começa. Travado. |
-| `"graduationCapUsd": 1000000000` | Onde a curva graduaria: na prática, nunca (parte 3). Travado. |
+| `"startCapSol": 30` | Onde a curva começa. Travado. Onde ela graduaria não tem linha: ela não gradua (parte 3). |
 | `"minIntervalSecs": 600` | O agente escreve no máximo um édito a cada 10 minutos. Travado. |
 | `"maxRuleSecs": 7200` | Um édito vale no máximo 2 horas. Travado. |
 | `"minTreasuryBps": 4000` | Piso da tesouraria: 40% das taxas. Travado. |
@@ -326,6 +329,9 @@ Atenção:
 
 - Os endereços vão **entre aspas**, sem os sinais `<` e `>` do exemplo.
 - **Não** existe linha `feeClaimer`. Se ela aparecer, o comando recusa.
+- **Não** existe mais a linha `graduationCapUsd`. O exemplo antigo tinha; se o seu
+  `launch.json` foi copiado dele e ainda tem essa linha, **apague a linha inteira**. Enquanto
+  ela estiver lá, o comando recusa com `the launch file cannot name a graduationCapUsd`.
 - **Não** acrescente a linha `cosigner` (a chave de app): o Veluno nasce sem ela.
 - O endereço da tesouraria **não** entra neste arquivo. Ele vai só para o servidor.
 
@@ -353,7 +359,7 @@ Aparece um resumo. **Leia linha por linha** e compare com o que você anotou:
 | `fee claimer` | um endereço que você não conhece. Está certo: é o livro de regras, que nenhuma chave controla. |
 | `app key` | começa com `none: no hook about the app applies to this token` |
 | `trading fee` | `3% per trade, of which Meteora keeps 20%` |
-| `curve` | `starts at 30 SOL of market cap` e, na linha de baixo, `US$ 1,000,000,000` e `which takes ... SOL of buys`: é quanto de compras faria a curva graduar (parte 3) |
+| `curve` | `starts at 30 SOL of market cap and cannot graduate` e, na linha de baixo, `9,000,000,000 SOL in the curve, 14 times all the SOL there is (about 635 million)`: é o SOL que teria de estar na curva para ela graduar (parte 3) |
 | `limits` | `one edict every 10 minutes at most, an edict stands 2 hours at most` e `treasury never below 40% and never above 50%` |
 | `names` | `one, for good` |
 | `card` | `https://www.veluno.li/metadata.json` e, na linha de baixo, `answers with the card of Veluno (VELUNO)`. Se nessa linha aparecer `WARNING`, **não lance**: o arquivo não está no ar, ou o endereço não é o certo. |
