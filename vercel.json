@@ -4,9 +4,9 @@
   "installCommand": "",
   "outputDirectory": "site",
   "rewrites": [
-    { "source": "/data/log.jsonl", "destination": "https://agent.veluno.li/log.jsonl?tail=500" },
-    { "source": "/data/ledger-head.json", "destination": "https://agent.veluno.li/ledger-head.json" },
-    { "source": "/data/ledger.jsonl", "destination": "https://agent.veluno.li/ledger.jsonl" }
+    { "source": "/data/log.jsonl", "destination": "https://hookdinamic-production.up.railway.app/log.jsonl?tail=500" },
+    { "source": "/data/ledger-head.json", "destination": "https://hookdinamic-production.up.railway.app/ledger-head.json" },
+    { "source": "/data/ledger.jsonl", "destination": "https://hookdinamic-production.up.railway.app/ledger.jsonl" }
   ],
   "headers": [
     {

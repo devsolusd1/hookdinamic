@@ -8,9 +8,9 @@ window.SITE = {
   rpc: "https://mainnet.helius-rpc.com/?api-key=de4569d6-ed27-4b75-a13d-febdeeccf9f4",
 
   // Addresses, as printed at launch.
-  rulebook: "",
-  program: "",
-  pool: "",
+  rulebook: "ZrEfM1SEcDQkSJz9R7hQ9rE6pTnA4TPYWBbR9RQUVCq",
+  program: "AzoQSz4jMRXuezfS1HuRbNm3AphjN8CUC6u74rbaFUYT",
+  pool: "aens7CRFZEThbWpWRKaTjhGZPxEqRhjiMrrDpmqLMLj",
 
   // The agent's published decisions, one JSON object per line.
   log: "data/log.jsonl",
@@ -46,7 +46,7 @@ window.SITE = {
   explorer: "https://solscan.io",
 
   // Shown under the addresses: [{ label: "Jupiter", url: "https://jup.ag/swap/SOL-<mint>" }]
-  trade: [],
+  trade: [{ label: "Jupiter", url: "https://jup.ag/swap/SOL-FyxgHKqyBxW9TfdrT6gnfHQFEyFvhsN63AmHmc3j23eX" }],
 };
 
 // Set before the page paints, so a live page never shows the specimen.
