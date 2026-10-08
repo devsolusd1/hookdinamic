@@ -146,7 +146,7 @@ export function initIx(p: {
   agent: PublicKey;
   /** The app's signing key. Leave out for a token that names no app: no rule about one can then be written. */
   cosigner?: PublicKey;
-  /** An owner no rule applies to (the buyback vault). Leave out for nobody. */
+  /** An owner no rule applies to. Leave out for nobody, which is how this token launches: the keeper's buyback is judged like any buy. */
   exempt?: PublicKey;
   /** The token account that holds the curve's SOL. */
   curveVault: PublicKey;

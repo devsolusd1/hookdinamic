@@ -96,6 +96,8 @@ async function run() {
       for (const line of inWords(event.choice, event.change, names)) console.log(`    ${line}`);
       console.log(`    why: ${event.reasoning}`);
       if (event.signature) console.log(`    transaction ${event.signature}`);
+      // The transaction carries the announcement as its memo. Only a memo that had to be cut is worth a line.
+      if (event.memo !== undefined) console.log(`    on chain, as the memo: ${event.memo || "nothing"}`);
     }
     if ((event.status === "rewritten" || event.status === "held") && event.usage) {
       console.log(`    tokens: ${event.usage.inputTokens} in, ${event.usage.outputTokens} out`);

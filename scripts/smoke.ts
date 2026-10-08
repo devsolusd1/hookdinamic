@@ -3,6 +3,7 @@
 //   npm run smoke -- .local/devnet 0.05
 //
 // Reads token.json and trader.json from the folder; the number is the SOL to buy with.
+import "../src/quiet.js";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { DynamicBondingCurveClient, SwapMode } from "@meteora-ag/dynamic-bonding-curve-sdk";

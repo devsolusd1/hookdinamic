@@ -11,6 +11,7 @@
 // and the one write a payout round needs, and is what the crash sweeps run on. The second,
 // `Net`, answers every call a whole round makes, the pool and the rulebook and the curve
 // included, so that the keeper's own `turn` can be run from claim to payout.
+import "../src/quiet.js";
 import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -1332,7 +1333,8 @@ async function main() {
   await withWorlds("the guardian names another keeper", async () => {
     // Under these settings the keeper claims and credits and pays nothing out: all it has claimed is still with it.
     const HOLD = { treasuryAtLamports: 100n * SOL, minBuyLamports: 100n * SOL, payWhenLamports: 100n * SOL };
-    const next = Keypair.generate().publicKey;
+    const heir = Keypair.generate();
+    const next = heir.publicKey;
     /** Rounds until the keeper says it has stopped for good. */
     const toTheEnd = async (w: World) => {
       const said: string[] = [];
@@ -1353,7 +1355,8 @@ async function main() {
     const leftThePool = w.net.total - w.net.waiting;
     const said = await toTheEnd(w);
     const books = readBooks(w.store);
-    check(said.at(-1)?.startsWith("retired:") === true && said.at(-1)!.includes("as the keeper, not my key") && !said.some((line) => line.startsWith("error:")), `it pays out round by round, with no error, and then says it has stopped for good (its rounds said: ${said.map((line) => line.slice(0, 40)).join(" / ")})`);
+    // "stopped for good" are the words the service passes on to /health, and the ones the owner's guides say to wait for.
+    check(said.at(-1)?.startsWith("retired:") === true && said.at(-1)!.includes("as the keeper, not my key") && said.at(-1)!.includes("stopped for good") && !said.some((line) => line.startsWith("error:")), `it pays out round by round, with no error, and then says it has stopped for good (its rounds said: ${said.map((line) => line.slice(0, 40)).join(" / ")})`);
     check(w.net.total - w.net.waiting === leftThePool, "it claims nothing more: what waits in the pool is the next keeper's");
     check(w.net.balance(w.treasury) - w.treasuryHad === FORTY && books.totals.treasury.owed === "0", "the treasury is sent all it was owed, without waiting for the sum it is usually sent at");
     check(sentToHolders(w) === BigInt(before.credited) && books.credited === "0" && w.holders.every((holder) => w.net.balance(holder) > 0n), "every holder is sent all they were owed, without waiting for a full round");
@@ -1362,6 +1365,9 @@ async function main() {
     const linesThen = ledgerOf(w).length;
     check(await turn(w.ctx, w.hooks).then(() => false, (error) => error instanceof Retired) && ledgerOf(w).length === linesThen, "every round after that ends at once, and writes nothing");
     agree(w, "after the replaced keeper paid out");
+    // The keeper named in its place, started on the same folder: what a service gets that is given the new key and nothing else.
+    const [booksThen, saidHeir] = [readFileSync(join(w.store.dir, "private", "books.json"), "utf8"), await once({ ...w, ctx: { ...w.ctx, keeper: heir }, keeper: heir })];
+    check(saidHeir.startsWith("error:") && saidHeir.includes(`are those of keeper ${w.keeper.publicKey.toBase58()}`) && ledgerOf(w).length === linesThen && readFileSync(join(w.store.dir, "private", "books.json"), "utf8") === booksThen, `the keeper named in its place refuses that folder, whose books are another's, and changes nothing in it: it needs a folder of its own (its round said: ${saidHeir.slice(0, 60)})`);
     // The guardian names the first keeper again, before anybody else has claimed.
     w.net.named = w.keeper.publicKey;
     const again = await once(w);

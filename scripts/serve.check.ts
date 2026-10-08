@@ -25,9 +25,10 @@ import { getAssociatedTokenAddressSync, TOKEN_2022_PROGRAM_ID } from "@solana/sp
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SendTransactionError, Transaction } from "@solana/web3.js";
 import BN from "bn.js";
 import { base58, decodeRulebook as pageRulebook, hashOf, readLog as pageReadLog } from "../site/chain.js";
+import { BUYING_HOOKS, ruleOf } from "../site/hooks.js";
 import { readLedger } from "../site/ledger.js";
-import { mendLog, noteOf, readLog, runOnce, waitingPath, watch, type Context, type Decide } from "../src/agent.js";
-import { decodeRulebook, RULEBOOK_LEN, rulebookAddress, type Limits, type Split } from "../src/hook.js";
+import { ANNOUNCEMENT_MAX, announced, edictTransaction, MEMO_PROGRAM, MEMO_UNITS, memoUnits, mendLog, noteOf, readLog, runOnce, TRANSACTION_MAX, waitingPath, watch, type Context, type Decide, type LogEntry } from "../src/agent.js";
+import { decodeRulebook, MAX_CONDITIONS, RULEBOOK_LEN, rulebookAddress, type Condition, type Limits, type Split } from "../src/hook.js";
 import { AlreadyRunning, type KeeperContext, type KeeperOutcome } from "../src/keeper/index.js";
 import { launch } from "../src/launch.js";
 import { inPublic, main, plain, serve, type Service } from "./serve.js";
@@ -214,6 +215,8 @@ function madeUpChain() {
     quietReads: 0,
     /** The signatures of the transactions the node was sent, as the page's own code writes them. */
     sent: [] as string[],
+    /** What each of them carried as its memo, by signature: the text, and the keys the memo made sign. */
+    memos: new Map<string, { text: string; signers: string[] }>(),
     /** Called as a transaction arrives, before anything is done with it. */
     onSend: undefined as (() => void) | undefined,
     note: () => book.subarray(248, 280).toString("hex"),
@@ -258,6 +261,9 @@ function madeUpChain() {
         throw new SendTransactionError({ action: "simulate", signature: "", transactionMessage: "Transaction simulation failed: custom program error: 0xd", logs: [] });
       }
       chain.sent.push(base58(tx.signature!));
+      const memo = tx.instructions.find((instruction) => instruction.programId.equals(MEMO_PROGRAM));
+      if (memo) chain.memos.set(chain.sent.at(-1)!, { text: memo.data.toString("utf8"), signers: memo.keys.filter((key) => key.isSigner).map((key) => key.pubkey.toBase58()) });
+      // The edict comes first in its transaction, whatever follows it.
       if (chain.next !== "lost") chain.land(tx.instructions[0].data);
       return chain.sent.at(-1)!;
     },
@@ -390,6 +396,8 @@ async function offline() {
   check(outcome.status === "rewritten" && log.length === 1 && log[0].note === chain.note(), "an edict goes out, and the log has it under the hash the chain holds");
   check(outcome.status === "rewritten" && outcome.signature === chain.sent[0] && log[0].signature === chain.sent[0], "with the signature of the transaction that carried it, known before it was sent");
   check(kept !== "" && JSON.stringify(JSON.parse(kept).line) === JSON.stringify(log[0]) && !waits(), "the very line was on disk before the transaction left, and nothing waits once the log has it");
+  const carried = chain.memos.get(chain.sent[0]);
+  check(carried?.text === log[0].record.announcement && carried?.signers.join() === chain.agent.publicKey.toBase58() && !("memo" in log[0].record), "its transaction carries the announcement as a memo the agent signed, word for word, so the record has nothing to add about it");
 
   chain.clock += 1_900;
   chain.next = "unseen";
@@ -458,8 +466,111 @@ async function offline() {
   const began = Date.now();
   await watch({ ...ctx, decide: async (snapshot, book) => { setTimeout(() => halt.abort(), 50); await sleep(400); return rote(snapshot, book); } }, { pollSecs: 30, thinkEverySecs: 30, signal: halt.signal });
   check(Date.now() - began < 5_000 && chain.epoch() === 9 && readLog(logPath).length === 8 && readLog(logPath)[7].note === chain.note(), "the agent's loop, asked to stop in the middle of a look, finishes the look and leaves without waiting for its next poll");
+  check(readLog(logPath).every((entry) => chain.memos.get(entry.signature ?? "")?.text === entry.record.announcement), "every edict in the log went out with its announcement as its memo, the ones whose text had to be put back among them");
 
   check(plain(new Error("failed: https://rpc.example/v2/SECRET?api-key=SECRET\nmore")) === "failed: https://rpc.example" && inPublic(new TypeError("fetch failed at https://rpc.example/SECRET")) === "TypeError" && inPublic(new Error("refused: x-api-key: SECRET")) === "Error" && inPublic(new Error("my books say I hold 5 lamports")) === "my books say I hold 5 lamports", "an error is printed with any address cut to its host, and shown to the public only if it has neither an address nor a key in it");
+
+  // -------------------------------------------------------------------------------------------
+  console.log("an edict's words, in its transaction (the agent's own code; each transaction is signed and serialised as it would be sent)");
+
+  const scribe = Keypair.generate();
+  const [aProgram, aMint] = [Keypair.generate().publicKey, Keypair.generate().publicKey];
+  // The largest transaction the agent writes: the catalogue's longest rule, and a change of
+  // name that has to top the mint up first.
+  const longest = BUYING_HOOKS.flatMap((hook) => hook.settings.map((_, i) => ruleOf(hook.id, i + 1))).reduce((a, b) => (b.length > a.length ? b : a));
+  /** An edict's transaction for these words, as the node would be sent it, and what is found in those bytes. */
+  function carrying(announcement: string, rule: Condition[] = longest) {
+    const change = { ruleSecs: 3_600, rule, holdersBps: 3_000, burnBps: 3_000, treasuryBps: 4_000 };
+    const record: LogEntry["record"] = {
+      mint: aMint.toBase58(), epoch: 1, at: "2026-10-08T12:00:00.000Z", action: "rewrite", hooks: { buying: null, fees: "even-split", name: 1 },
+      change: { ...change, rule: rule.map((condition) => ({ ...condition, value: condition.value.toString() })) }, announcement, reasoning: "Scripted.", model: "stand-in",
+    };
+    const made = edictTransaction({ program: aProgram, agent: scribe.publicKey, mint: aMint, change, rename: { index: 1, lamports: 1_000_000 }, record });
+    made.tx.recentBlockhash = Keypair.generate().publicKey.toBase58();
+    made.tx.sign(scribe);
+    const wire = made.tx.serialize();
+    const sent = Transaction.from(wire);
+    const memo = sent.instructions.find((instruction) => instruction.programId.equals(MEMO_PROGRAM));
+    return {
+      record: made.record,
+      bytes: wire.length,
+      to: sent.instructions.map((instruction) => instruction.programId.toBase58()),
+      noted: sent.instructions[0].data.subarray(-32).equals(made.note) && made.note.equals(noteOf(made.record)),
+      memo: memo ? memo.data.toString("utf8") : null,
+      signedByAgent: memo?.keys.length === 1 && memo.keys[0].isSigner && memo.keys[0].pubkey.equals(scribe.publicKey),
+    };
+  }
+  /** Whether `memo` is `text` cut after a whole word and closed with an ellipsis, with no room for the word after. */
+  const cutAtAWord = (memo: string | null, text: string, fits: (longer: string) => boolean) => {
+    if (!memo?.endsWith("…")) return false;
+    const kept = memo.slice(0, -1);
+    const next = text.slice(kept.length).match(/^[\s.,;:…–—-]*\S+/u);
+    return text.startsWith(kept) && /^[\s.,;:…–—-]*\s/u.test(text.slice(kept.length)) && !!next && !fits(`${kept}${next[0]}…`);
+  };
+  const bytesOf = (text: string) => Buffer.byteLength(text, "utf8");
+
+  const plainWords = "Plain words, and nothing else. ".repeat(8).slice(0, ANNOUNCEMENT_MAX);
+  const inPlain = carrying(plainWords);
+  check(inPlain.memo === plainWords && inPlain.signedByAgent && !("memo" in inPlain.record) && inPlain.noted, `an announcement in plain letters, all ${ANNOUNCEMENT_MAX} characters of it, is the memo byte for byte, the agent signs it, and the note is the hash of a record that has nothing to add`);
+  check(inPlain.to.join() === [aProgram, PublicKey.default, aProgram, MEMO_PROGRAM].map((program) => program.toBase58()).join(), "the edict comes first, then the top-up and the change of name, and the words last");
+  const withoutWords = inPlain.bytes - bytesOf(plainWords);
+  const room = TRANSACTION_MAX - withoutWords;
+  check(room >= 3 * ANNOUNCEMENT_MAX, `the largest transaction the agent writes (a rule of ${longest.length} conditions, the catalogue's longest, and a change of name that tops the mint up) is ${withoutWords} bytes before the memo's text, which leaves the text ${room}: more than the ${3 * ANNOUNCEMENT_MAX} that ${ANNOUNCEMENT_MAX} characters can come to`);
+
+  // Signs that are not plain letters, of the kinds a sentence in English might have.
+  const typeset = "Slow Opening is on — for the first 10 minutes no wallet can buy above 2% of supply — then “the cap” lifts. Fees: Holders’ Payday · holders 42% · burn 18% · treasury 40%. It’s on for 30 min → selling isn’t restricted … ‘ever’ – é ü ✓ So far.";
+  const inType = carrying(typeset);
+  check(typeset.length === ANNOUNCEMENT_MAX && inType.memo === typeset && !("memo" in inType.record) && inType.bytes <= TRANSACTION_MAX, `${ANNOUNCEMENT_MAX} characters with curly quotes, long dashes and accents among them go whole too (${bytesOf(typeset)} bytes of text, reckoned at ${memoUnits(typeset)} units of the ${MEMO_UNITS} a memo may cost, a transaction of ${inType.bytes} bytes)`);
+  // The rarer Chinese characters take four bytes each and are cheap to the Memo program: nothing that goes whole weighs more.
+  const heavy = "\u{20000}".repeat(ANNOUNCEMENT_MAX / 2);
+  const inHeavy = carrying(heavy);
+  check(heavy.length === ANNOUNCEMENT_MAX && inHeavy.memo === heavy && !("memo" in inHeavy.record) && inHeavy.bytes <= TRANSACTION_MAX && inHeavy.bytes > inType.bytes, `and so do the heaviest ${ANNOUNCEMENT_MAX} characters that the Memo program can afford (${bytesOf(heavy)} bytes of text, a transaction of ${inHeavy.bytes} bytes, under the ${TRANSACTION_MAX} a transaction may be)`);
+
+  const affordable = (text: string) => memoUnits(text) <= MEMO_UNITS;
+  const tooDear = "“Slow” — “steady” — “small” … ".repeat(8).slice(0, ANNOUNCEMENT_MAX);
+  const inDear = carrying(tooDear);
+  check(memoUnits(tooDear) > MEMO_UNITS && inDear.memo !== null && affordable(inDear.memo) && cutAtAWord(inDear.memo, tooDear, affordable), `words the Memo program could not afford (reckoned at ${memoUnits(tooDear)} units) are cut after a whole word and closed with an ellipsis: ${inDear.memo?.length} of ${tooDear.length} characters, reckoned at ${memoUnits(inDear.memo ?? "")}`);
+  check(inDear.record.memo === inDear.memo && inDear.record.announcement === tooDear && inDear.noted && inDear.signedByAgent, "the record then says what the memo was, next to the announcement whole, and the note is the hash of both");
+  const allSigns = carrying("€".repeat(ANNOUNCEMENT_MAX));
+  const allFaces = carrying("\u{1f642}".repeat(ANNOUNCEMENT_MAX / 2));
+  check(/^€+…$/u.test(allSigns.memo ?? "") && affordable(allSigns.memo!) && !affordable(`€${allSigns.memo}`), `words with no space to cut at are cut where they have to be (${allSigns.memo?.length} characters of ${ANNOUNCEMENT_MAX})`);
+  check(/^\u{1f642}+…$/u.test(allFaces.memo ?? "") && affordable(allFaces.memo!) && !affordable(`\u{1f642}${allFaces.memo}`), `and never through the middle of a character that takes two units (${[...(allFaces.memo ?? "")].length - 1} emoji of ${ANNOUNCEMENT_MAX / 2})`);
+
+  // What the model is told about it: twenty curly quotes and dashes, or a dozen emoji, in an announcement of full length.
+  const among = (sign: string, count: number) => `${`${sign} `.repeat(count)}${"Plain words, and nothing else. ".repeat(8)}`.slice(0, ANNOUNCEMENT_MAX);
+  check(affordable(among("—", 20)) && !affordable(among("—", 30)) && affordable(among("\u{1f642}", 12)) && !affordable(among("\u{1f642}", 13)) && carrying(among("\u{1f642}", 12)).memo === among("\u{1f642}", 12), `which is what the model is told: among plain words to the full ${ANNOUNCEMENT_MAX} characters, twenty long dashes go whole (${memoUnits(among("—", 20))} units) and so do a dozen emoji (${memoUnits(among("\u{1f642}", 12))}), and a thirteenth is one too many`);
+
+  // A decision that did not pass through the limit on an announcement could be longer than a transaction has room for.
+  const tooLong = "Plain words, and nothing else. ".repeat(29).trim();
+  const inLong = carrying(tooLong);
+  const hasRoom = (text: string) => bytesOf(text) <= room;
+  check(affordable(tooLong) && bytesOf(tooLong) > room && inLong.bytes <= TRANSACTION_MAX && inLong.bytes > TRANSACTION_MAX - 12 && cutAtAWord(inLong.memo, tooLong, hasRoom) && inLong.record.memo === inLong.memo, `words too long for the transaction (${bytesOf(tooLong)} bytes) are cut the same way, to a transaction of ${inLong.bytes} bytes`);
+  const fullRule = carrying(plainWords, Array.from({ length: MAX_CONDITIONS }, () => ({ group: 0, fact: 0, op: 0, value: 1n })));
+  check(fullRule.memo === plainWords && fullRule.bytes - bytesOf(plainWords) > withoutWords, `a rule of ${MAX_CONDITIONS} conditions, the most the program takes, still leaves the text ${TRANSACTION_MAX - (fullRule.bytes - bytesOf(plainWords))} bytes`);
+
+  const withinLimit = (text: string) => text.length <= ANNOUNCEMENT_MAX;
+  const wordy = "Slow Opening is on. For the first 10 minutes no wallet can buy above 2% of supply, then the cap lifts. ".repeat(4);
+  const ranOver = announced(wordy);
+  check(announced(plainWords) === plainWords && announced(typeset) === typeset && cutAtAWord(ranOver, wordy, withinLimit), `an announcement within ${ANNOUNCEMENT_MAX} characters is left as it is, and one that ran over is cut after a whole word (${ranOver.length} characters of ${wordy.length})`);
+  // Half of a surrogate pair by itself, and a whole pair that the limit falls in the middle of.
+  const halved = announced("half \ud83d of a pair");
+  const astride = announced(`${"x".repeat(ANNOUNCEMENT_MAX - 1)}\u{1f642}`);
+  check(halved === `half ${String.fromCodePoint(0xfffd)} of a pair` && astride === `${"x".repeat(ANNOUNCEMENT_MAX - 1)}…` && [halved, astride].every((text) => Buffer.from(text, "utf8").toString("utf8") === text), "half a surrogate pair, which UTF-8 cannot carry, never gets into the record: the memo could not be the record's words otherwise");
+
+  // The same through a whole look, on a chain in memory.
+  const inked = madeUpChain();
+  const inkedLog = join(folder(), "agent-log.jsonl");
+  const scripted = byRote({ minutes: 30, keepName: true });
+  const saying = (announcement: string): Context => ({ connection: inked.connection, dbc: inked.dbc, hookProgram: inked.hookProgram, mint: inked.mint, pool: Keypair.generate().publicKey, agent: inked.agent, logPath: inkedLog, decide: async (snapshot, book) => ({ ...(await scripted(snapshot, book)), announcement }) });
+  outcome = await runOnce(saying(tooDear));
+  let penned = readLog(inkedLog)[0];
+  check(outcome.status === "rewritten" && outcome.memo === inDear.memo && penned.record.memo === inDear.memo && penned.record.announcement === tooDear && inked.memos.get(penned.signature!)?.text === inDear.memo, "a look whose words are too dear sends the cut memo, and its line in the log says what the memo was");
+  check(penned.note === inked.note() && (await hashOf(penned.record)) === inked.note(), "the note on chain is the hash of that record, and the page's own code finds it sound");
+  inked.clock += 1_900;
+  const overLimit = `${plainWords} And more words than an announcement may have.`;
+  outcome = await runOnce(saying(overLimit));
+  penned = readLog(inkedLog)[1];
+  check(outcome.status === "rewritten" && outcome.memo === undefined && outcome.announcement === penned.record.announcement && cutAtAWord(penned.record.announcement ?? null, overLimit, withinLimit) && inked.memos.get(penned.signature!)?.text === penned.record.announcement && !("memo" in penned.record), "a look whose words ran over the limit has them cut in the record itself, and the memo is the record's words again");
 
   // -------------------------------------------------------------------------------------------
   console.log("a disk that comes up empty");
@@ -968,6 +1079,13 @@ async function onValidator() {
   const edicts = pageLog?.filter((entry) => entry.record.action === "rewrite") ?? [];
   const notes = await Promise.all(edicts.map((entry) => hashOf(entry.record)));
   check(edicts.length >= 1 && notes.every((note, i) => note === edicts[i].note) && notes.includes(await chainNote()), "the page reads the log from the service: every text hashes to its note, and the edict in force is among them");
+  // The words are in the transaction too. This is the read an explorer makes, and all a page needs to say so: the signature and the announcement from the log's line.
+  const newest = edicts.at(-1);
+  await until("the newest edict's transaction, read as an explorer reads it, shows its announcement as a memo the agent signed", async () => {
+    const shown = newest ? await connection.getParsedTransaction(String(newest.signature), { commitment: "confirmed", maxSupportedTransactionVersion: 0 }) : null;
+    const memos = shown?.transaction.message.instructions.filter((instruction) => instruction.programId.equals(MEMO_PROGRAM)) ?? [];
+    return memos.length === 1 && "parsed" in memos[0] && memos[0].parsed === (newest.record.memo ?? newest.record.announcement) && shown?.meta?.logMessages?.includes(`Program log: Signed by ${agent.publicKey.toBase58()}`);
+  }, 20);
   const pageHead = await readLedger(at("/ledger-head.json"));
   check(pageHead && pageHead.mint === mint.publicKey.toBase58() && pageHead.seq >= 2 && BigInt(pageHead.totals.claimed) >= 288_000_000n && pageHead.recent.some((line: { kind: string }) => line.kind === "claim"), `the page reads the keeper's head from the service: ${pageHead ? `${pageHead.seq} lines, ${Number(pageHead.totals.claimed) / 1e9} SOL claimed` : "nothing"}`);
   const ledger = await ledgerNow();
@@ -1078,13 +1196,23 @@ async function onValidator() {
   told = await guardianSays("keeper", newKeeper.toBase58(), ...withKey, "--send");
   check(told.code === 0 && (await readBook()).keeper.equals(newKeeper), "with --send the rulebook names the new keeper");
   // The old keeper claims nothing more, pays out what it holds round by round, each payment waiting for a finalized block, and only then stops.
-  await until("the old keeper pays out what it held and stops for good, and /health says why", async () => (await healthOf(port)).body.problems.some((problem) => problem.includes("the keeper keeps failing") && problem.includes("as the keeper, not my key") && problem.includes("stopped for good")), 300);
+  // What is waited for is the keeper's own words. Whether the service lists them as a failure or as a keeper that has finished is the service's to say.
+  await until("the old keeper pays out what it held and stops for good, and /health says why", async () => (await healthOf(port)).body.problems.some((problem) => problem.includes("as the keeper, not my key") && problem.includes("stopped for good")), 300);
   check((await ledgerNow()).at(-1)?.kind === "note", "the last line of its ledger is its note of what was left with it");
+  // The service lists it as a keeper that has finished, not as one that keeps failing, and takes no more rounds.
+  // Two rounds' worth of time is let pass first, in which a loop that had not ended would speak again.
+  await sleep(5_000);
+  health = await healthOf(port);
+  const finished = `the keeper has finished and no keeper runs here now: the rulebook names ${newKeeper.toBase58()} as the keeper, not my key ${keeper.publicKey.toBase58()}: I have paid out what my books owed and stopped for good. The last line of my ledger says what was left.`;
+  const ofKeeper = health.body.problems.filter((problem) => problem.startsWith("the keeper"));
+  check(health.status === 503 && !health.body.ok && ofKeeper.length === 1 && ofKeeper[0] === finished && !health.body.keeper.on && health.body.keeper.last === "retired" && health.body.keeper.errorsInARow === 0, `/health answers 503 with one line about the keeper, in words that are not a failure's, and shows it off, its last word "retired" and no error counted (${JSON.stringify(ofKeeper)})`);
+  const saidOnce = (words: string) => service.lines.filter((line) => line.includes(words)).length === 1;
+  check(saidOnce("keeper: finished: the rulebook names ") && saidOnce("keeper: it takes no more rounds. The fees in the pool wait for the new keeper. What to do next: put the new keeper's key in KEEPER_KEYPAIR_JSON."), "the log says once that it has finished, and once what to do next");
   const records = await fetch(at("/ledger-head.json"));
   check(records.status === 200 && (await records.text()).length > 0, "the records are still served while both loops are refused");
 
   signalToStop(service.child);
-  check((await service.exited).code === 0, "it stops cleanly again");
+  check((await service.exited).code === 0 && !existsSync(join(dir, "service.lock")) && !existsSync(join(dir, "keeper", "private", "keeper.lock")), "it stops cleanly again, and both locks are let go");
 
   if (failures === 0) rmSync(dir, { recursive: true, force: true });
   console.log(failures ? `\n${failures} check(s) FAILED, ${passed} passed. The service's folder is left at ${dir}` : `\nall ${passed} checks passed`);

@@ -6,6 +6,7 @@
 //
 //   npm run validator     (in one terminal; needs WSL)
 //   npm run e2e
+import "../src/quiet.js";
 import { readFileSync } from "node:fs";
 import { ComputeBudgetProgram, Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, Transaction, type TransactionInstruction } from "@solana/web3.js";
 import {

@@ -15,8 +15,14 @@ Projeto independente: programa, chaves e carteiras próprios. O programa não fo
    compra em vigor, até quando ela vale, como as taxas se dividem (holders / queima /
    tesouraria), e quem é o guardião, o agente e o keeper.
 3. O **agente** não inventa regras. Ele escolhe num **catálogo** fixo (`site/hooks.js`) um hook
-   de compra, um hook de taxas e por quanto tempo valem, e grava isso no livro de regras. O
-   texto de cada édito vai para um diário público; o hash do texto fica on-chain.
+   de compra, um hook de taxas e por quanto tempo valem, e grava isso no livro de regras. A
+   transação de cada édito leva três coisas: a regra, o anúncio do édito como **memo** assinado
+   pelo agente (quem abrir a transação num explorador lê o que o Veluno disse) e o hash do
+   registro inteiro do édito, que fica no livro de regras. O registro inteiro, com os motivos,
+   vai para um diário público. O anúncio tem no máximo 240 caracteres. Se ele custar mais do
+   que o programa de memo pode gastar (letras simples custam pouco; aspas curvas, travessões e
+   emojis custam caro), o memo é cortado numa palavra, com reticências; o diário guarda o
+   anúncio inteiro e diz o que foi gravado como memo.
 4. O token é negociado numa curva da Meteora (Dynamic Bonding Curve) que, na prática, nunca
    gradua. A taxa é de 3% por trade: a Meteora fica com um quinto, e o resto é dividido como o
    édito em vigor mandar. A tesouraria recebe sempre entre 40% e 50% desse resto.
@@ -120,7 +126,8 @@ keeper recebe em `TREASURY`.
 Provado numa rede local, contra o programa real da Meteora: o lançamento, o hook aceitando e
 recusando compras, a retirada das taxas pelo programa, o keeper pagando tesouraria, recompra
 e holders com as contas batendo, o agente emitindo éditos sem perder o texto de nenhum mesmo
-com o processo morto no meio, o serviço parando limpo, e o guardião pausando e trocando chaves.
+com o processo morto no meio, cada édito com o anúncio como memo na própria transação, o
+serviço parando limpo, e o guardião pausando e trocando chaves.
 
 Ainda não foi feito:
 

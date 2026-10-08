@@ -11,13 +11,16 @@ import { closeSync, existsSync, fstatSync, fsyncSync, openSync, readFileSync, re
 import Anthropic from "@anthropic-ai/sdk";
 import { betaZodOutputFormat } from "@anthropic-ai/sdk/helpers/beta/zod";
 import { getPriceFromSqrtPrice, type DynamicBondingCurveClient } from "@meteora-ag/dynamic-bonding-curve-sdk";
-import { type Connection, type Keypair, PublicKey, SendTransactionError, SystemProgram, Transaction } from "@solana/web3.js";
+import { type Connection, type Keypair, PublicKey, SendTransactionError, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
 import { z } from "zod";
 import { BUYING_HOOKS, buyingHooksFor, FEE_HOOKS, IDENTITY_HOOK, recogniseRule, recogniseSplit, ruleOf, worded } from "../site/hooks.js";
 import { TOKEN_DECIMALS, TOTAL_SUPPLY } from "./curve.js";
 import { BPS, decodeRulebook, describe, FACTS, OPS, rulebookAddress, setNameIx, setRulesIx, span, type Change, type Condition, type Limits, type Name, type Rulebook } from "./hook.js";
 
 const ids = (hooks: { id: string }[]) => hooks.map((hook) => hook.id) as [string, ...string[]];
+
+/** The most an announcement may be, in characters as JavaScript counts them. */
+export const ANNOUNCEMENT_MAX = 240;
 
 /** What the model answers with: its picks from the catalogue, and what it has to say about them. */
 const Decision = z.object({
@@ -26,7 +29,7 @@ const Decision = z.object({
   minutes: z.number().describe("How long this edict stands, in whole minutes. The next one is written when it is up."),
   fees: z.enum(ids(FEE_HOOKS)).describe("The fee hook to switch on."),
   name: z.number().describe("0 to keep the token's name. Otherwise the number of the name to take, from the list in the message."),
-  announcement: z.string().describe("What holders read. Names the hooks now on, what they mean for a buyer and how long the edict stands. At most 240 characters."),
+  announcement: z.string().describe(`What holders read, and what goes on chain with the edict. Names the hooks now on, what they mean for a buyer and how long the edict stands. At most ${ANNOUNCEMENT_MAX} characters, in plain letters, digits and everyday punctuation.`),
   reasoning: z.string().describe("Two or three sentences on why these, given the market and your earlier edicts. Public as well."),
 });
 type Decision = z.infer<typeof Decision>;
@@ -105,6 +108,11 @@ export type LogEntry = {
     announcement?: string;
     reasoning: string;
     model: string;
+    /**
+     * What the edict's transaction carries as its memo, when that is not the announcement
+     * whole: the announcement cut short, or nothing. Left out when the two are the same.
+     */
+    memo?: string;
   };
   note?: string;
   signature?: string;
@@ -139,7 +147,8 @@ export type Outcome =
   /** An edict is due, and the caller asked for the model to be left alone for now (`ask: false`). */
   | { status: "resting" }
   | { status: "held"; reasoning: string; usage?: Usage }
-  | { status: "rewritten"; choice: Choice; change: Change; announcement: string; reasoning: string; signature: string | null; usage?: Usage };
+  /** `memo` is what the transaction carries as its memo, when that is not the announcement whole. */
+  | { status: "rewritten"; choice: Choice; change: Change; announcement: string; reasoning: string; signature: string | null; memo?: string; usage?: Usage };
 
 const hasApp = (book: Rulebook) => !book.cosigner.equals(PublicKey.default);
 
@@ -291,7 +300,9 @@ ${catalogue(appAvailable, renamable)}
 
 How to choose. The choice is yours, and there is no right answer to find. Look at the market in the message and at your own earlier edicts, and pick what you judge fits the moment: something tighter when buying is frantic, something looser or nothing at all when it is quiet, and another fee hook when the last one has had its turn. Do not settle into a pattern. Unless you have a reason you can state, do not switch on a buying hook you used in either of your last two edicts.
 
-Everything you write is public. The announcement is what holders read: name the hooks that are now on, say in plain words what they mean for a buyer and how long the edict stands, and say nothing about where the price will go. The page next to it shows the same edict as the chain stores it, so the two must agree.`;
+Everything you write is public. The announcement is what holders read: name the hooks that are now on, say in plain words what they mean for a buyer and how long the edict stands, and say nothing about where the price will go. The page next to it shows the same edict as the chain stores it, so the two must agree.
+
+The announcement also goes on chain: it is written into the edict's own transaction as a memo, where it stays for good and anybody who opens the transaction reads it. It can be at most ${ANNOUNCEMENT_MAX} characters, and a longer one is cut at a word. Write it in plain letters, digits and everyday punctuation, with straight quotes and a hyphen for a dash. The chain charges for a memo by the character, and every other sign is dear there: an accented letter costs what five plain letters do, a curly quote or a long dash thirty, an emoji more than fifty. An announcement of full length can afford about twenty curly quotes and dashes, or a dozen emoji; past that, the copy on chain is cut short at a word.`;
 
 function toChoice(decision: Decision): Choice {
   return {
@@ -340,7 +351,7 @@ export function askClaude(options: { persona: string; model?: string; effort?: "
 
       const choice = toChoice(decision);
       const problem = unfit(choice, book, facts);
-      if (!problem) return { action: "rewrite", choice, announcement: decision.announcement.slice(0, 240), reasoning: decision.reasoning, model: response.model, usage };
+      if (!problem) return { action: "rewrite", choice, announcement: announced(decision.announcement), reasoning: decision.reasoning, model: response.model, usage };
       messages.push({ role: "assistant", content: response.content }, { role: "user", content: `That cannot be used: ${problem}. Choose again.` });
     }
     return hold("two answers in a row could not be used; nothing changes");
@@ -584,6 +595,142 @@ export async function takeSnapshot(ctx: Context, book: Rulebook, now: number, hi
   };
 }
 
+// ---------------------------------------------------------------------------------------------
+// An edict's words, on chain.
+//
+// The announcement goes into the edict's own transaction as a memo that the agent signs, so
+// that anybody who opens the transaction in an explorer reads what was said. The words and
+// the rule land together or not at all, and that cuts both ways: a memo the chain would not
+// take would take the edict down with it. Two things can make a memo too much. A transaction
+// is at most 1232 bytes. And the Memo program is paid for by the character: to write its text
+// into the log it looks every character up in Unicode's tables, which costs it some 350
+// compute units for a plain letter and between nine and twenty thousand for a sign from
+// further up, a curly quote, a long dash or an emoji. So the memo is measured against both
+// before anything is signed, and one that would not fit is cut at a word. The note still
+// commits to the whole announcement, and the record says what the memo was.
+//
+// The agent only ever writes a memo. It reads nobody's, its own included: what it knows of
+// its earlier words comes from its log.
+
+/** The SPL Memo program. It takes text as its data, and fails unless every account it is given has signed. */
+export const MEMO_PROGRAM = new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
+
+/** The most a transaction may be on the wire, signatures included, in bytes. */
+export const TRANSACTION_MAX = 1232;
+
+/**
+ * The most compute units a memo may be reckoned to cost. A transaction that asks for nothing
+ * else is given 200,000 units for each of its instructions to a program like the hook or the
+ * Memo program. An edict has two of those, and three with a change of name; the hook spends
+ * under a thousand units on the rule and some thirteen thousand on a name, so this leaves it
+ * many times what it needs.
+ */
+export const MEMO_UNITS = 350_000;
+
+/**
+ * At most what the Memo program spends on `text` signed by one key, in compute units: a
+ * ceiling for each character by where it sits in Unicode. The ceilings come from running
+ * every character below U+20000, and a sample of those above, through the program's own
+ * bytecode, which is the same on mainnet and cannot be changed there. Most characters cost
+ * less than their ceiling, so a memo comes in under this; scripts/e2e-agent.ts runs the
+ * dearest of each band through the program again.
+ */
+export function memoUnits(text: string): number {
+  // An empty memo: nearly all of it goes on the line of the log that says who signed.
+  let units = 16_000;
+  for (const character of text) {
+    const code = character.codePointAt(0)!;
+    units +=
+      code >= 0x20 && code < 0x7f ? 360 // plain letters, digits and punctuation
+      : code < 0x800 || code >= 0x20000 ? 1_800 // accented letters, Greek, Cyrillic, Hebrew and Arabic; and, far up, the rarer Chinese characters
+      : code < 0x3000 ? 11_500 // curly quotes, long dashes, arrows and symbols
+      : code < 0x10000 ? 16_000 // Chinese, Japanese and Korean
+      : 20_500; // emoji
+  }
+  return units;
+}
+
+/**
+ * `text` if it `fits`; otherwise as much of it as does, ended after a whole word and closed
+ * with an ellipsis. A first word that is too much by itself is cut where it has to be, and
+ * where not even one character fits the answer is empty.
+ */
+function shortened(text: string, fits: (text: string) => boolean): string {
+  if (fits(text)) return text;
+  const [words, characters]: number[][] = [[], []];
+  let end = 0;
+  // Character by character and not by UTF-16 unit, so that no surrogate pair is cut in two.
+  for (const character of text) {
+    end += character.length;
+    characters.push(end);
+    if (/\S/u.test(character) && /\s/u.test(text[end] ?? "")) words.push(end);
+  }
+  for (const at of [...words.reverse(), ...characters.reverse()]) {
+    // The ellipsis takes the place of whatever closed the last word.
+    const kept = text.slice(0, at).replace(/[\s.,;:…–—-]+$/u, "");
+    if (kept && fits(`${kept}…`)) return `${kept}…`;
+  }
+  return "";
+}
+
+/**
+ * An announcement as it goes into the record: within its limit, cut at a word if it ran over,
+ * and holding nothing UTF-8 cannot carry (half of a surrogate pair becomes the replacement
+ * character), so that the memo is the record's own words byte for byte.
+ */
+export const announced = (text: string) => shortened(Buffer.from(text, "utf8").toString("utf8"), (cut) => cut.length <= ANNOUNCEMENT_MAX);
+
+/** `text` as a memo that `signer` signs. Its data is the text and nothing else. */
+export function memoIx(signer: PublicKey, text: string): TransactionInstruction {
+  return new TransactionInstruction({
+    programId: MEMO_PROGRAM,
+    keys: [{ pubkey: signer, isSigner: true, isWritable: false }],
+    data: Buffer.from(text, "utf8"),
+  });
+}
+
+/**
+ * The transaction that writes an edict, not yet signed, and the record its note is the hash
+ * of. It holds the rule, then the change of name if there is one, then the announcement as a
+ * memo. `record.memo` is filled in here, when the memo is not the announcement whole.
+ */
+export function edictTransaction(p: {
+  program: PublicKey;
+  agent: PublicKey;
+  mint: PublicKey;
+  change: Change;
+  /** The name to take, counted from 0, and the lamports the mint is short of to carry it. */
+  rename?: { index: number; lamports: number };
+  record: LogEntry["record"];
+}): { tx: Transaction; record: LogEntry["record"]; note: Buffer } {
+  const edict = (note?: Buffer) => [
+    setRulesIx({ program: p.program, agent: p.agent, mint: p.mint, change: p.change, note }),
+    // A name changes in the same transaction as its edict, right after it. The mint was given
+    // room for its longest name at launch; the transfer covers a mint that was not.
+    ...(p.rename && p.rename.lamports > 0 ? [SystemProgram.transfer({ fromPubkey: p.agent, toPubkey: p.mint, lamports: p.rename.lamports })] : []),
+    ...(p.rename ? [setNameIx({ program: p.program, agent: p.agent, mint: p.mint, index: p.rename.index })] : []),
+  ];
+  const paidByAgent = (instructions: TransactionInstruction[]) => {
+    const tx = new Transaction().add(...instructions);
+    tx.feePayer = p.agent;
+    return tx;
+  };
+  // The bytes left for the memo's text: the most a transaction may be, less what this one
+  // comes to with an empty memo in it. The note and the blockhash weigh the same whatever they are.
+  const empty = paidByAgent([...edict(), memoIx(p.agent, "")]);
+  empty.recentBlockhash = PublicKey.default.toBase58();
+  const room = TRANSACTION_MAX - empty.serialize({ requireAllSignatures: false, verifySignatures: false }).length;
+  const said = p.record.announcement ?? "";
+  const memo = shortened(said, (text) => {
+    const bytes = Buffer.byteLength(text);
+    // A text of 128 bytes or more takes a second byte to say how long it is.
+    return bytes + (bytes < 128 ? 0 : 1) <= room && memoUnits(text) <= MEMO_UNITS;
+  });
+  const record = memo === said ? p.record : { ...p.record, memo };
+  const note = noteOf(record);
+  return { tx: paidByAgent([...edict(note), ...(memo ? [memoIx(p.agent, memo)] : [])]), record, note };
+}
+
 /** The lamports the mint is short of to carry name `index`, which may be longer than the one it has. */
 async function rentForName(ctx: Context, book: Rulebook, index: number): Promise<number> {
   const mint = await ctx.connection.getAccountInfo(ctx.mint);
@@ -638,32 +785,31 @@ export async function runOnce(ctx: Context, options: { letRuleRun?: boolean; ask
   if (problem) throw new Error(`the decision cannot be used: ${problem}`);
   const change = changeOf(choice, book.limits);
   const { minutes: _minutes, ...hooks } = choice;
-  const record: LogEntry["record"] = {
-    mint: base.mint,
-    epoch: Number(book.epoch) + 1,
-    at: base.at,
-    action: "rewrite",
-    hooks,
-    change: logged(change),
-    announcement: verdict.announcement,
-    reasoning: base.reasoning,
-    model: base.model,
-  };
-  const decided = { choice, change, announcement: verdict.announcement, reasoning: verdict.reasoning, usage: verdict.usage };
+  // The same goes for what it says: the record, the page and the memo all hold these words.
+  const announcement = announced(verdict.announcement);
+  const decided = { choice, change, announcement, reasoning: verdict.reasoning, usage: verdict.usage };
   if (ctx.dryRun) return { status: "rewritten", ...decided, signature: null };
 
-  const note = noteOf(record);
-  const tx = new Transaction().add(setRulesIx({ program: ctx.hookProgram, agent: ctx.agent.publicKey, mint: ctx.mint, change, note }));
-  if (choice.name !== null) {
-    // A name changes in the same transaction as its edict, right after it. The mint was given
-    // room for its longest name at launch; this covers a mint that was not.
-    const short = await rentForName(ctx, book, choice.name);
-    if (short > 0) tx.add(SystemProgram.transfer({ fromPubkey: ctx.agent.publicKey, toPubkey: ctx.mint, lamports: short }));
-    tx.add(setNameIx({ program: ctx.hookProgram, agent: ctx.agent.publicKey, mint: ctx.mint, index: choice.name }));
-  }
+  const { tx, record, note } = edictTransaction({
+    program: ctx.hookProgram,
+    agent: ctx.agent.publicKey,
+    mint: ctx.mint,
+    change,
+    rename: choice.name === null ? undefined : { index: choice.name, lamports: await rentForName(ctx, book, choice.name) },
+    record: {
+      mint: base.mint,
+      epoch: Number(book.epoch) + 1,
+      at: base.at,
+      action: "rewrite",
+      hooks,
+      change: logged(change),
+      announcement,
+      reasoning: base.reasoning,
+      model: base.model,
+    },
+  });
   // Signed here, so that the signature is known before anything is sent.
   const recent = await ctx.connection.getLatestBlockhash("confirmed");
-  tx.feePayer = ctx.agent.publicKey;
   tx.recentBlockhash = recent.blockhash;
   tx.lastValidBlockHeight = recent.lastValidBlockHeight;
   tx.sign(ctx.agent);
@@ -692,7 +838,7 @@ export async function runOnce(ctx: Context, options: { letRuleRun?: boolean; ask
   }
   appendLine(ctx.logPath, line);
   rmSync(waitingPath(ctx.logPath), { force: true });
-  return { status: "rewritten", ...decided, signature };
+  return { status: "rewritten", ...decided, signature, ...(record.memo === undefined ? {} : { memo: record.memo }) };
 }
 
 /** An edict in a few plain lines, for a terminal. `names` are the token's, to say which one it took. */

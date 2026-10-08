@@ -1,18 +1,20 @@
 // The agent's loop on a local validator (scripts/validator.sh), with a stand-in for the model:
 // it proves everything around the model's answer. Market in, a pick from the catalogue out,
-// the edict on chain, a log line whose hash matches the note in the rulebook.
+// the edict on chain with its words beside it as a memo, a log line whose hash matches the
+// note in the rulebook.
 //
 //   npm run validator        (in one terminal; needs WSL)
 //   npm run e2e:agent
+import "../src/quiet.js";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DynamicBondingCurveClient, SwapMode } from "@meteora-ag/dynamic-bonding-curve-sdk";
 import { getTokenMetadata, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
-import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, sendAndConfirmTransaction, Transaction } from "@solana/web3.js";
+import { ComputeBudgetProgram, Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, sendAndConfirmTransaction, Transaction } from "@solana/web3.js";
 import BN from "bn.js";
 import { FEE_HOOKS, recogniseRule, recogniseSplit, worded } from "../site/hooks.js";
-import { buyingLabel, changeOf, noteOf, outsideLimits, readBook, readLog, runOnce, somebodyCanBuy, unfit, watch, type Choice, type Context, type Decide, type Outcome, type Snapshot } from "../src/agent.js";
+import { ANNOUNCEMENT_MAX, buyingLabel, changeOf, MEMO_PROGRAM, MEMO_UNITS, memoIx, memoUnits, noteOf, outsideLimits, readBook, readLog, runOnce, somebodyCanBuy, unfit, watch, type Choice, type Context, type Decide, type Outcome, type Snapshot } from "../src/agent.js";
 import { compile, describe, pauseIx, type Change, type Clause, type Limits, type Name, type Split } from "../src/hook.js";
 import { launch } from "../src/launch.js";
 import { byRote } from "./stand-in.js";
@@ -88,12 +90,56 @@ const minded = (inner: Decide): Decide => async (snapshot, book) => {
   return inner(snapshot, book);
 };
 /** A mind that gives one answer, whatever it is shown. */
-const answering = (choice: Choice): Decide => minded(async () => ({ action: "rewrite", choice, announcement: "as told", reasoning: "scripted", model: "stand-in" }));
+const answering = (choice: Choice, announcement = "as told"): Decide => minded(async () => ({ action: "rewrite", choice, announcement, reasoning: "scripted", model: "stand-in" }));
 const tokenName = async () => {
   const metadata = await getTokenMetadata(connection, mint.publicKey, "confirmed", TOKEN_2022_PROGRAM_ID);
   return `${metadata?.name} (${metadata?.symbol})`;
 };
 const full = (name: Name) => `${name.name} (${name.symbol})`;
+
+/** What each run of `program` spent according to a transaction's log, and what the transaction had left when the run began. */
+const runsOf = (program: PublicKey, logs: string[]) =>
+  logs.flatMap((line) => {
+    const said = line.match(/^Program (\S+) consumed (\d+) of (\d+) compute units$/);
+    return said && said[1] === program.toBase58() ? [{ spent: Number(said[2]), had: Number(said[3]) }] : [];
+  });
+
+/**
+ * An edict's transaction, read from the node twice over: as it was sent, for the memo's own
+ * bytes and who had to sign it, and parsed, which is how an explorer reads it. Null if the
+ * node does not have it.
+ */
+async function transactionOf(signature: string | null | undefined) {
+  if (!signature) return null;
+  const finding = { commitment: "confirmed", maxSupportedTransactionVersion: 0 } as const;
+  // A node can confirm a transaction a moment before it can show it.
+  let [sent, shown] = [await connection.getTransaction(signature, finding), await connection.getParsedTransaction(signature, finding)];
+  for (let i = 0; i < 20 && !(sent && shown); i++) {
+    await sleep(0.5);
+    [sent, shown] = [await connection.getTransaction(signature, finding), await connection.getParsedTransaction(signature, finding)];
+  }
+  if (!sent || !shown) return null;
+  const { message } = sent.transaction;
+  const keys = message.staticAccountKeys;
+  const memo = message.compiledInstructions.find((instruction) => keys[instruction.programIdIndex].equals(MEMO_PROGRAM));
+  const parsed = shown.transaction.message.instructions.filter((instruction) => instruction.programId.equals(MEMO_PROGRAM));
+  const logs = sent.meta?.logMessages ?? [];
+  return {
+    /** The program each instruction goes to, in order. */
+    programs: message.compiledInstructions.map((instruction) => keys[instruction.programIdIndex].toBase58()),
+    /** The memo's data, and whether the one account it names is the agent, signing. */
+    data: memo ? Buffer.from(memo.data) : null,
+    agentSigned: memo?.accountKeyIndexes.length === 1 && keys[memo.accountKeyIndexes[0]].equals(agent.publicKey) && message.isAccountSigner(memo.accountKeyIndexes[0]),
+    /** What an explorer shows for the memo: the program by name, and the words. */
+    explorer: parsed.length === 1 && "parsed" in parsed[0] ? { program: parsed[0].program, words: parsed[0].parsed as unknown } : null,
+    logs,
+    memoRun: runsOf(MEMO_PROGRAM, logs)[0],
+    hookRuns: runsOf(HOOK, logs),
+    spent: sent.meta?.computeUnitsConsumed ?? 0,
+    failed: sent.meta?.err ?? null,
+  };
+}
+const inUtf8 = (text: string | undefined) => Buffer.from(text ?? "", "utf8");
 
 const logPath = join(mkdtempSync(join(tmpdir(), "agent-")), "agent-log.jsonl");
 const ctx: Context = { connection, dbc, hookProgram: HOOK, mint: mint.publicKey, pool, agent, logPath, decide: minded(byRote({ keepName: true })) };
@@ -139,6 +185,12 @@ check(recogniseSplit(book, LIMITS.maxTreasuryBps, LIMITS.minTreasuryBps)?.hook.i
 const [line] = readLog(logPath);
 check(Buffer.from(book.note).equals(noteOf(line.record)) && line.note === book.note.toString("hex"), "the note in the rulebook is the hash of the logged decision");
 check(line.record.hooks?.buying?.hook === sent?.choice.buying?.hook && line.record.hooks?.fees === sent?.choice.fees, "which names the hooks by their place in the catalogue");
+const firstTx = await transactionOf(line.signature);
+check(firstTx?.programs.join() === [HOOK, MEMO_PROGRAM].map((program) => program.toBase58()).join() && firstTx.failed === null, "the edict's transaction carries a memo, right after the rule");
+check(!!firstTx?.data?.equals(inUtf8(line.record.announcement)) && line.record.announcement === sent?.announcement && !("memo" in line.record), `the memo is the announcement, byte for byte: ${line.record.announcement}`);
+check(!!firstTx?.agentSigned && firstTx.logs.includes(`Program log: Signed by ${agent.publicKey.toBase58()}`), "the agent signed the memo, and the Memo program says so in the transaction's log");
+check(firstTx?.explorer?.program === "spl-memo" && firstTx.explorer.words === line.record.announcement && firstTx.logs.some((said) => said.startsWith(`Program log: Memo (len ${inUtf8(line.record.announcement).length}): `)), "read as an explorer reads it (getTransaction, parsed), the transaction shows the words");
+check(!!firstTx && firstTx.memoRun.spent <= memoUnits(line.record.announcement ?? "") && firstTx.memoRun.had >= MEMO_UNITS, `the memo cost ${firstTx?.memoRun.spent} compute units, under the ${memoUnits(line.record.announcement ?? "")} it was reckoned at, and after the rule (${firstTx?.hookRuns[0]?.spent} units) the transaction still had ${firstTx?.memoRun.had} for it: more than the ${MEMO_UNITS} a memo may cost`);
 check(seen[0].market.market_cap_sol > 30 && seen[0].market.sol_in_curve > 0.9 && seen[0].market.pool_transactions_since_last_edict >= 1 && seen[0].limits.longest_edict_minutes === 360, `it was shown the market: ${JSON.stringify(seen[0].market)}`);
 check(seen[0].in_force.buying === "none" && seen[0].in_force.name === full(NAMES[0]) && seen[0].names.length === 3, "what was in force and the token's names");
 check(seen[0].fee_hooks.find((hook) => hook.id === "buyback-burn")?.shares === "holders 18%, burn 42%, treasury 40%", "and what each fee hook would come to");
@@ -153,16 +205,77 @@ await sleep(LIMITS.minIntervalSecs + 1);
 const stray = await runOnce({ ...ctx, decide: answering({ buying: { hook: "max-sell", setting: 1 }, fees: "even-split", name: null, minutes: 30 }) }).then(() => null, (error: Error) => error.message);
 check(!!stray && stray.includes("cannot be used") && (await readBook(ctx)).epoch === 1n && readLog(logPath).length === 1, "a pick that is not in the catalogue is dropped before it is sent, and leaves no trace");
 
+console.log("what the Memo program charges");
+// The dearest character of each stretch of Unicode, from U+007F up to the last one there is,
+// as running every character through this program found them.
+const DEAREST = [0x7f, 0x8a, 0x7ba, 0xfdb, 0x1fff, 0x205f, 0x244b, 0x2ffc, 0x31ea, 0x9ffa, 0xabfa, 0xd7fc, 0xeaaa, 0xffef, 0x1eefa, 0x1faaa, 0x1fffd, 0x2b738, 0x10fffd].map((code) => String.fromCodePoint(code));
+{
+  /** What the Memo program spends on `text` signed by the agent. Nothing is sent: the node is asked to run it, with the most compute a transaction may ask for. */
+  const charged = async (text: string) => {
+    const tx = new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), memoIx(agent.publicKey, text));
+    tx.feePayer = agent.publicKey;
+    tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+    tx.sign(agent);
+    const { value } = await connection.simulateTransaction(tx);
+    return value.err ? Infinity : (runsOf(MEMO_PROGRAM, value.logs ?? [])[0]?.spent ?? Infinity);
+  };
+  const texts = [
+    "",
+    "Plain words, and nothing else. ".repeat(8).slice(0, ANNOUNCEMENT_MAX),
+    // As long as a transaction has room for, in plain letters and in signs the program writes out as two.
+    "Plain words, and nothing else. ".repeat(26),
+    "\"".repeat(800),
+    "\"It's\" a \\ and a\ttab\nand a new line. ".repeat(6),
+    "For the next 30 minutes: Newcomers · up to 0.25%, and Holders’ Payday for the fees.",
+    "“Slow” — ‘steady’ – small … 2% → 1%, 40 € ✓ ".repeat(3),
+    "Aufträge, crédito, señal, Ωμέγα, Привет, שלום ".repeat(5),
+    "你好，世界。한국어 テスト ".repeat(4),
+    "\u{1f642} \u{1f680}\u{1f525} ok ".repeat(6),
+    // Each of the dearest by itself, and then taking turns with plain letters, which makes the program stop and start its writing.
+    ...DEAREST.flatMap((sign) => [sign.repeat(Math.min(60, Math.floor(1_200_000 / memoUnits(sign)))), `${sign} a`.repeat(40)]),
+    DEAREST.join(" ").repeat(3),
+  ];
+  const costs: number[] = [];
+  for (const text of texts) costs.push(await charged(text));
+  const over = texts.filter((text, i) => costs[i] > memoUnits(text));
+  const closest = Math.max(...texts.map((text, i) => costs[i] / memoUnits(text)));
+  check(over.length === 0, `no memo costs more than the agent reckons: ${texts.length} texts run by the program itself, from an empty one (${costs[0]} units) to the dearest character of every stretch of Unicode, and the closest took ${(closest * 100).toFixed(1)}% of its estimate${over.map((text) => ` OVER: ${JSON.stringify(text)}`).join("")}`);
+  check(costs[1] < 110_000 && costs[1] <= memoUnits(texts[1]), `${ANNOUNCEMENT_MAX} characters in plain letters cost ${costs[1]} units (reckoned at ${memoUnits(texts[1])})`);
+}
+
+console.log("words the chain could not afford whole");
+// The dearest sign there is, and the dearest of two cheaper kinds and of the accented letters.
+const [DEAR, LESS_DEAR, LESSER, ACCENTED] = [0x1faaa, 0xffef, 0x2ffc, 0x7ba].map((code) => String.fromCodePoint(code));
+// Words made of those, so that what the memo really costs comes as near to what it may cost as it can.
+const dear = `${DEAR} ${LESS_DEAR} ${LESSER} a b c d e f g h `.repeat(10).trim();
+const cut = await runOnce({ ...ctx, decide: answering({ buying: { hook: "max-wallet", setting: 2 }, fees: "holders-payday", name: null, minutes: 30 }, dear) });
+const cutLine = readLog(logPath).at(-1)!;
+const cutTx = await transactionOf(cutLine.signature);
+book = await readBook(ctx);
+const memoWords = cutLine.record.memo ?? "";
+check(cut.status === "rewritten" && book.epoch === 2n && memoUnits(dear) > MEMO_UNITS && cut.memo === cutLine.record.memo && cutLine.record.announcement === dear, `an edict whose words would cost too much (reckoned at ${memoUnits(dear)} units) lands all the same, and its record keeps the announcement whole`);
+check(memoWords.endsWith("…") && dear.startsWith(memoWords.slice(0, -1)) && /\s/.test(dear[memoWords.length - 1]) && memoUnits(memoWords) <= MEMO_UNITS, `the record says what the memo was: the first ${memoWords.length - 1} of its ${dear.length} characters, cut after a whole word and closed with an ellipsis`);
+check(!!cutTx?.data?.equals(inUtf8(memoWords)) && cutTx.agentSigned && cutTx.explorer?.words === memoWords && cutTx.failed === null, "and that, byte for byte, is the memo in its transaction and what an explorer shows");
+check(Buffer.from(book.note).equals(noteOf(cutLine.record)) && cutLine.note === book.note.toString("hex"), "the note in the rulebook is the hash of that record: the whole announcement, and the memo as it was cut");
+check(!!cutTx && cutTx.memoRun.spent <= memoUnits(memoWords) && cutTx.memoRun.spent > 0.9 * MEMO_UNITS && cutTx.memoRun.had >= MEMO_UNITS, `the memo cost ${cutTx?.memoRun.spent} compute units of the ${MEMO_UNITS} it may (reckoned at ${memoUnits(memoWords)}), and the transaction had ${cutTx?.memoRun.had} left for it`);
+
 console.log("a new name");
-await sleep(Math.max(0, LIMITS.minRenameSecs + 1 - (Date.now() - launchedAt) / 1000));
-const third = await runOnce({ ...ctx, decide: answering({ buying: null, fees: "buyback-burn", name: 2, minutes: 0.3 }) });
+// Words that only just fit: the dearest signs, as many as a memo can afford, and plain letters up to the limit.
+const edge = `${DEAR.repeat(12)} ${ACCENTED.repeat(6)} `.padEnd(ANNOUNCEMENT_MAX, "and a new name, ");
+await sleep(Math.max(LIMITS.minIntervalSecs + 1, LIMITS.minRenameSecs + 1 - (Date.now() - launchedAt) / 1000));
+const third = await runOnce({ ...ctx, decide: answering({ buying: null, fees: "buyback-burn", name: 2, minutes: 0.3 }, edge) });
 check(third.status === "rewritten", "a look that was not told to wait replaces the edict in force");
 book = await readBook(ctx);
-check(book.epoch === 2n && book.rule.length === 0 && book.ruleUntil - book.updatedAt === 18, "an edict with no buying hook has a term all the same");
+check(book.epoch === 3n && book.rule.length === 0 && book.ruleUntil - book.updatedAt === 18, "an edict with no buying hook has a term all the same");
 check(book.name === 2 && book.renamedAt === book.updatedAt && (await tokenName()) === full(NAMES[2]), `the token is now called ${await tokenName()}`);
 check(book.burnBps === 4_200 && book.treasuryBps === 4_000 && readLog(logPath).at(-1)?.record.hooks?.name === 2, "the fee hook it came with is on chain too, and the record names the new name");
+const renamed = readLog(logPath).at(-1)!;
+const renameTx = await transactionOf(renamed.signature);
+check(edge.length === ANNOUNCEMENT_MAX && memoUnits(edge) <= MEMO_UNITS && memoUnits(edge) > MEMO_UNITS - 2_000 && renamed.record.announcement === edge && !("memo" in renamed.record), `its announcement is ${ANNOUNCEMENT_MAX} characters, not all of them plain, reckoned at ${memoUnits(edge)} units: as dear as a memo may be`);
+check(renameTx?.programs.join() === [HOOK, HOOK, MEMO_PROGRAM].map((program) => program.toBase58()).join() && !!renameTx.data?.equals(inUtf8(edge)) && renameTx.agentSigned && renameTx.explorer?.words === edge, `the rule, the change of name and all ${inUtf8(edge).length} bytes of those words went in one transaction`);
+check(!!renameTx && renameTx.memoRun.spent <= memoUnits(edge) && renameTx.memoRun.had >= MEMO_UNITS, `where the memo cost ${renameTx?.memoRun.spent} units, the rule ${renameTx?.hookRuns[0]?.spent} and the change of name ${renameTx?.hookRuns[1]?.spent}; the transaction had ${renameTx?.memoRun.had} left for the memo, and used ${renameTx?.spent} in all`);
 const last = seen.at(-1)!;
-check(last.history.length === 1 && last.history[0].buying === buyingLabel(sent?.choice.buying ?? null) && last.history[0].fees === FEE_HOOKS[0].name, "it is shown its own earlier edicts by the names of their hooks");
+check(last.history.length === 2 && last.history[0].buying === buyingLabel(sent?.choice.buying ?? null) && last.history[0].fees === FEE_HOOKS[0].name && last.history[1].announcement === dear, "it is shown its own earlier edicts by the names of their hooks, with what it said then, whole");
 check(last.in_force.minutes_left > 0 && last.name_change.allowed_now, "what was in force when it looked, and that a new name was allowed");
 
 console.log("on its own");
@@ -180,16 +293,19 @@ const until = async (what: string, done: () => boolean, seconds: number) => {
 await until("it leaves an edict that still has time on it alone, rule or no rule", () => count("in-force") > 0, 10);
 check(seen.length === calls, "and asks the model nothing meanwhile");
 await until("when the time is up it looks by itself; the model cannot be reached, so it issues nothing", () => count("held") === 1, 40);
-check(readLog(logPath).at(-1)?.record.action === "hold" && (await readBook(ctx)).epoch === 2n, "which it writes down, changing nothing");
+check(readLog(logPath).at(-1)?.record.action === "hold" && (await readBook(ctx)).epoch === 3n, "which it writes down, changing nothing");
 await until("it tries again and issues the next edict", () => count("rewritten") === 1, 20);
 book = await readBook(ctx);
-check(book.epoch === 3n && book.rule.length > 0 && book.ruleUntil - book.updatedAt === 12, "a buying hook from the catalogue, for twelve seconds");
+check(book.epoch === 4n && book.rule.length > 0 && book.ruleUntil - book.updatedAt === 12, "a buying hook from the catalogue, for twelve seconds");
 check((await tokenName()) === full(NAMES[2]), "the name stays: it changed too recently");
 await until("then the one after, when those twelve seconds are up", () => count("rewritten") === 2, 40);
 await until("and another", () => count("rewritten") === 3, 40);
 book = await readBook(ctx);
-check(book.epoch === 5n && book.name !== 2 && (await tokenName()) === full(NAMES[book.name]), `by now it has changed its name again, to ${await tokenName()}`);
+check(book.epoch === 6n && book.name !== 2 && (await tokenName()) === full(NAMES[book.name]), `by now it has changed its name again, to ${await tokenName()}`);
 check(readLog(logPath).filter((entry) => entry.record.hooks && entry.record.hooks.name !== null).length >= 2, "each change of name is in the record, with its edict");
+const own = readLog(logPath).filter((entry) => entry.record.action === "rewrite").slice(-3);
+const ownTxs = await Promise.all(own.map((entry) => transactionOf(entry.signature)));
+check(own.length === 3 && ownTxs.every((tx, i) => !!tx?.data?.equals(inUtf8(own[i].record.announcement)) && tx.agentSigned && tx.explorer?.words === own[i].record.announcement && !("memo" in own[i].record)), `each of the three it issued by itself has its words in its transaction: ${own.at(-1)?.record.announcement}`);
 
 await sendAndConfirmTransaction(connection, new Transaction().add(pauseIx({ program: HOOK, guardian: guardian.publicKey, mint: mint.publicKey, paused: true })), [guardian], { commitment: "confirmed" });
 const asked = seen.length;

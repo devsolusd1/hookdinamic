@@ -18,6 +18,7 @@
 //   KEEPER_OWN_WALLETS                  the project's own wallets, separated by commas: they are never paid as holders
 //   KEEPER_SETTINGS                     any of the numbers in src/keeper/settings.ts, as JSON, to replace its defaults
 //   DRY_RUN=1                           work out and print; send and write nothing
+import "../src/quiet.js";
 import { existsSync, readFileSync } from "node:fs";
 import { DynamicBondingCurveClient } from "@meteora-ag/dynamic-bonding-curve-sdk";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";

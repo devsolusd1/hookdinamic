@@ -146,8 +146,9 @@ Tem que terminar com:
   The rulebook shows the change.
 ```
 
-A pausa vale na hora, na blockchain. Já o `/health` do servidor leva um pouco para mostrar: em
-um minuto, no máximo cinco, ele mostra o agente com `"last": "paused"`.
+A pausa vale na hora, na blockchain. Já o `/health` do servidor leva um pouco para mostrar: o
+agente confere o livro de regras a cada minuto (é o `AGENT_POLL_SECS=60` do servidor), então em
+cerca de um minuto ele aparece com `"last": "paused"`.
 
 ## 3. Despausar
 
@@ -161,8 +162,8 @@ Termina com `state       running` e `The rulebook shows the change.` Se o últim
 estava dentro do prazo, a regra dele volta a valer na hora.
 
 A blockchain já aceita o agente de novo na hora. O servidor nota na próxima vez que lê o livro
-de regras: em geral em um minuto, no máximo em cinco. Nesse meio tempo o `/health` continua
-mostrando `"last": "paused"`. Não é defeito.
+de regras, o que ele faz a cada minuto: em cerca de um minuto. Nesse meio tempo o `/health`
+continua mostrando `"last": "paused"`. Não é defeito.
 
 ---
 
@@ -188,8 +189,8 @@ consegue tirar dinheiro de ninguém.
    `The rulebook shows the change.`
 5. No servidor (Railway → Variables): cole o conteúdo de `agente2.json` em
    `AGENT_KEYPAIR_JSON` → Seal → Deploy. Até você fazer isso, o `/health` mostra
-   `the agent keeps failing: ... is not this token's agent`. É o esperado. (Em geral aparece
-   em um minuto; no pior caso, em quinze.)
+   `the agent keeps failing: ... is not this token's agent`. É o esperado. (Aparece em cerca
+   de um minuto.)
 6. **Despause** (parte 3).
 7. Se o endereço do agente estava em `KEEPER_OWN_WALLETS` no servidor, acrescente lá o
    endereço novo.
@@ -226,9 +227,12 @@ mais nada. **Aqui cada minuto conta: troque primeiro, entenda depois.**
      dinheiro sozinho.
    - As contas do keeper antigo (quanto cada holder tem a receber) não passam sozinhas para o
      novo. Elas só existem no disco do servidor. Hoje não existe um comando para isso.
-   Quando ele termina, o `/health` mostra `the keeper keeps failing: the rulebook names ... as
-   the keeper, not my key ...: I have paid out what my books owed and stopped for good`. É o
-   esperado: o keeper antigo pagou o que devia e parou.
+   Quando ele termina, o `/health` mostra `the keeper has finished and no keeper runs here
+   now: the rulebook names ... as the keeper, not my key ...: I have paid out what my books
+   owed and stopped for good`. É o esperado, e não é uma falha: o keeper antigo pagou o que
+   devia e parou. O `"ok"` fica `false` (e o alarme avisa) porque daí em diante nenhum keeper
+   roda no servidor: as taxas esperam na pool até o keeper novo ser ligado, junto com quem
+   programa.
 
 **Não troque o keeper por rotina.** Só em emergência, ou combinado com quem programa.
 

@@ -22,6 +22,7 @@
 //
 // The keeper's folder is .local/e2e-keeper. It is removed when every check has passed, and
 // left for looking at when one has not.
+import "../src/quiet.js";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";

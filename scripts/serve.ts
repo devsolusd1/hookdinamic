@@ -46,7 +46,7 @@ import { gzipSync } from "node:zlib";
 import { DynamicBondingCurveClient } from "@meteora-ag/dynamic-bonding-curve-sdk";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { askClaude, mendLog, NotTheAgent, readBook, readLog, watch, type Context, type Decide, type LogCheck, type Outcome } from "../src/agent.js";
-import { AlreadyRunning, round, settingsFrom, type KeeperContext, type KeeperOutcome } from "../src/keeper/index.js";
+import { AlreadyRunning, Retired, round, settingsFrom, type KeeperContext, type KeeperOutcome } from "../src/keeper/index.js";
 import { solPriceUsd } from "../src/price.js";
 
 /** Below this much free disk the agent issues nothing: an edict whose text could not be kept is worse than none. */
@@ -208,8 +208,9 @@ export async function serve(options: Options = {}): Promise<Service> {
     /**
      * `saying`: the last thing the keeper did, or what it waits for, in its own words.
      * `short`: it has said its wallet is out of SOL, and has not had a round with nothing in its way since.
+     * `finished`: the guardian has named another keeper and this one has paid out what it held, in its own words. It takes no more rounds.
      */
-    keeper: { ...quiet(), address: null as string | null, saying: null as string | null, short: false },
+    keeper: { ...quiet(), address: null as string | null, saying: null as string | null, short: false, finished: null as string | null },
   };
 
   function beat(of: Beat, event: { status: string; error?: unknown }) {
@@ -241,6 +242,10 @@ export async function serve(options: Options = {}): Promise<Service> {
       if (loop.errorsInARow >= 3 || (loop.errorsInARow > 0 && loop.forGood)) found.push(`the ${name} keeps failing: ${loop.lastError}`);
       else if (loop.errorsInARow > 0 && !loop.worked) found.push(`the ${name} has not worked since it started: ${loop.lastError}`);
     }
+    // A keeper that has finished has not failed, and is listed all the same: from then on
+    // nobody takes the fees out of the pool through this service, and only a person can change
+    // that. Its line begins with words of its own, so that it is not read as a failure.
+    if (health.keeper.finished) found.push(`the keeper has finished and no keeper runs here now: ${health.keeper.finished}`);
     for (const epoch of health.agent.withoutText) found.push(`edict ${epoch} is on chain and its text is not in the log`);
     // The keeper says so itself, in a round that otherwise went well.
     if (health.keeper.short) found.push("the keeper's wallet needs topping up");
@@ -614,6 +619,16 @@ export async function serve(options: Options = {}): Promise<Service> {
       } catch (error) {
         // Another process holds the keeper's folder: this one has no business waiting for it.
         if (error instanceof AlreadyRunning) throw error;
+        // The guardian has named another keeper, and this one has paid out what it held. That
+        // is the end of its work and not a failure. Every later round would end here at once,
+        // so none is taken: the loop ends, and what to do next is said once. A wallet that has
+        // nothing more to send needs no topping up either.
+        if (error instanceof Retired) {
+          Object.assign(health.keeper, { on: false, last: "retired", lastAt: Date.now(), errorsInARow: 0, short: false, finished: inPublic(error) });
+          say(`keeper: finished: ${plain(error)}`);
+          say(`keeper: it takes no more rounds. The fees in the pool wait for the new keeper. What to do next: put the new keeper's key in KEEPER_KEYPAIR_JSON. The new keeper also needs a folder of its own: the books and the ledger in ${keeperDir} are this keeper's, and another keeper refuses them. If the guardian names this key again instead, start the service again: it is the keeper as before.`);
+          return;
+        }
         beat(health.keeper, { status: "error", error });
         const news = `error: ${plain(error)}`;
         if (news !== said) say(`keeper: ${news}`);

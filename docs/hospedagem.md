@@ -114,10 +114,11 @@ No ensaio, é o projeto que você já tem.
 
 Na mainnet, um projeto novo: **New Project** → **Deploy from GitHub repo** →
 `devsolusd1/hookdinamic`. Aparece uma caixa com o nome do serviço e ele começa a construir.
-Esse primeiro deploy sobe sem as variáveis: o agente e o keeper ficam desligados. A Railway
-pode mostrar o serviço como ativo ou acusar erro de "healthcheck". **Nos dois casos é o
-esperado:** ainda falta configurar. Antes de seguir, desligue os deploys automáticos desse
-serviço novo (Settings → Source, como em "Onde você está agora").
+Esse primeiro deploy sobe sem as variáveis: o agente e o keeper ficam desligados. Mesmo assim
+a Railway mostra o serviço como **ativo** (foi o que aconteceu no servidor de verdade): ela só
+pergunta se o serviço responde em `/`, e ele responde assim que a porta abre. **É o esperado, e
+não quer dizer que está pronto:** ainda falta configurar. Antes de seguir, desligue os deploys
+automáticos desse serviço novo (Settings → Source, como em "Onde você está agora").
 
 ## 3. Criar o disco
 
@@ -246,7 +247,8 @@ A lista `"problems"` diz o motivo, em inglês. Os mais comuns:
 | `the agent is not running: ... is not set` | Faltou uma variável. | Volte ao passo 4 e confira o nome que aparece. |
 | `... is not a keypair ...` | A chave foi colada pela metade. | Cole de novo, do `[` ao `]`. |
 | `the agent keeps failing: ... is not this token's agent` | A chave no servidor não é a do agente deste token. | Confira `AGENT_KEYPAIR_JSON` e `MINT`. |
-| `the keeper keeps failing: the rulebook names ... as the keeper, not my key` | A chave no servidor não é a do keeper deste token. | Confira `KEEPER_KEYPAIR_JSON` e `MINT`. Se o guardião acabou de trocar o keeper, é o esperado: veja `docs/emergencia.md`, parte 5. |
+| `the keeper keeps failing: the rulebook names ... as the keeper, not my key` | A chave no servidor não é a do keeper deste token. | Confira `KEEPER_KEYPAIR_JSON` e `MINT`. (Depois de uma troca de keeper pelo guardião a linha é outra: a de baixo.) |
+| `the keeper has finished and no keeper runs here now: ... stopped for good` | **Não é falha.** O guardião trocou o keeper, e o keeper deste servidor pagou o que devia e parou. O `"ok"` fica `false` porque daí em diante nenhum keeper roda aqui: as taxas esperam na pool pelo keeper novo. | Chame quem programa para ligar o keeper novo: veja `docs/emergencia.md`, parte 5. Enquanto isso, `KEEPER_OFF=1` em Variables (e Deploy) tira o aviso e deixa o resto rodando. |
 | `... has not worked since it started: ...` | O agente ou o keeper ainda não conseguiu dar um passo desde que ligou. Quase sempre é uma variável errada. | Leia o resto da frase e confira o passo 4. |
 | `... there is nothing at the treasury's address ...` | Não há nada no endereço que está em `TREASURY`: ou nunca houve, ou a carteira foi esvaziada até zero (o keeper confere isso cada vez que o serviço liga). | Compare `TREASURY` com a carteira, letra por letra. Se estiver certo, mande 0,01 SOL para ela: o keeper liga sozinho quando o SOL chegar. Ao tirar SOL da tesouraria, deixe sempre um pouco nela. |
 | `... the treasury's address ... is not a wallet ...` | O endereço em `TREASURY` não é de uma carteira (é de um programa ou de uma conta de token). SOL mandado para lá nunca sairia. | Corrija `TREASURY`. O keeper não faz nada enquanto isso. |
