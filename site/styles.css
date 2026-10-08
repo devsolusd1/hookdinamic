@@ -1175,6 +1175,11 @@ main {
   color: var(--ink-soft);
 }
 
+/* The wallet the buybacks and burns come from, as a pill to press, under the burn's figures. */
+.share-wallet {
+  margin-top: 0.8rem;
+}
+
 .share dt::before,
 .move-kind::before {
   content: "";

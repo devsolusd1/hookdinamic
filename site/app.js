@@ -101,6 +101,16 @@ function txPill(signature) {
   return node;
 }
 
+/** The wallet my keeper buys back and burns from, as something to press: its address shortened, and the way out to the explorer. */
+function walletPill(address) {
+  const node = document.getElementById("tx-template").content.firstElementChild.cloneNode(true);
+  node.href = `${site.explorer}/account/${address}`;
+  node.title = "Open this wallet on the explorer";
+  node.querySelector(".tx-word").textContent = "Buyback wallet";
+  node.querySelector("code").textContent = shorten(address);
+  return node;
+}
+
 /**
  * What an edict's transaction holds of its words, going by its record. I write the announcement
  * into the transaction as a memo, and the record, which the hash on chain commits to, says what
@@ -1345,7 +1355,7 @@ const ledgerShown = () => (ledger && !(book && ledger.mint !== book.mint) ? ledg
 /** Where the fees went: the three shares, what is still owed in each, and the last things my keeper did. */
 function renderGone() {
   const head = ledgerShown();
-  const key = [ledgerState, ledger?.seq, Boolean(head)].join(" ");
+  const key = [ledgerState, ledger?.seq, Boolean(head), book?.keeper].join(" ");
   if (key === goneShown) return;
   goneShown = key;
   const say = slot("gone-say");
@@ -1373,6 +1383,11 @@ function renderGone() {
   write("gone-burn", inSol(totals.burn.spent));
   write("gone-tokens", inTokens(totals.burn.tokens));
   write("owed-burn", owed(totals.burn.owed));
+  // The wallet that buys back and burns is my keeper's, the one the rulebook names: anybody can
+  // open it and see each buyback and each burn for themselves.
+  const keeper = isAddress(book?.keeper) && book.keeper !== NOBODY ? book.keeper : "";
+  slot("gone-wallet").hidden = !keeper;
+  slot("gone-wallet").replaceChildren(...(keeper ? [walletPill(keeper)] : []));
   write("gone-treasury", inSol(totals.treasury.paid));
   write("owed-treasury", owed(totals.treasury.owed));
   renderGoneSum();
