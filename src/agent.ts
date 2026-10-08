@@ -557,9 +557,19 @@ async function settleWaiting(ctx: Context, book: Rulebook): Promise<{ book: Rule
   return { book: last };
 }
 
+/**
+ * The chain's own clock, in seconds. The newest slot may have no block (it was skipped), or
+ * one the node asked does not hold yet (a provider answers from several nodes), and the node
+ * then refuses instead of answering: a few slots back there is always one. Failing even that,
+ * this machine's clock, which is within a second or two of the chain's.
+ */
 async function chainTime(connection: Connection): Promise<number> {
-  const time = await connection.getBlockTime(await connection.getSlot());
-  return time ?? Math.floor(Date.now() / 1000);
+  const slot = await connection.getSlot();
+  for (let back = 0; back < 8 && back <= slot; back++) {
+    const time = await connection.getBlockTime(slot - back).catch(() => null);
+    if (time !== null) return time;
+  }
+  return Math.floor(Date.now() / 1000);
 }
 
 export async function readBook(ctx: Pick<Context, "connection" | "hookProgram" | "mint">): Promise<Rulebook> {
